@@ -138,6 +138,13 @@ func listenGroupMessages(ctx context.Context, session *GroupSession, groupID str
 		}
 		fmt.Printf("[GROUP E2EE] Decrypted Result: %s\n", plaintext)
 
+		// --- RATCHET: Putar kunci pengirim di database kita agar sinkron dengan pesan dia selanjutnya ---
+		hKDF := hmac.New(sha256.New, senderKey)
+		hKDF.Write([]byte("GROUP_RATCHET"))
+		nextSenderKey := hKDF.Sum(nil)
+		corestore.SaveGroupSenderKey(groupID, gMsg.SenderID, nextSenderKey)
+		fmt.Printf("[Group Ratchet] Rotated sender key for @%s in group %s\n", FormatPeerID(gMsg.SenderID), groupID)
+
 		// --- VERIFIKASI TANDA TANGAN ---
 		if gMsg.Signature != "" {
 			sID, _ := peer.Decode(gMsg.SenderID)

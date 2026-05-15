@@ -1,0 +1,112 @@
+services:
+  relay-server:
+    build: .
+    command: ["-dedicated", "-port", "4001", "-debug"]
+    ports:
+      - "4001:4001"
+    volumes:
+      - ./test_data/relay:/app/.data
+    networks:
+      - net-a
+      - net-b
+      - net-c
+      - net-d
+      - net-e
+    tty: true
+    stdin_open: true
+
+  client-a:
+    build: .
+    command: ["-debug"]
+    volumes:
+      - ./test_data/client-a:/app/.data
+    networks:
+      - net-a
+    environment:
+      - P2P_INPUT_PATH=/tmp/p2p_cmd
+    depends_on:
+      - relay-server
+
+  client-b:
+    build: .
+    command: ["-debug"]
+    volumes:
+      - ./test_data/client-b:/app/.data
+    networks:
+      - net-b
+    environment:
+      - P2P_INPUT_PATH=/tmp/p2p_cmd
+    depends_on:
+      - relay-server
+
+  client-c:
+    build: .
+    command: ["-debug"]
+    volumes:
+      - ./test_data/client-c:/app/.data
+    networks:
+      - net-c
+    environment:
+      - P2P_INPUT_PATH=/tmp/p2p_cmd
+    depends_on:
+      - relay-server
+
+  client-d:
+    build: .
+    command: ["-client-only", "-debug"]
+    volumes:
+      - ./test_data/client-d:/app/.data
+    networks:
+      - net-d
+    environment:
+      - P2P_INPUT_PATH=/tmp/p2p_cmd
+    depends_on:
+      - relay-server
+
+  client-e:
+    build: .
+    command: ["-client-only", "-debug"]
+    volumes:
+      - ./test_data/client-e:/app/.data
+    networks:
+      - net-e
+    environment:
+      - P2P_INPUT_PATH=/tmp/p2p_cmd
+    depends_on:
+      - relay-server
+
+  client-f:
+    build: .
+    command: ["-client-only", "-debug"]
+    volumes:
+      - ./test_data/client-f:/app/.data
+    networks:
+      - net-c
+    environment:
+      - P2P_INPUT_PATH=/tmp/p2p_cmd
+    depends_on:
+      - relay-server
+
+  client-g:
+    build: .
+    command: ["-client-only", "-debug"]
+    volumes:
+      - ./test_data/client-g:/app/.data
+    networks:
+      - net-e
+    environment:
+      - P2P_INPUT_PATH=/tmp/p2p_cmd
+    depends_on:
+      - relay-server
+
+networks:
+  net-a:
+    driver: bridge
+  net-b:
+    driver: bridge
+  net-c:
+    driver: bridge
+  net-d:
+    driver: bridge
+  net-e:
+    driver: bridge

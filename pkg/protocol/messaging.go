@@ -91,7 +91,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				localRatchetPriv, _ := base64.StdEncoding.DecodeString(localRatchetPrivB64)
 				localRatchetPub, _ := base64.StdEncoding.DecodeString(localRatchetPubB64)
 
-				if recvChain == nil { recvChain = rootKey }
+				if len(recvChain) == 0 { recvChain = rootKey }
 
 				session := &corecrypto.SessionState{
 					PeerID: senderID.String(),
@@ -289,7 +289,7 @@ func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 		localRatchetPriv, _ := base64.StdEncoding.DecodeString(localRatchetPrivB64)
 		localRatchetPub, _ := base64.StdEncoding.DecodeString(localRatchetPubB64)
 
-		if sendB64 == "" { sendChain = rootKey }
+		if len(sendChain) == 0 { sendChain = rootKey }
 
 		session := &corecrypto.SessionState{
 			PeerID: targetID.String(),
@@ -460,9 +460,14 @@ func processCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 	}
 
 	if strings.HasPrefix(msgStr, "/join ") {
-		parts := strings.SplitN(msgStr, " ", 3)
-		if len(parts) == 3 {
-			JoinGroup(ctx, h, priv, parts[1], strings.Split(parts[2], ","))
+		parts := strings.Split(msgStr, " ")
+		if len(parts) >= 2 {
+			groupID := parts[1]
+			var members []string
+			if len(parts) >= 3 {
+				members = strings.Split(parts[2], ",")
+			}
+			JoinGroup(ctx, h, priv, groupID, members)
 		}
 		return
 	}

@@ -1,0 +1,10 @@
+vendor/
+build/
+.git/
+.node_identity.key
+messages.db
+patches/
+p2psdk.aar
+p2psdk.xcframework
+*.so
+*.dylib

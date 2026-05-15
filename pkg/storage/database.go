@@ -18,6 +18,11 @@ func InitDatabase(dbPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
+	
+	// Enable WAL mode for better concurrency
+	DB.Exec("PRAGMA journal_mode=WAL;")
+	DB.Exec("PRAGMA busy_timeout=5000;")
+	DB.SetMaxOpenConns(1) // SQLite works best with 1 writer for modernc
 
 	// Create messages table if it doesn't exist (For local history)
 	query := `
