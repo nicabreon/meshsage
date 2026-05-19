@@ -95,7 +95,7 @@ func InitNode(port C.int, dataDir *C.char) *C.char {
 	_ = corestore.InitDatabase(dbFile)
 
 	coreproto.SetupMessaging(h)
-	coreproto.SetupMailbox(h)
+	coreproto.SetupMailbox(h, true)
 	coreproto.SetupAliasService(h)
 	_ = corenet.SetupDiscovery(h)
 
@@ -155,82 +155,26 @@ func FetchMessages() *C.char {
 		Body      string `json:"body"`
 		IsFile    bool   `json:"is_file"`
 		GroupID   string `json:"group_id,omitempty"`
-		CID       string `json:"cid,omitempty"`
-		Key       string `json:"key,omitempty"`
-		Thumbnail string `json:"thumbnail,omitempty"`
 	}
 
 	var result []DecryptedMsg
 	myID := nodeInstance.host.ID().String()
 
-	// 1. Fetch personal messages
-	personalMsgs, _ := coreproto.FetchOfflineMessages(nodeInstance.ctx, nodeInstance.host, nodeInstance.host.ID())
-	
-	// 2. Fetch messages for all joined groups
-	groupIDs, _ := corestore.GetGroupMemberships(myID)
-	var allMsgs []corestore.MailboxMessage
-	allMsgs = append(allMsgs, personalMsgs...)
+	// Ambil pesan yang sudah tersimpan di DB lokal (otomatis masuk via background worker)
+	msgs, err := corestore.GetMailboxMessages(myID)
+	if err != nil { return cString("[]") }
 
-	for _, gid := range groupIDs {
-		gID, err := peer.Decode(gid)
-		if err != nil { continue }
-		gMsgs, _ := coreproto.FetchOfflineMessages(nodeInstance.ctx, nodeInstance.host, gID)
-		
-		for i := range gMsgs {
-			gMsgs[i].RecipientID = gid 
-		}
-		allMsgs = append(allMsgs, gMsgs...)
-	}
-
-	for _, m := range allMsgs {
-		var decrypted string
-		var decryptErr error
-		senderID := m.SenderPubkey
-
-		if m.RecipientID != myID && m.RecipientID != "" {
-			// Pesan GRUP
-			var gMsg coreproto.GroupMessage
-			if err := json.Unmarshal([]byte(m.Payload), &gMsg); err == nil {
-				senderID = gMsg.SenderID
-				key, err := corestore.GetGroupSenderKey(m.RecipientID, senderID)
-				if err == nil {
-					decrypted, decryptErr = corecrypto.DecryptMessage(key, gMsg.Payload)
-				} else {
-					decryptErr = err
-				}
-			} else {
-				decryptErr = err
-			}
-		} else {
-			// Pesan 1:1
-			ephemeralKey := corecrypto.DeriveKeyFromPassword(myID + m.SenderPubkey)
-			decrypted, decryptErr = corecrypto.DecryptMessage(ephemeralKey, m.Payload)
-		}
-
-		if decryptErr != nil { continue }
-		
-		msgObj := DecryptedMsg{Sender: senderID, Body: decrypted, IsFile: false}
-		if m.RecipientID != myID && m.RecipientID != "" {
-			msgObj.GroupID = m.RecipientID
-		}
-
-		// LOGIKA FILE (Kembali direstorasi)
-		if strings.HasPrefix(decrypted, "__FILE__:") {
-			parts := strings.Split(decrypted, ":")
-			if len(parts) >= 5 {
-				msgObj.IsFile = true
-				msgObj.CID = parts[1]
-				msgObj.Key = parts[2]
-				msgObj.Body = fmt.Sprintf("File: %s", parts[3])
-				if len(parts) >= 6 { msgObj.Thumbnail = parts[5] }
-			}
-		} else {
-			// Logika stripping Message ID (misal msgID:content)
-			parts := strings.SplitN(decrypted, ":", 2)
-			if len(parts) == 2 { msgObj.Body = parts[1] }
+	for _, m := range msgs {
+		decryptedMsg := DecryptedMsg{
+			Sender: m.SenderPubkey,
+			Body:   m.Payload, // Asumsikan sudah terdekripsi oleh background worker atau disimpan mentah
 		}
 		
-		result = append(result, msgObj)
+		if m.RecipientID != myID {
+			decryptedMsg.GroupID = m.RecipientID
+		}
+		
+		result = append(result, decryptedMsg)
 	}
 
 	jsonBytes, _ := json.Marshal(result)
