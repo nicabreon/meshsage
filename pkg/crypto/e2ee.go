@@ -29,6 +29,15 @@ func GenerateEphemeralKeypair() (privateKey []byte, publicKey []byte, err error)
 	return privateKey, publicKey, nil
 }
 
+// DerivePublicKey computes the X25519 public key from a given private key.
+func DerivePublicKey(privateKey []byte) ([]byte, error) {
+	publicKey, err := curve25519.X25519(privateKey, curve25519.Basepoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive public key: %w", err)
+	}
+	return publicKey, nil
+}
+
 // DeriveSharedSecret computes the X25519 shared secret and derives a 32-byte AES key using HKDF.
 func DeriveSharedSecret(privateKey []byte, peerPublicKey []byte) ([]byte, error) {
 	sharedSecret, err := curve25519.X25519(privateKey, peerPublicKey)

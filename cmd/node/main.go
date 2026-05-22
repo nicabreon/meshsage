@@ -137,6 +137,10 @@ func main() {
 	coreproto.SetupAliasService(host)
 	coreproto.SetupClusterSync(ctx, host)
 
+	// Restore group memberships from database
+	_ = coreproto.RestoreGroups(ctx, host, priv)
+
+
 	if corenet.IsDedicated {
 		coreproto.SetupReplicationHandler(host)
 		go corestore.StartGarbageCollector(ctx, 1*time.Hour, 14)

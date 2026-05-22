@@ -2,9 +2,13 @@ package protocol
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -14,17 +18,51 @@ import (
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
 )
 
+var ClusterSecretKey = []byte("default-p2p-cluster-secret-key-change-me")
+
+func init() {
+	if envKey := os.Getenv("CLUSTER_SECRET"); envKey != "" {
+		ClusterSecretKey = []byte(envKey)
+	}
+}
+
 const (
 	ReplicationProtocol = "/chirp/replicate/1.0.0"
 	ClusterSyncTopic    = "p2p-core-cluster-sync"
 )
 
 type ClusterEvent struct {
-	Type    string `json:"type"` // "MAILBOX_ADD", "MAILBOX_PURGE", "PREKEY_ADD"
-	Hash    string `json:"hash,omitempty"`
-	OwnerID string `json:"owner_id,omitempty"`
-	Payload string `json:"payload,omitempty"`
-	Sender  string `json:"sender,omitempty"`
+	Type      string `json:"type"` // "MAILBOX_ADD", "MAILBOX_PURGE", "PREKEY_ADD"
+	Hash      string `json:"hash,omitempty"`
+	OwnerID   string `json:"owner_id,omitempty"`
+	Payload   string `json:"payload,omitempty"`
+	Sender    string `json:"sender,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}
+
+// GenerateClusterHMAC menghasilkan tanda tangan HMAC-SHA256 base64 untuk ClusterEvent.
+// Signature dihitung dari semua field selain field Signature itu sendiri.
+func GenerateClusterHMAC(event ClusterEvent, key []byte) string {
+	sigInput := ClusterEvent{
+		Type:    event.Type,
+		Hash:    event.Hash,
+		OwnerID: event.OwnerID,
+		Payload: event.Payload,
+		Sender:  event.Sender,
+	}
+	data, _ := json.Marshal(sigInput)
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// VerifyClusterHMAC memverifikasi apakah signature pada ClusterEvent cocok dengan HMAC dari data event.
+func VerifyClusterHMAC(event ClusterEvent, key []byte) bool {
+	if event.Signature == "" {
+		return false
+	}
+	expectedSig := GenerateClusterHMAC(event, key)
+	return hmac.Equal([]byte(event.Signature), []byte(expectedSig))
 }
 
 // SetupReplicationHandler configures the Relay to listen for replication requests
@@ -112,6 +150,12 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 			var event ClusterEvent
 			if err := json.Unmarshal(msg.Data, &event); err != nil { continue }
 
+			// DESIGN-07 FIX: Verifikasi signature HMAC-SHA256 untuk cluster event
+			if !VerifyClusterHMAC(event, ClusterSecretKey) {
+				fmt.Printf("[Cluster Error] Invalid HMAC signature for event type %s from peer %s\n", event.Type, msg.ReceivedFrom.String())
+				continue
+			}
+
 			switch event.Type {
 			case "MAILBOX_ADD":
 				fmt.Printf("[Cluster] Syncing mailbox message for %s\n", event.OwnerID)
@@ -137,6 +181,10 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 func BroadcastClusterEvent(ctx context.Context, event ClusterEvent) {
 	topic, err := corenet.GlobalPubSub.Join(ClusterSyncTopic)
 	if err != nil { return }
+	
+	// DESIGN-07 FIX: Tambahkan signature HMAC sebelum melakukan broadcast
+	event.Signature = GenerateClusterHMAC(event, ClusterSecretKey)
+	
 	data, _ := json.Marshal(event)
 	topic.Publish(ctx, data)
 }

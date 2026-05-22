@@ -18,6 +18,7 @@ import (
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
 	corenet "github.com/nicabreon/meshsage/pkg/network"
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
+	"github.com/nicabreon/meshsage/pkg/logger"
 )
 
 type GroupMessage struct {
@@ -73,12 +74,14 @@ func JoinGroup(ctx context.Context, h host.Host, priv crypto.PrivKey, groupID st
 	}
 
 	// 4. Save members and share our key with them
+	corestore.AddGroupMember(groupID, h.ID().String())
 	for _, m := range members {
 		corestore.AddGroupMember(groupID, m)
 		if m != h.ID().String() {
 			go shareKeyWithMember(ctx, h, priv, groupID, m, localKey)
 		}
 	}
+
 
 	session := &GroupSession{
 		Topic:    topic,
@@ -216,6 +219,7 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 	// Fan-out: Send the message individually to each member.
 	// SendMessage will automatically handle direct-send or mailbox fallback with X3DH.
 	members, err := corestore.GetGroupMembers(groupID)
+	logger.Debug().Interface("members", members).Err(err).Msg("SendGroupMessage: Group members retrieved")
 	if err == nil {
 		for _, m := range members {
 			if m == h.ID().String() {
@@ -223,8 +227,17 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 			}
 			target, err := peer.Decode(m)
 			if err == nil {
-				// We prefix with GRPM: so the receiver knows it's a group message
-				go SendMessage(ctx, h, h.Peerstore().PrivKey(h.ID()), target, "GRPM:"+groupID+":"+string(msgBytes))
+				logger.Debug().Str("target", target.String()).Msg("SendGroupMessage: Launching SendMessage goroutine")
+				go func(t peer.ID) {
+					sendErr := SendMessage(ctx, h, h.Peerstore().PrivKey(h.ID()), t, "GRPM:"+groupID+":"+string(msgBytes))
+					if sendErr != nil {
+						logger.Error().Err(sendErr).Str("target", t.String()).Msg("SendGroupMessage: SendMessage failed")
+					} else {
+						logger.Debug().Str("target", t.String()).Msg("SendGroupMessage: SendMessage completed successfully")
+					}
+				}(target)
+			} else {
+				logger.Error().Err(err).Str("memberID", m).Msg("SendGroupMessage: Failed to decode member peerID")
 			}
 		}
 	}
@@ -281,3 +294,24 @@ func ProcessGroupMessage(groupID string, msgBytes []byte) {
 
 	fmt.Printf("\n[Group %s] @%s (Offline): %s\n> ", groupID, FormatPeerID(gMsg.SenderID), plaintext)
 }
+
+// RestoreGroups loads groups that we are members of from the database and joins them.
+func RestoreGroups(ctx context.Context, h host.Host, priv crypto.PrivKey) error {
+	groups, err := corestore.GetGroupMemberships(h.ID().String())
+	if err != nil {
+		return err
+	}
+	for _, gid := range groups {
+		members, err := corestore.GetGroupMembers(gid)
+		if err == nil {
+			err = JoinGroup(ctx, h, priv, gid, members)
+			if err != nil {
+				logger.Error().Err(err).Str("groupID", gid).Msg("Failed to auto-restore group membership")
+			} else {
+				logger.Info().Str("groupID", gid).Msg("Auto-restored group membership on startup")
+			}
+		}
+	}
+	return nil
+}
+

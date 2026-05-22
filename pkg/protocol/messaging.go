@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -27,7 +28,18 @@ import (
 
 const MessagingProtocolID = "/p2p-core/msg/1.0.0"
 
-var localHost host.Host 
+// sessionLocks menyimpan mutex per-peer untuk mencegah race condition
+// saat concurrent goroutine mengakses Double Ratchet session state.
+var (
+	localHost    host.Host
+	sessionLocks sync.Map // map[peerID string]*sync.Mutex
+)
+
+// getSessionLock mengembalikan mutex khusus untuk peerID tertentu.
+func getSessionLock(peerID string) *sync.Mutex {
+	val, _ := sessionLocks.LoadOrStore(peerID, &sync.Mutex{})
+	return val.(*sync.Mutex)
+}
 
 func SetupMessaging(h host.Host) {
 	localHost = h
@@ -40,7 +52,7 @@ func handleStream(s network.Stream) {
 
 	buf := bufio.NewReader(s)
 	var length uint32
-	if err := binary.Read(s, binary.LittleEndian, &length); err != nil {
+	if err := binary.Read(buf, binary.LittleEndian, &length); err != nil {
 		return
 	}
 
@@ -50,6 +62,9 @@ func handleStream(s network.Stream) {
 	}
 
 	ProcessSecureEnvelope(context.Background(), localHost, senderID, string(envelopeBytes))
+
+	// Kirim balik "OK\n" sebagai tanda terima (ACK)
+	_, _ = s.Write([]byte("OK\n"))
 }
 
 // ProcessSecureEnvelope menangani dekripsi X3DH dan pemrosesan JSON payload
@@ -69,13 +84,25 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		
 		if len(headerParts) == 4 {
 			counter, _ := strconv.ParseUint(headerParts[2], 10, 32)
+
+			// BUG-03: Lock per-peer agar tidak ada race condition pada session state
+			sessionMu := getSessionLock(senderID.String())
+			sessionMu.Lock()
+			defer sessionMu.Unlock()
 			
 			// A. Cek Skipped Keys dulu
 			skippedKey, err := corestore.GetSkippedKey(senderID.String(), uint32(counter))
 			if err == nil {
 				logger.Info().Str("peerID", senderID.String()).Uint32("counter", uint32(counter)).Msg("DR: Using skipped message key")
-				aesKey = skippedKey
-				encryptedPayloadB64 = base64.StdEncoding.EncodeToString([]byte(headerParts[3]))
+				// BUG-02 FIX: Gunakan DecryptMessage (bukan DecryptMessageRaw) karena
+				// EncryptWithRatchet menggunakan EncryptMessage yang menyertakan gzip.
+				plaintext, err := corecrypto.DecryptMessage(skippedKey, headerParts[3])
+				if err != nil {
+					logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR: Skipped key decryption failed")
+					return
+				}
+				processDecryptedPayload(ctx, h, senderID, []byte(plaintext))
+				return
 			} else {
 				// B. Jalur Standard Ratchet
 				remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, err := corestore.LoadSession(senderID.String())
@@ -127,9 +154,6 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 					corestore.SaveSkippedKey(senderID.String(), c, k)
 				}
 				
-				// Payload murni (tanpa header DR) sudah ada di plaintext
-				// Tapi alur di bawah mengharapkan encryptedPayloadB64 untuk didekripsi ulang (biar seragam)
-				// Kita bypass saja dengan langsung unmarshal
 				processDecryptedPayload(ctx, h, senderID, []byte(plaintext))
 				return
 			}
@@ -138,12 +162,20 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 	} else if strings.HasPrefix(envelope, "X3DH:") {
 		// 2. Jalur Handshake X3DH (Lengkap)
 		fmt.Printf("[HANDSHAKE] Receiving new X3DH Handshake from %s\n", FormatPeerID(senderID.String()))
-		parts := strings.SplitN(envelope, ":", 4)
+		// Format baru: X3DH:keyID:ePub:senderRatchetPub:encryptedPayload
+		parts := strings.SplitN(envelope, ":", 5)
 		if len(parts) < 4 { return }
 		
 		keyID := parts[1]
 		ePubB64 := parts[2]
-		encryptedPayloadB64 = parts[3]
+		// Dukung format lama (4 parts) dan baru (5 parts dengan ratchetPub)
+		var senderRatchetPubB64 string
+		if len(parts) == 5 {
+			senderRatchetPubB64 = parts[3]
+			encryptedPayloadB64 = parts[4]
+		} else {
+			encryptedPayloadB64 = parts[3]
+		}
 
 		privKeyB64, err := corestore.FindPrivateKeyByID(keyID)
 		if err != nil || privKeyB64 == "" {
@@ -157,10 +189,57 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		aesKey, err = corecrypto.DeriveSharedSecret(privKeyBytes, ePubBytes)
 		if err != nil { return }
 
-		// SIMPAN SESI: Agar pesan berikutnya dari orang ini tidak perlu X3DH lagi
-		rootKeyB64 := base64.StdEncoding.EncodeToString(aesKey)
+		// Inisialisasi ratchet keys di sisi receiver
+		bobPreKeyPub, err := corecrypto.DerivePublicKey(privKeyBytes)
+		if err != nil { return }
+		bobPreKeyPubB64 := base64.StdEncoding.EncodeToString(bobPreKeyPub)
+
+		// Lakukan DH Receive Step awal menggunakan privKeyBytes (Bob_PreKey_Priv) dan senderRatchetPub
+		recvRootKey := aesKey
+		recvChainKey := []byte{}
+		if senderRatchetPubB64 != "" {
+			senderRatchetPubBytes, decErr := base64.StdEncoding.DecodeString(senderRatchetPubB64)
+			if decErr == nil {
+				recvChainSecret, dhErr := corecrypto.DeriveSharedSecret(privKeyBytes, senderRatchetPubBytes)
+				if dhErr == nil {
+					res, err := corecrypto.HKDFExpand(recvChainSecret, "p2p-core-dh-ratchet", 64)
+					if err == nil {
+						recvRootKey = res[:32]
+						recvChainKey = res[32:]
+					}
+				}
+			}
+		}
+
+		// Generate local ratchet keypair baru untuk Bob
+		localRatchetPriv, localRatchetPub, _ := corecrypto.GenerateEphemeralKeypair()
+		localRatchetPrivB64 := base64.StdEncoding.EncodeToString(localRatchetPriv)
+		localRatchetPubB64  := base64.StdEncoding.EncodeToString(localRatchetPub)
+
+		// Lakukan DH Send Step awal
+		sendRootKey := recvRootKey
+		sendChainKey := []byte{}
+		if senderRatchetPubB64 != "" {
+			senderRatchetPubBytes, decErr := base64.StdEncoding.DecodeString(senderRatchetPubB64)
+			if decErr == nil {
+				sharedSecretSend, dhErr := corecrypto.DeriveSharedSecret(localRatchetPriv, senderRatchetPubBytes)
+				if dhErr == nil {
+					resSend, err := corecrypto.HKDFExpand(sharedSecretSend, "p2p-core-dh-ratchet", 64)
+					if err == nil {
+						sendRootKey = resSend[:32]
+						sendChainKey = resSend[32:]
+					}
+				}
+			}
+		}
+
+		rootKeyB64 := base64.StdEncoding.EncodeToString(sendRootKey)
+		sendChainB64 := base64.StdEncoding.EncodeToString(sendChainKey)
+		recvChainB64 := base64.StdEncoding.EncodeToString(recvChainKey)
+
 		fmt.Printf("[HANDSHAKE] Initial session established. RootKey: %s...\n", rootKeyB64[:6])
-		corestore.SaveSession(senderID.String(), "", rootKeyB64, "", "", "", "", "", 0, 0, 0)
+		// Simpan dengan SendChainKey, RecvChainKey dan ratchet keys terisi lengkap
+		corestore.SaveSession(senderID.String(), bobPreKeyPubB64, rootKeyB64, sendChainB64, recvChainB64, senderRatchetPubB64, localRatchetPrivB64, localRatchetPubB64, 0, 0, 0)
 	} else {
 		return
 	}
@@ -278,6 +357,11 @@ func SendStatusUpdate(ctx context.Context, h host.Host, targetID peer.ID, refID 
 func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID, env MessageEnvelope) error {
 	jsonPayload, _ := json.Marshal(env)
 
+	// BUG-03: Lock per-peer agar tidak ada race condition pada session state
+	sessionMu := getSessionLock(targetID.String())
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
 	// 1. Cek apakah sudah punya sesi aktif (Session Cache)
 	remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, err := corestore.LoadSession(targetID.String())
 	if err == nil && rootB64 != "" {
@@ -340,6 +424,7 @@ func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 	}
 	if !preKeyFound { return fmt.Errorf("no pre-key found") }
 
+
 	logger.Debug().Msg("X3DH HANDSHAKE: Generating Ephemeral Keypair & Deriving Shared Secret")
 	ePriv, ePub, err := corecrypto.GenerateEphemeralKeypair()
 	if err != nil { return err }
@@ -348,18 +433,42 @@ func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 	aesKey, err := corecrypto.DeriveSharedSecret(ePriv, peerPubKeyBytes)
 	if err != nil { return err }
 
-	// Simpan Sesi Awal
-	rootKeyB64 := base64.StdEncoding.EncodeToString(aesKey)
-	logger.Info().Str("peerID", FormatPeerID(targetID.String())).Str("rootKey", rootKeyB64[:6]).Msg("X3DH HANDSHAKE: Saving Initial Session")
-	corestore.SaveSession(targetID.String(), pubKeyB64, rootKeyB64, "", "", "", "", "", 0, 0, 0)
+	// Inisialisasi Double Ratchet: Generate ratchet keypair lokal
+	localRatchetPriv, localRatchetPub, err := corecrypto.GenerateEphemeralKeypair()
+	if err != nil { return err }
 
+	// Lakukan DH Send Step awal menggunakan localRatchetPriv dan pubKeyB64 (Pre-key Bob)
+	sharedSecret, err := corecrypto.DeriveSharedSecret(localRatchetPriv, peerPubKeyBytes)
+	if err != nil { return err }
+	res, err := corecrypto.HKDFExpand(sharedSecret, "p2p-core-dh-ratchet", 64)
+	if err != nil { return err }
+
+	initRootKey := res[:32]
+	initSendChainKey := res[32:]
+
+	senderRootKeyB64 := base64.StdEncoding.EncodeToString(initRootKey)
+	senderSendChainB64 := base64.StdEncoding.EncodeToString(initSendChainKey)
+	senderRatchetPrivB64 := base64.StdEncoding.EncodeToString(localRatchetPriv)
+	senderRatchetPubB64Out := base64.StdEncoding.EncodeToString(localRatchetPub)
+
+	logger.Info().Str("peerID", FormatPeerID(targetID.String())).Str("rootKey", senderRootKeyB64[:6]).Msg("X3DH HANDSHAKE: Saving Initial Session with Ratchet Keys")
+	// Simpan session dengan SendChainKey terisi, RecvChainKey kosong, dan RemoteRatchetPubkey = pubKeyB64
+	corestore.SaveSession(targetID.String(), pubKeyB64, senderRootKeyB64, senderSendChainB64, "", pubKeyB64, senderRatchetPrivB64, senderRatchetPubB64Out, 0, 0, 0)
+
+	// Sertakan localRatchetPub di dalam payload agar receiver bisa init RecvChainKey
+	type x3dhPayload struct {
+		Data        []byte `json:"d"`
+		RatchetPub  string `json:"rp"`
+	}
 	encryptedBytes, err := corecrypto.EncryptMessageRaw(aesKey, jsonPayload)
 	if err != nil { return err }
 
 	ePubB64 := base64.StdEncoding.EncodeToString(ePub)
-	finalWireEnvelope := fmt.Sprintf("X3DH:%s:%s:%s", keyID, ePubB64, base64.StdEncoding.EncodeToString(encryptedBytes))
+	// Format: X3DH:keyID:ePub:senderRatchetPub:encryptedPayload
+	finalWireEnvelope := fmt.Sprintf("X3DH:%s:%s:%s:%s", keyID, ePubB64, senderRatchetPubB64Out, base64.StdEncoding.EncodeToString(encryptedBytes))
 	return transmitEnvelope(ctx, h, targetID, finalWireEnvelope)
 }
+
 
 // deriveNextKeys is deprecated, logic moved to corecrypto.RatchetStep
 
@@ -381,14 +490,34 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 	return sendSecureEnvelope(ctx, h, priv, target, env)
 }
 
-// Helper function to handle both live and mailbox transmission
 func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWireEnvelope string) error {
-	s, err := h.NewStream(ctx, target, MessagingProtocolID)
+	logger.Debug().Str("target", target.String()).Msg("transmitEnvelope: Attempting direct dial to target")
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	s, err := h.NewStream(dialCtx, target, MessagingProtocolID)
 	if err == nil {
-		defer s.Close()
-		_ = binary.Write(s, binary.LittleEndian, uint32(len(finalWireEnvelope)))
-		_, _ = s.Write([]byte(finalWireEnvelope))
-		return nil
+		logger.Debug().Str("target", target.String()).Msg("transmitEnvelope: Direct dial succeeded, writing envelope")
+		errWrite := binary.Write(s, binary.LittleEndian, uint32(len(finalWireEnvelope)))
+		if errWrite == nil {
+			_, errWrite = s.Write([]byte(finalWireEnvelope))
+		}
+		if errWrite == nil {
+			// Read ACK
+			respReader := bufio.NewReader(s)
+			s.SetReadDeadline(time.Now().Add(1 * time.Second))
+			resp, errRead := respReader.ReadString('\n')
+			if errRead != nil || strings.TrimSpace(resp) != "OK" {
+				errWrite = fmt.Errorf("did not receive ACK from target: %v", errRead)
+			}
+		}
+		s.Close()
+		if errWrite == nil {
+			return nil
+		}
+		logger.Warn().Err(errWrite).Str("target", target.String()).Msg("transmitEnvelope: Direct write failed, falling back to mailbox")
+		err = errWrite
+	} else {
+		logger.Debug().Err(err).Str("target", target.String()).Msg("transmitEnvelope: Direct dial failed, falling back to mailbox storage")
 	}
 	encodedEnvelope := base64.StdEncoding.EncodeToString([]byte(finalWireEnvelope))
 	return StoreOfflineMessage(ctx, h, target, h.ID().String(), encodedEnvelope)
@@ -559,8 +688,8 @@ func processCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		return
 	}
 
-	peers := h.Network().Peers()
-	for _, p := range peers {
-		_ = SendMessage(ctx, h, priv, p, msgStr)
-	}
+	// DESIGN-05 FIX: Input tidak dikenal sebagai command → tampilkan error, jangan broadcast ke semua peer.
+	// Perilaku broadcast lama sangat berbahaya (typo command = kirim ke semua orang).
+	fmt.Printf("[Error] Unknown command: '%s'\n", msgStr)
+	fmt.Printf("Available commands: /msg, /group, /join, /fetch, /register, /upload, /latency\n> ")
 }

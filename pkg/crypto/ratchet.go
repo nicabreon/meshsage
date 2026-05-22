@@ -82,6 +82,16 @@ func (s *SessionState) DecryptWithRatchet(payload string) (string, map[uint32][]
 		newPriv, newPub, _ := GenerateEphemeralKeypair()
 		s.LocalRatchetPrivkey = newPriv
 		s.LocalRatchetPubkey = newPub
+
+		// Send DH step
+		sharedSecretSend, err := DeriveSharedSecret(s.LocalRatchetPrivkey, s.RemoteRatchetPubkey)
+		if err == nil {
+			resSend, err := HKDFExpand(sharedSecretSend, "p2p-core-dh-ratchet", 64)
+			if err == nil {
+				s.RootKey = resSend[:32]
+				s.SendChainKey = resSend[32:]
+			}
+		}
 	}
 	
 	// 2. Skip keys in current symmetric ratchet if n > s.M

@@ -67,6 +67,22 @@ func SetupMailbox(h host.Host, isClientOnly bool) {
 			handleNotifyStream(s)
 		})
 	}
+
+	// BUG-08 FIX: Periodic cleanup rateLimitMap agar tidak memory leak pada relay long-running
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			rateLimitMutex.Lock()
+			for k, t := range rateLimitMap {
+				if time.Since(t) > 5*time.Minute {
+					delete(rateLimitMap, k)
+				}
+			}
+			rateLimitMutex.Unlock()
+			logger.Debug().Msg("Rate limit map cleaned up")
+		}
+	}()
 }
 
 func handleNotifyStream(s network.Stream) {
@@ -291,7 +307,9 @@ func StoreOfflineMessage(ctx context.Context, h host.Host, targetID peer.ID, sen
 	for _, p := range infraPeers {
 		if p != targetID { targetPeers[p] = true }
 	}
-	closest, _ := corenet.GlobalDHT.GetClosestPeers(ctx, coord)
+	dhtCtx2, cancel2 := context.WithTimeout(ctx, 3*time.Second)
+	closest, _ := corenet.GlobalDHT.GetClosestPeers(dhtCtx2, coord)
+	cancel2()
 	for _, p := range closest {
 		if len(targetPeers) >= 3 { break }
 		if p != h.ID() && p != targetID { targetPeers[p] = true }
