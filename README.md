@@ -51,6 +51,13 @@ Start a node:
 ./meshsage -port 4001 -db messages.db
 ```
 
+### **3. Automated E2E Testing**
+We have an automated End-to-End test script that validates the Double Ratchet implementation, Offline Mailbox, and Group Messaging in various scenarios:
+```bash
+bash e2e_test_scenarios.sh
+```
+Check out the [Test Walkthrough](test_walkthrough.md) for detailed results and cryptographic verification logs.
+
 ---
 
 ## **💬 CLI Command Guide**
