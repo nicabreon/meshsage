@@ -76,6 +76,8 @@ Once the node is running, you can interact with it using the following commands:
 
 ## **🏗️ System Architecture**
 
+For a detailed look at the subsystems, sequence flows, and network topology, see the [System Architecture & Subsystem Diagrams](architecture_diagrams.md).
+
 *   **Networking**: libp2p (Kademlia DHT, GossipSub, mDNS).
 *   **Cryptography**: X25519 (Diffie-Hellman), AES-GCM (Encryption), HMAC-SHA256 (Ratchet).
 *   **Storage**: SQLite (with WAL mode for high concurrency).
