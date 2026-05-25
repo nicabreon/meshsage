@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -149,11 +150,25 @@ func main() {
 		corenet.IsClientOnly = true
 	}
 
-	// Automatic Pre-Key Refill for any connected infrastructure node
-	// 5. Dynamic Infrastructure Connection & Pre-Key Management
+	// BUG-2/3 FIX: Deduplication map for peer connection events.
+	// libp2p fires PeerConnected for every new transport (QUIC, mDNS, circuit relay) separately.
+	// Without dedup, the same peer triggers infrastructure sync 2-3x within milliseconds.
+	var recentlyConnected sync.Map // map[peer.ID]time.Time
+
 	host.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(n network.Network, conn network.Conn) {
 			remoteID := conn.RemotePeer()
+
+			// Dedup: if we fired this event for the same peer within the last 5 seconds, skip.
+			now := time.Now()
+			if last, ok := recentlyConnected.Load(remoteID); ok {
+				if now.Sub(last.(time.Time)) < 5*time.Second {
+					logger.Debug().Str("peerID", remoteID.String()).Msg(">>> PEER CONNECTED (dedup suppressed duplicate event)")
+					return
+				}
+			}
+			recentlyConnected.Store(remoteID, now)
+
 			logger.Info().Str("peerID", remoteID.String()).Msg(">>> NEW PEER CONNECTED")
 			logger.Debug().Str("peerID", remoteID.String()).Msg("Checking capabilities for new peer...")
 

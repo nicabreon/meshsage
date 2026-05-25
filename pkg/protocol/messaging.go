@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -140,6 +141,17 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				}
 
 				// Berhasil dekripsi! Simpan state baru
+				// BUG-1 FIX: If the session.RemoteRatchetPubkey changed during DecryptWithRatchet,
+				// a DH ratchet step occurred. Clear ALL old skipped keys — they belong to the old
+				// epoch and will permanently fail decryption.
+				oldRemoteRatchet, _ := base64.StdEncoding.DecodeString(remoteRatchetB64)
+				if !bytes.Equal(oldRemoteRatchet, session.RemoteRatchetPubkey) {
+					if clearErr := corestore.ClearSkippedKeys(senderID.String()); clearErr != nil {
+						logger.Warn().Err(clearErr).Str("peerID", senderID.String()).Msg("DR: Failed to clear stale skipped keys after DH step")
+					} else {
+						logger.Debug().Str("peerID", senderID.String()).Msg("DR: DH ratchet step detected — cleared stale skipped keys")
+					}
+				}
 				corestore.SaveSession(senderID.String(), remoteIdentityB64, 
 					base64.StdEncoding.EncodeToString(session.RootKey),
 					base64.StdEncoding.EncodeToString(session.SendChainKey),
@@ -238,6 +250,14 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		recvChainB64 := base64.StdEncoding.EncodeToString(recvChainKey)
 
 		fmt.Printf("[HANDSHAKE] Initial session established. RootKey: %s...\n", rootKeyB64[:6])
+		// BUG-1 FIX: Clear ALL stale skipped keys from old epochs before saving new session.
+		// Old skipped keys (keyed by peerID+counter) belong to a different ratchet epoch
+		// and will always fail decryption with "cipher: message authentication failed".
+		if clearErr := corestore.ClearSkippedKeys(senderID.String()); clearErr != nil {
+			logger.Warn().Err(clearErr).Str("peerID", senderID.String()).Msg("X3DH: Failed to clear stale skipped keys")
+		} else {
+			logger.Debug().Str("peerID", senderID.String()).Msg("X3DH: Cleared stale skipped keys for new session")
+		}
 		// Simpan dengan SendChainKey, RecvChainKey dan ratchet keys terisi lengkap
 		corestore.SaveSession(senderID.String(), bobPreKeyPubB64, rootKeyB64, sendChainB64, recvChainB64, senderRatchetPubB64, localRatchetPrivB64, localRatchetPubB64, 0, 0, 0)
 	} else {
@@ -452,6 +472,12 @@ func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 	senderRatchetPubB64Out := base64.StdEncoding.EncodeToString(localRatchetPub)
 
 	logger.Info().Str("peerID", FormatPeerID(targetID.String())).Str("rootKey", senderRootKeyB64[:6]).Msg("X3DH HANDSHAKE: Saving Initial Session with Ratchet Keys")
+	// BUG-1 FIX: Sender side — clear stale skipped keys before establishing new session.
+	if clearErr := corestore.ClearSkippedKeys(targetID.String()); clearErr != nil {
+		logger.Warn().Err(clearErr).Str("peerID", targetID.String()).Msg("X3DH SEND: Failed to clear stale skipped keys")
+	} else {
+		logger.Debug().Str("peerID", targetID.String()).Msg("X3DH SEND: Cleared stale skipped keys for new session")
+	}
 	// Simpan session dengan SendChainKey terisi, RecvChainKey kosong, dan RemoteRatchetPubkey = pubKeyB64
 	corestore.SaveSession(targetID.String(), pubKeyB64, senderRootKeyB64, senderSendChainB64, "", pubKeyB64, senderRatchetPrivB64, senderRatchetPubB64Out, 0, 0, 0)
 

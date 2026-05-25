@@ -302,6 +302,15 @@ func GetSkippedKey(peerID string, counter uint32) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(keyStr)
 }
 
+// ClearSkippedKeys removes ALL skipped keys for a peer.
+// Must be called whenever a DH Ratchet step occurs or a new X3DH session is established,
+// because old epoch keys are permanently invalid and would cause "cipher: message authentication failed".
+func ClearSkippedKeys(peerID string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec(`DELETE FROM skipped_keys WHERE peer_id = ?`, peerID)
+	return err
+}
+
 // SaveAlias persists an alias record to the database
 func SaveAlias(aliasHash, aliasName, peerID string, pubkeyBytes []byte) error {
 	if DB == nil { return fmt.Errorf("database not initialized") }
