@@ -271,9 +271,11 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 	pubKeyStr := base64.StdEncoding.EncodeToString(pubKeyBytes)
 
 	aliasMutex.Lock()
-
-
-	_ = corestore.SaveAlias(aliasHash, alias, myPeerID, pubKeyBytes)
+	err = corestore.SaveAlias(aliasHash, alias, myPeerID, pubKeyBytes)
+	if err != nil {
+		aliasMutex.Unlock()
+		return fmt.Errorf("failed to save registered alias to local database: %w", err)
+	}
 	aliasStore[aliasHash] = AliasRecord{PeerID: myPeerID, PubKey: pubKey}
 	ownerStore[pubKeyStr] = alias
 	aliasMutex.Unlock()
