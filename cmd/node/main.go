@@ -80,9 +80,14 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Convert DefaultSeeds strings to peer.AddrInfo for AutoRelay
+	// Convert seeds strings to peer.AddrInfo for AutoRelay
+	seedsList := DefaultSeeds
+	if *targetPeer != "" {
+		seedsList = []string{*targetPeer}
+	}
+
 	var staticRelays []peer.AddrInfo
-	for _, s := range DefaultSeeds {
+	for _, s := range seedsList {
 		ma, err := multiaddr.NewMultiaddr(s)
 		if err != nil {
 			continue
@@ -203,7 +208,7 @@ func main() {
 	go func() {
 		seeds := DefaultSeeds
 		if *targetPeer != "" {
-			seeds = append(seeds, *targetPeer)
+			seeds = []string{*targetPeer}
 		}
 
 		ticker := time.NewTicker(30 * time.Second)
