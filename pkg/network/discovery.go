@@ -2,7 +2,6 @@ package network
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -11,7 +10,6 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/core/discovery"
-	"github.com/multiformats/go-multiaddr"
 	"github.com/nicabreon/meshsage/pkg/logger"
 )
 
@@ -82,36 +80,6 @@ func SetupDiscovery(h host.Host) error {
 								dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 								defer cancel()
 								
-								// Proactively inject circuit relay addresses for the discovered target peer using all connected relays.
-								// This ensures libp2p can fall back to relay-routing if direct UDP connection has not punched through yet.
-								for _, p := range h.Network().Peers() {
-									protos, _ := h.Peerstore().GetProtocols(p)
-									isRelay := false
-									for _, proto := range protos {
-										if string(proto) == "/p2p-core/mailbox/1.0.0" {
-											isRelay = true
-											break
-										}
-									}
-									if isRelay {
-										// 1. Add short form
-										relayAddrStr := fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", p.String(), pi.ID.String())
-										ma, err := multiaddr.NewMultiaddr(relayAddrStr)
-										if err == nil {
-											h.Peerstore().AddAddr(pi.ID, ma, 5*time.Minute)
-										}
-										
-										// 2. Add full physical form
-										for _, addr := range h.Peerstore().Addrs(p) {
-											fullRelayAddrStr := fmt.Sprintf("%s/p2p/%s/p2p-circuit/p2p/%s", addr.String(), p.String(), pi.ID.String())
-											fullMa, err := multiaddr.NewMultiaddr(fullRelayAddrStr)
-											if err == nil {
-												h.Peerstore().AddAddr(pi.ID, fullMa, 5*time.Minute)
-											}
-										}
-									}
-								}
-
 								errDial := h.Connect(dialCtx, pi)
 								if errDial == nil {
 									logger.Info().Str("peerID", pi.ID.String()).Msg("DHT Discovery: Successfully connected")

@@ -22,8 +22,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
-	"github.com/multiformats/go-multiaddr"
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
+	corenet "github.com/nicabreon/meshsage/pkg/network"
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
 	"github.com/nicabreon/meshsage/pkg/logger"
 )
@@ -536,34 +536,18 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 }
 
 func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWireEnvelope string) error {
-	// Proactively inject circuit relay addresses for the target peer using all connected relays.
-	// This ensures libp2p can fall back to relay-routing if direct UDP connection has not punched through yet.
-	for _, p := range h.Network().Peers() {
-		protos, _ := h.Peerstore().GetProtocols(p)
-		isRelay := false
-		for _, proto := range protos {
-			if string(proto) == "/p2p-core/mailbox/1.0.0" {
-				isRelay = true
-				break
-			}
-		}
-		if isRelay {
-			// 1. Add the short relay-id format
-			relayAddrStr := fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", p.String(), target.String())
-			ma, err := multiaddr.NewMultiaddr(relayAddrStr)
-			if err == nil {
-				h.Peerstore().AddAddr(target, ma, 5*time.Minute)
-			}
-			
-			// 2. Add the full physical transport relay address format
-			for _, addr := range h.Peerstore().Addrs(p) {
-				fullRelayAddrStr := fmt.Sprintf("%s/p2p/%s/p2p-circuit/p2p/%s", addr.String(), p.String(), target.String())
-				fullMa, err := multiaddr.NewMultiaddr(fullRelayAddrStr)
-				if err == nil {
-					h.Peerstore().AddAddr(target, fullMa, 5*time.Minute)
-				}
-			}
-			logger.Debug().Str("target", target.String()).Str("relay", p.String()).Msg("Added dynamic circuit relay addresses to peerstore")
+	// Query the DHT to find the target peer's actual addresses (including relay addresses)
+	// if we don't have them cached in peerstore. This is standard libp2p peer routing.
+	if len(h.Peerstore().Addrs(target)) == 0 && corenet.GlobalDHT != nil {
+		logger.Debug().Str("target", target.String()).Msg("No addresses for target, querying DHT FindPeer...")
+		findCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		pinfo, err := corenet.GlobalDHT.FindPeer(findCtx, target)
+		cancel()
+		if err == nil {
+			h.Peerstore().AddAddrs(target, pinfo.Addrs, 5*time.Minute)
+			logger.Debug().Str("target", target.String()).Int("addrs", len(pinfo.Addrs)).Msg("Found target addresses via DHT")
+		} else {
+			logger.Warn().Err(err).Str("target", target.String()).Msg("DHT FindPeer failed")
 		}
 	}
 
