@@ -82,13 +82,14 @@ Once the node is running (either in CLI or TUI mode), you can use the following 
 | :--- | :--- | :--- |
 | `/register @alias` | Register an alias for your Peer ID on the DHT. | `/register @nicabreon` |
 | `/msg <target>` | Send an encrypted private message. Target can be a PeerID or `@alias`. | `/msg @mediaserver Hello!` |
-| `/group-create <group_alias> <members>` | Create a cryptographic group and register its alias. | `/group-create @kopi-senja @aldo` |
+| `/group-create <group_alias> <secure/unsecure> [member1,member2,...]` | Create a cryptographic group and register its alias (members parameter is optional). | `/group-create @kopi-senja SECURE @aldo` |
+| `/group-join <group_alias>` | Join an open (UNSECURE) group. | `/group-join @woroworo` |
 | `/group <group_alias_or_id> <message>` | Send an encrypted group message. | `/group @kopi-senja Halo gaes!` |
-| `/group-add <group_alias_or_id> <member>` | Creator only: Add a member to the group and sync keys. | `/group-add @kopi-senja @bob` |
-| `/group-remove <group_alias_or_id> <member>` | Creator only: Kick a member and trigger key rotation. | `/group-remove @kopi-senja @bob` |
-| `/group-exit <group_alias_or_id>` | Member only: Leave the group. | `/group-exit @kopi-senja` |
+| `/group-add <group_alias_or_id> <member>` | Creator only: Add a member to a SECURE group. | `/group-add @kopi-senja @bob` |
+| `/group-remove <group_alias_or_id> <member>` | Creator only: Kick a member from a group (triggers key rotation). | `/group-remove @kopi-senja @bob` |
+| `/group-exit <group_alias_or_id>` | Member only: Leave a group (triggers key rotation). | `/group-exit @kopi-senja` |
 | `/group-disband <group_alias_or_id>` | Creator only: Dissolve the group. | `/group-disband @kopi-senja` |
-| `/group-info <group_alias_or_id>` | Display group metadata and member online status. | `/group-info @kopi-senja` |
+| `/group-info <group_alias_or_id>` | Display group metadata, type, and member online status. | `/group-info @kopi-senja` |
 | `/fetch` | Manually trigger a mailbox fetch for offline messages. | `/fetch` |
 | `/latency <target>` | Test latency (RTT) to a PeerID or `@alias`. | `/latency @mediaserver` |
 

@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"fmt"
+	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -115,6 +117,25 @@ func InitDatabase(dbPath string) error {
 		peer_id TEXT NOT NULL,
 		pubkey_bytes BLOB NOT NULL,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	-- Create group_metadata table for cryptographic group chat ownership
+	CREATE TABLE IF NOT EXISTS group_metadata (
+		group_id TEXT PRIMARY KEY,
+		group_alias TEXT UNIQUE NOT NULL,
+		creator_id TEXT NOT NULL,
+		group_type TEXT CHECK(group_type IN ('SECURE', 'UNSECURE')) NOT NULL,
+		created_at INTEGER NOT NULL,
+		signature TEXT NOT NULL
+	);
+
+	-- Create group_members_v2 table for proper member role management
+	CREATE TABLE IF NOT EXISTS group_members_v2 (
+		group_id TEXT,
+		peer_id TEXT,
+		role TEXT CHECK(role IN ('CREATOR', 'MEMBER')) DEFAULT 'MEMBER',
+		joined_at INTEGER NOT NULL,
+		PRIMARY KEY (group_id, peer_id)
 	);`
 
 	_, err = DB.Exec(query)
@@ -459,4 +480,99 @@ func GetGroupMemberships(peerID string) ([]string, error) {
 	}
 	return groups, nil
 }
+
+// GroupMetadata represents the persistent metadata of a group
+type GroupMetadata struct {
+	GroupID    string `json:"group_id"`
+	GroupAlias string `json:"group_alias"`
+	CreatorID  string `json:"creator_id"`
+	GroupType  string `json:"group_type"`
+	CreatedAt  int64  `json:"created_at"`
+	Signature  string `json:"signature"`
+}
+
+// SaveGroupMetadata persists a group's metadata
+func SaveGroupMetadata(meta GroupMetadata) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec(`INSERT OR REPLACE INTO group_metadata 
+		(group_id, group_alias, creator_id, group_type, created_at, signature) 
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		meta.GroupID, meta.GroupAlias, meta.CreatorID, meta.GroupType, meta.CreatedAt, meta.Signature)
+	return err
+}
+
+// LoadGroupMetadata retrieves a group's metadata by its ID or Alias
+func LoadGroupMetadata(idOrAlias string) (meta GroupMetadata, err error) {
+	if DB == nil { return meta, fmt.Errorf("database not initialized") }
+	
+	// Clean the alias search term
+	alias := idOrAlias
+	if !strings.HasPrefix(alias, "@") {
+		alias = "@" + alias
+	}
+
+	row := DB.QueryRow(`SELECT group_id, group_alias, creator_id, group_type, created_at, signature 
+		FROM group_metadata WHERE group_id = ? OR group_alias = ? OR group_alias = ?`, 
+		idOrAlias, idOrAlias, alias)
+	
+	err = row.Scan(&meta.GroupID, &meta.GroupAlias, &meta.CreatorID, &meta.GroupType, &meta.CreatedAt, &meta.Signature)
+	return
+}
+
+// GetGroupType returns the group type ("SECURE" or "UNSECURE")
+func GetGroupType(groupID string) (string, error) {
+	if DB == nil { return "", fmt.Errorf("database not initialized") }
+	var gtype string
+	err := DB.QueryRow("SELECT group_type FROM group_metadata WHERE group_id = ?", groupID).Scan(&gtype)
+	return gtype, err
+}
+
+// AddGroupMemberV2 inserts or updates a group member with their role
+func AddGroupMemberV2(groupID, peerID, role string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec(`INSERT OR REPLACE INTO group_members_v2 
+		(group_id, peer_id, role, joined_at) VALUES (?, ?, ?, ?)`,
+		groupID, peerID, role, time.Now().Unix())
+	return err
+}
+
+// RemoveGroupMemberV2 deletes a member from the group
+func RemoveGroupMemberV2(groupID, peerID string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec(`DELETE FROM group_members_v2 WHERE group_id = ? AND peer_id = ?`, groupID, peerID)
+	return err
+}
+
+// GroupMemberV2 represents a member record with role
+type GroupMemberV2 struct {
+	PeerID string
+	Role   string
+}
+
+// GetGroupMembersV2 retrieves all members and their roles in a group
+func GetGroupMembersV2(groupID string) ([]GroupMemberV2, error) {
+	if DB == nil { return nil, fmt.Errorf("database not initialized") }
+	rows, err := DB.Query(`SELECT peer_id, role FROM group_members_v2 WHERE group_id = ? ORDER BY joined_at ASC`, groupID)
+	if err != nil { return nil, err }
+	defer rows.Close()
+
+	var members []GroupMemberV2
+	for rows.Next() {
+		var m GroupMemberV2
+		if err := rows.Scan(&m.PeerID, &m.Role); err == nil {
+			members = append(members, m)
+		}
+	}
+	return members, nil
+}
+
+// DeleteGroupMetadata removes a group completely from database (disband)
+func DeleteGroupMetadata(groupID string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err1 := DB.Exec(`DELETE FROM group_metadata WHERE group_id = ?`, groupID)
+	_, err2 := DB.Exec(`DELETE FROM group_members_v2 WHERE group_id = ?`, groupID)
+	if err1 != nil { return err1 }
+	return err2
+}
+
 

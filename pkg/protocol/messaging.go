@@ -327,6 +327,61 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 			}
 		}
 
+		// Check for Group Invitation (GINVITE:<json>)
+		if strings.HasPrefix(env.Content, "GINVITE:") {
+			inviteStr := strings.TrimPrefix(env.Content, "GINVITE:")
+			logger.Debug().Str("inviteStr", inviteStr).Msg("Received GINVITE message, parsing...")
+			var invite struct {
+				Meta    corestore.GroupMetadata `json:"meta"`
+				Members []string                `json:"members"`
+				GKey    string                  `json:"gkey"`
+			}
+			if err := json.Unmarshal([]byte(inviteStr), &invite); err != nil {
+				logger.Error().Err(err).Msg("Failed to unmarshal GINVITE JSON")
+				return
+			}
+			
+			// Verify Creator Signature
+			creatorID, errDec := peer.Decode(invite.Meta.CreatorID)
+			if errDec != nil {
+				logger.Error().Err(errDec).Str("creator", invite.Meta.CreatorID).Msg("Failed to decode creator peer ID")
+				return
+			}
+			pubKey := h.Peerstore().PubKey(creatorID)
+			var errExtract error
+			if pubKey == nil {
+				pubKey, errExtract = creatorID.ExtractPublicKey()
+				if errExtract != nil {
+					logger.Error().Err(errExtract).Str("creator", invite.Meta.CreatorID).Msg("Failed to extract creator public key")
+					return
+				}
+			}
+			
+			dataToVerify := []byte(invite.Meta.GroupID + invite.Meta.GroupAlias + invite.Meta.CreatorID + fmt.Sprintf("%d", invite.Meta.CreatedAt))
+			sigBytes, _ := base64.StdEncoding.DecodeString(invite.Meta.Signature)
+			valid, errVerify := pubKey.Verify(dataToVerify, sigBytes)
+			if errVerify != nil {
+				logger.Error().Err(errVerify).Msg("Error verifying GINVITE signature")
+				return
+			}
+			if !valid {
+				logger.Error().Str("group", invite.Meta.GroupAlias).Msg("Received GINVITE with INVALID signature!")
+				return
+			}
+			
+			errJoin := JoinGroupProper(ctx, h, h.Peerstore().PrivKey(h.ID()),
+				invite.Meta.GroupID, invite.Meta.GroupAlias, invite.Meta.CreatorID, invite.Meta.GroupType, invite.Meta.Signature, invite.Members)
+			if errJoin != nil {
+				logger.Error().Err(errJoin).Str("group", invite.Meta.GroupAlias).Msg("Failed to join group in GINVITE handler")
+			}
+			
+			if invite.GKey != "" {
+				keyBytes, _ := base64.StdEncoding.DecodeString(invite.GKey)
+				_ = corestore.SaveGroupSenderKey(invite.Meta.GroupID, invite.Meta.CreatorID, keyBytes)
+			}
+			return
+		}
+
 		// Check for Group Message prefix (Offline Fan-out)
 		if strings.HasPrefix(env.Content, "GRPM:") {
 			parts := strings.SplitN(env.Content, ":", 3)
@@ -656,15 +711,401 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		return
 	}
 
-	if strings.HasPrefix(msgStr, "/join ") {
-		parts := strings.Split(msgStr, " ")
-		if len(parts) >= 2 {
-			groupID := parts[1]
-			var members []string
-			if len(parts) >= 3 {
-				members = strings.Split(parts[2], ",")
+	if strings.HasPrefix(msgStr, "/group-create ") {
+		parts := strings.SplitN(msgStr, " ", 4)
+		if len(parts) >= 3 {
+			alias := parts[1]
+			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+			gtype := strings.ToUpper(parts[2])
+			if gtype != "SECURE" && gtype != "UNSECURE" {
+				logger.Displayf("[Error] Invalid group type: %s. Must be SECURE or UNSECURE.\n", parts[2])
+				return
 			}
-			JoinGroup(ctx, h, priv, groupID, members)
+			
+			var members []string
+			if len(parts) == 4 {
+				memberListRaw := strings.Split(parts[3], ",")
+				for _, m := range memberListRaw {
+					m = strings.TrimSpace(m)
+					if m == "" { continue }
+					if strings.HasPrefix(m, "@") {
+						resolved, err := ResolveAlias(ctx, h, m)
+						if err == nil { m = resolved } else {
+							logger.Displayf("[Error] Failed to resolve member alias %s: %v\n", m, err)
+							return
+						}
+					}
+					members = append(members, m)
+				}
+			}
+
+			// Generate Group ID
+			groupID := fmt.Sprintf("group_%x", sha256.Sum256([]byte(h.ID().String()+fmt.Sprintf("%d", time.Now().UnixNano()))))[:32]
+			
+			// Sign Metadata
+			privKey := h.Peerstore().PrivKey(h.ID())
+			createdAt := time.Now().Unix()
+			dataToSign := []byte(groupID + alias + h.ID().String() + fmt.Sprintf("%d", createdAt))
+			sigBytes, err := privKey.Sign(dataToSign)
+			if err != nil {
+				logger.Displayf("[Error] Failed to sign metadata: %v\n", err)
+				return
+			}
+			sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
+
+			// Register Group Alias to DHT
+			errReg := RegisterAlias(ctx, h, alias, h.ID().String())
+			if errReg != nil {
+				logger.Displayf("[Error] Failed to register group alias %s: %v\n", alias, errReg)
+				return
+			}
+
+			// Join Group locally
+			errJoin := JoinGroupProper(ctx, h, privKey, groupID, alias, h.ID().String(), gtype, sigB64, members)
+			if errJoin == nil {
+				// Send Invitations to members (GINVITE)
+				localKey, _ := corestore.GetGroupLocalKey(groupID)
+				invitePayload := struct {
+					Meta    corestore.GroupMetadata `json:"meta"`
+					Members []string                `json:"members"`
+					GKey    string                  `json:"gkey"`
+				}{
+					Meta: corestore.GroupMetadata{
+						GroupID:    groupID,
+						GroupAlias: alias,
+						CreatorID:  h.ID().String(),
+						GroupType:  gtype,
+						CreatedAt:  createdAt,
+						Signature:  sigB64,
+					},
+					Members: members,
+					GKey:    base64.StdEncoding.EncodeToString(localKey),
+				}
+				inviteBytes, _ := json.Marshal(invitePayload)
+				inviteMsg := "GINVITE:" + string(inviteBytes)
+
+				for _, m := range members {
+					if m != h.ID().String() {
+						targetID, errDec := peer.Decode(m)
+						if errDec == nil {
+							go func(t peer.ID) {
+								_ = SendMessage(ctx, h, privKey, t, inviteMsg)
+							}(targetID)
+						}
+					}
+				}
+			} else {
+				logger.Displayf("[Error] Failed to join group: %v\n", errJoin)
+			}
+		} else {
+			logger.Displayf("[Error] Use: /group-create <alias> <secure/unsecure> [member1,member2,...]\n")
+		}
+		return
+	}
+
+	if strings.HasPrefix(msgStr, "/group-join ") {
+		parts := strings.SplitN(msgStr, " ", 2)
+		if len(parts) == 2 {
+			alias := parts[1]
+			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+			
+			// Resolve group metadata from the network
+			meta, err := ResolveGroupMetadata(ctx, h, alias)
+			if err != nil {
+				logger.Displayf("[Error] Failed to resolve group metadata for %s: %v\n", alias, err)
+				return
+			}
+
+			if meta.GroupType == "SECURE" {
+				logger.Displayf("[Error] This group is SECURE (Closed). You must be invited by the Creator (%s).\n", FormatSender(meta.CreatorID))
+				return
+			}
+
+			privKey := h.Peerstore().PrivKey(h.ID())
+			
+			// Join locally
+			errJoin := JoinGroupProper(ctx, h, privKey, meta.GroupID, meta.GroupAlias, meta.CreatorID, meta.GroupType, meta.Signature, []string{})
+			if errJoin == nil {
+				// Broadcast GCMD:JOIN to the group so online members share GKEYs with us
+				payload := fmt.Sprintf("GCMD:JOIN:%s", h.ID().String())
+				dataToSign := []byte(payload + h.ID().String())
+				sigBytes, _ := privKey.Sign(dataToSign)
+				sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
+
+				gMsg := GroupMessage{
+					SenderID:  h.ID().String(),
+					Payload:   payload,
+					Signature: sigB64,
+				}
+				msgBytes, _ := json.Marshal(gMsg)
+
+				session, exists := activeGroups[meta.GroupID]
+				if exists {
+					_ = session.Topic.Publish(ctx, msgBytes)
+				}
+			} else {
+				logger.Displayf("[Error] Failed to join group: %v\n", errJoin)
+			}
+		} else {
+			logger.Displayf("[Error] Use: /group-join <group_alias>\n")
+		}
+		return
+	}
+
+	if strings.HasPrefix(msgStr, "/group-add ") {
+		parts := strings.SplitN(msgStr, " ", 3)
+		if len(parts) == 3 {
+			alias := parts[1]
+			member := parts[2]
+			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+
+			meta, err := corestore.LoadGroupMetadata(alias)
+			if err != nil {
+				logger.Displayf("[Error] Group metadata not found for %s: %v\n", alias, err)
+				return
+			}
+			if meta.CreatorID != h.ID().String() {
+				logger.Displayf("[Error] Only the Creator can add members.\n")
+				return
+			}
+			if meta.GroupType != "SECURE" {
+				logger.Displayf("[Error] This group is public/open. Members join themselves using /group-join.\n")
+				return
+			}
+
+			if strings.HasPrefix(member, "@") {
+				resolved, err := ResolveAlias(ctx, h, member)
+				if err == nil { member = resolved } else {
+					logger.Displayf("[Error] Failed to resolve member alias %s: %v\n", member, err)
+					return
+				}
+			}
+
+			// Save member locally
+			_ = corestore.AddGroupMemberV2(meta.GroupID, member, "MEMBER")
+
+			// Send GINVITE to new member
+			privKey := h.Peerstore().PrivKey(h.ID())
+			localKey, _ := corestore.GetGroupLocalKey(meta.GroupID)
+			existingMembers, _ := corestore.GetGroupMembersV2(meta.GroupID)
+			var memberIDs []string
+			for _, m := range existingMembers {
+				memberIDs = append(memberIDs, m.PeerID)
+			}
+			// Ensure the new member is also included
+			memberIDs = append(memberIDs, member)
+
+			invitePayload := struct {
+				Meta    corestore.GroupMetadata `json:"meta"`
+				Members []string                `json:"members"`
+				GKey    string                  `json:"gkey"`
+			}{
+				Meta:    meta,
+				Members: memberIDs,
+				GKey:    base64.StdEncoding.EncodeToString(localKey),
+			}
+			inviteBytes, _ := json.Marshal(invitePayload)
+			inviteMsg := "GINVITE:" + string(inviteBytes)
+
+			targetID, errDec := peer.Decode(member)
+			if errDec == nil {
+				go func(t peer.ID) {
+					_ = SendMessage(ctx, h, privKey, t, inviteMsg)
+				}(targetID)
+			}
+
+			// Broadcast GCMD:ADD to existing members
+			payload := fmt.Sprintf("GCMD:ADD:%s", member)
+			dataToSign := []byte(payload + h.ID().String())
+			sigBytes, _ := privKey.Sign(dataToSign)
+			sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
+
+			gMsg := GroupMessage{
+				SenderID:  h.ID().String(),
+				Payload:   payload,
+				Signature: sigB64,
+			}
+			msgBytes, _ := json.Marshal(gMsg)
+
+			session, exists := activeGroups[meta.GroupID]
+			if exists {
+				_ = session.Topic.Publish(ctx, msgBytes)
+			}
+			logger.Displayf("[Group] Added member %s successfully.\n", parts[2])
+		} else {
+			logger.Displayf("[Error] Use: /group-add <group_alias> <member>\n")
+		}
+		return
+	}
+
+	if strings.HasPrefix(msgStr, "/group-remove ") {
+		parts := strings.SplitN(msgStr, " ", 3)
+		if len(parts) == 3 {
+			alias := parts[1]
+			member := parts[2]
+			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+
+			meta, err := corestore.LoadGroupMetadata(alias)
+			if err != nil {
+				logger.Displayf("[Error] Group metadata not found for %s: %v\n", alias, err)
+				return
+			}
+			if meta.CreatorID != h.ID().String() {
+				logger.Displayf("[Error] Only the Creator can remove members.\n")
+				return
+			}
+
+			if strings.HasPrefix(member, "@") {
+				resolved, err := ResolveAlias(ctx, h, member)
+				if err == nil { member = resolved } else {
+					logger.Displayf("[Error] Failed to resolve member alias %s: %v\n", member, err)
+					return
+				}
+			}
+
+			// Broadcast GCMD:REMOVE
+			payload := fmt.Sprintf("GCMD:REMOVE:%s", member)
+			privKey := h.Peerstore().PrivKey(h.ID())
+			dataToSign := []byte(payload + h.ID().String())
+			sigBytes, _ := privKey.Sign(dataToSign)
+			sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
+
+			gMsg := GroupMessage{
+				SenderID:  h.ID().String(),
+				Payload:   payload,
+				Signature: sigB64,
+			}
+			msgBytes, _ := json.Marshal(gMsg)
+
+			session, exists := activeGroups[meta.GroupID]
+			if exists {
+				_ = session.Topic.Publish(ctx, msgBytes)
+			}
+
+			// Process locally
+			ProcessGroupControlMessage(ctx, h, meta.GroupID, gMsg)
+		} else {
+			logger.Displayf("[Error] Use: /group-remove <group_alias> <member>\n")
+		}
+		return
+	}
+
+	if strings.HasPrefix(msgStr, "/group-exit ") {
+		parts := strings.SplitN(msgStr, " ", 2)
+		if len(parts) == 2 {
+			alias := parts[1]
+			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+
+			meta, err := corestore.LoadGroupMetadata(alias)
+			if err != nil {
+				logger.Displayf("[Error] Group metadata not found for %s: %v\n", alias, err)
+				return
+			}
+			if meta.CreatorID == h.ID().String() {
+				logger.Displayf("[Warning] You are the Creator. Use /group-disband to dissolve the group.\n")
+				return
+			}
+
+			// Broadcast GCMD:EXIT
+			payload := fmt.Sprintf("GCMD:EXIT:%s", h.ID().String())
+			privKey := h.Peerstore().PrivKey(h.ID())
+			dataToSign := []byte(payload + h.ID().String())
+			sigBytes, _ := privKey.Sign(dataToSign)
+			sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
+
+			gMsg := GroupMessage{
+				SenderID:  h.ID().String(),
+				Payload:   payload,
+				Signature: sigB64,
+			}
+			msgBytes, _ := json.Marshal(gMsg)
+
+			session, exists := activeGroups[meta.GroupID]
+			if exists {
+				_ = session.Topic.Publish(ctx, msgBytes)
+				
+				// Exit locally
+				session.Sub.Cancel()
+				session.Topic.Close()
+				groupsMutex.Lock()
+				delete(activeGroups, meta.GroupID)
+				groupsMutex.Unlock()
+			}
+			_ = corestore.DeleteGroupMetadata(meta.GroupID)
+			logger.Displayf("[Group] You left group %s successfully.\n", meta.GroupAlias)
+		}
+		return
+	}
+
+	if strings.HasPrefix(msgStr, "/group-disband ") {
+		parts := strings.SplitN(msgStr, " ", 2)
+		if len(parts) == 2 {
+			alias := parts[1]
+			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+
+			meta, err := corestore.LoadGroupMetadata(alias)
+			if err != nil {
+				logger.Displayf("[Error] Group metadata not found for %s: %v\n", alias, err)
+				return
+			}
+			if meta.CreatorID != h.ID().String() {
+				logger.Displayf("[Error] Only the Creator can disband the group.\n")
+				return
+			}
+
+			// Broadcast GCMD:DISBAND
+			payload := "GCMD:DISBAND:"
+			privKey := h.Peerstore().PrivKey(h.ID())
+			dataToSign := []byte(payload + h.ID().String())
+			sigBytes, _ := privKey.Sign(dataToSign)
+			sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
+
+			gMsg := GroupMessage{
+				SenderID:  h.ID().String(),
+				Payload:   payload,
+				Signature: sigB64,
+			}
+			msgBytes, _ := json.Marshal(gMsg)
+
+			session, exists := activeGroups[meta.GroupID]
+			if exists {
+				_ = session.Topic.Publish(ctx, msgBytes)
+			}
+
+			// Disband locally
+			ProcessGroupControlMessage(ctx, h, meta.GroupID, gMsg)
+		}
+		return
+	}
+
+	if strings.HasPrefix(msgStr, "/group-info ") {
+		parts := strings.SplitN(msgStr, " ", 2)
+		if len(parts) == 2 {
+			alias := parts[1]
+			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+
+			meta, err := corestore.LoadGroupMetadata(alias)
+			if err != nil {
+				logger.Displayf("[Error] Group metadata not found for %s: %v\n", alias, err)
+				return
+			}
+			members, _ := corestore.GetGroupMembersV2(meta.GroupID)
+			logger.Displayln("=========================================")
+			logger.Displayf("  Group Info: %s\n", meta.GroupAlias)
+			logger.Displayf("  ID:         %s\n", meta.GroupID)
+			logger.Displayf("  Type:       %s\n", meta.GroupType)
+			logger.Displayf("  Creator:    %s\n", FormatSender(meta.CreatorID))
+			logger.Displayf("  Created At: %s\n", time.Unix(meta.CreatedAt, 0).Format("02/01/2006 15:04:05"))
+			logger.Displayln("  Members List:")
+			for _, m := range members {
+				status := "Offline"
+				memberID, errDec := peer.Decode(m.PeerID)
+				if errDec == nil && h.Network().Connectedness(memberID) == network.Connected {
+					status = "Online"
+				}
+				logger.Displayf("    - %s (%s) [%s]\n", FormatSender(m.PeerID), m.Role, status)
+			}
+			logger.Displayln("=========================================")
 		}
 		return
 	}
@@ -672,7 +1113,17 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 	if strings.HasPrefix(msgStr, "/group ") {
 		parts := strings.SplitN(msgStr, " ", 3)
 		if len(parts) == 3 {
-			SendGroupMessage(ctx, h, parts[1], parts[2])
+			targetStr := parts[1]
+			if !strings.HasPrefix(targetStr, "@") { targetStr = "@" + targetStr }
+
+			meta, err := corestore.LoadGroupMetadata(targetStr)
+			if err == nil {
+				targetStr = meta.GroupID
+			}
+			errSend := SendGroupMessage(ctx, h, targetStr, parts[2])
+			if errSend != nil {
+				logger.Displayf("[Error] Failed to send message to group: %v\n", errSend)
+			}
 		}
 		return
 	}

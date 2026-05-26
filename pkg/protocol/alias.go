@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -118,15 +119,7 @@ func handleAliasStream(s network.Stream) {
 				pubKeyStr := base64.StdEncoding.EncodeToString(pubKeyBytes)
 
 				aliasMutex.Lock()
-				// Cek apakah Kunci Publik ini sudah punya alias lain?
-				oldAlias, hasOld := ownerStore[pubKeyStr]
-				if hasOld && oldAlias != aliasName {
-					// Hapus alias lama
-					oldHash := GetAliasCoordinate(oldAlias)
-					delete(aliasStore, oldHash)
-					_ = corestore.DeleteAliasByHash(oldHash)
-					logger.Info().Str("oldAlias", oldAlias).Str("newAlias", aliasName).Msg("User updated name")
-				}
+
 
 				// Cek apakah nama alias baru ini sudah diambil orang lain?
 				aliasHash := GetAliasCoordinate(aliasName)
@@ -179,6 +172,21 @@ func handleAliasStream(s network.Stream) {
 					logger.Debug().Str("alias", aliasName).Msg("ALIAS SERVICE: Alias not found in local memory")
 					s.Write([]byte("NOT_FOUND\n"))
 				}
+			}
+		case "RESOLVE_GROUP":
+			if len(parts) == 2 {
+				aliasName := parts[1]
+				if !strings.HasPrefix(aliasName, "@") { aliasName = "@" + aliasName }
+				
+				meta, err := corestore.LoadGroupMetadata(aliasName)
+				if err == nil {
+					metaBytes, _ := json.Marshal(meta)
+					response := fmt.Sprintf("FOUND_GROUP %s\n", base64.StdEncoding.EncodeToString(metaBytes))
+					s.Write([]byte(response))
+				} else {
+					s.Write([]byte("NOT_FOUND\n"))
+				}
+				return
 			}
 		}
 	}
@@ -263,13 +271,7 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 	pubKeyStr := base64.StdEncoding.EncodeToString(pubKeyBytes)
 
 	aliasMutex.Lock()
-	// Clean up old alias for this public key if it changed
-	oldAlias, hasOld := ownerStore[pubKeyStr]
-	if hasOld && oldAlias != alias {
-		oldHash := GetAliasCoordinate(oldAlias)
-		delete(aliasStore, oldHash)
-		_ = corestore.DeleteAliasByHash(oldHash)
-	}
+
 
 	_ = corestore.SaveAlias(aliasHash, alias, myPeerID, pubKeyBytes)
 	aliasStore[aliasHash] = AliasRecord{PeerID: myPeerID, PubKey: pubKey}
@@ -348,14 +350,8 @@ func ResolveAlias(ctx context.Context, h host.Host, alias string) (string, error
 								if err == nil && derivedID.String() == peerID {
 									aliasHash := GetAliasCoordinate(alias)
 									aliasMutex.Lock()
-									
 									pubKeyStr := base64.StdEncoding.EncodeToString(pubKeyBytes)
-									oldAlias, hasOld := ownerStore[pubKeyStr]
-									if hasOld && oldAlias != alias {
-										oldHash := GetAliasCoordinate(oldAlias)
-										delete(aliasStore, oldHash)
-										_ = corestore.DeleteAliasByHash(oldHash)
-									}
+
 									
 									_ = corestore.SaveAlias(aliasHash, alias, peerID, pubKeyBytes)
 									aliasStore[aliasHash] = AliasRecord{PeerID: peerID, PubKey: pubKey}
@@ -403,4 +399,96 @@ func ResolveAlias(ctx context.Context, h host.Host, alias string) (string, error
 			return "", ctx.Err()
 		}
 	}
+}
+
+// ResolveGroupMetadata queries network nodes to find the metadata of a group by its alias or ID
+func ResolveGroupMetadata(ctx context.Context, h host.Host, alias string) (corestore.GroupMetadata, error) {
+	if !strings.HasPrefix(alias, "@") {
+		alias = "@" + alias
+	}
+
+	// 1. Check local DB first
+	meta, err := corestore.LoadGroupMetadata(alias)
+	if err == nil { return meta, nil }
+
+	// 2. Query the creator node directly if we can resolve the alias
+	creatorIDStr, err := ResolveAlias(ctx, h, alias)
+	if err == nil {
+		creatorID, errDec := peer.Decode(creatorIDStr)
+		if errDec == nil && creatorID != h.ID() {
+			dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			s, errStream := h.NewStream(dialCtx, creatorID, AliasProtocolID)
+			cancel()
+			if errStream == nil {
+				defer s.Close()
+				cmd := fmt.Sprintf("RESOLVE_GROUP %s\n", alias)
+				_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				_, errWrite := s.Write([]byte(cmd))
+				if errWrite == nil {
+					_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
+					respBuf := bufio.NewReader(s)
+					resp, errRead := respBuf.ReadString('\n')
+					if errRead == nil {
+						resp = strings.TrimSpace(resp)
+						if strings.HasPrefix(resp, "FOUND_GROUP ") {
+							parts := strings.SplitN(resp, " ", 2)
+							if len(parts) == 2 {
+								metaBytes, errDecB64 := base64.StdEncoding.DecodeString(parts[1])
+								if errDecB64 == nil {
+									var m corestore.GroupMetadata
+									if errU := json.Unmarshal(metaBytes, &m); errU == nil {
+										return m, nil
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Fallback: Query the closest peers
+	aliasHash := GetAliasCoordinate(alias)
+	dhtCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	closestPeers, err := corenet.GlobalDHT.GetClosestPeers(dhtCtx, aliasHash)
+	cancel()
+	if err != nil || len(closestPeers) == 0 {
+		closestPeers = h.Network().Peers()
+	}
+
+	for _, p := range closestPeers {
+		if p == h.ID() { continue }
+		
+		dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		s, err := h.NewStream(dialCtx, p, AliasProtocolID)
+		cancel()
+		if err != nil { continue }
+		defer s.Close()
+
+		cmd := fmt.Sprintf("RESOLVE_GROUP %s\n", alias)
+		_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, err = s.Write([]byte(cmd))
+		if err != nil { continue }
+
+		_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
+		respBuf := bufio.NewReader(s)
+		resp, err := respBuf.ReadString('\n')
+		if err != nil { continue }
+
+		resp = strings.TrimSpace(resp)
+		if strings.HasPrefix(resp, "FOUND_GROUP ") {
+			parts := strings.SplitN(resp, " ", 2)
+			if len(parts) == 2 {
+				metaBytes, errDec := base64.StdEncoding.DecodeString(parts[1])
+				if errDec == nil {
+					var m corestore.GroupMetadata
+					if errU := json.Unmarshal(metaBytes, &m); errU == nil {
+						return m, nil
+					}
+				}
+			}
+		}
+	}
+	return corestore.GroupMetadata{}, fmt.Errorf("group metadata not found in network")
 }

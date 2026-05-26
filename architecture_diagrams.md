@@ -327,6 +327,17 @@ sequenceDiagram
 
 Meshsage group messaging utilizes a **Sender Key** mechanism combined with **Cryptographic Ownership Governance**. Every group is managed by a **Creator** who signs the group's metadata and controls membership (adding or removing members). 
 
+Meshsage supports two group membership models:
+1. **SECURE (Closed / Invite-Only Group)**:
+   * Access is strictly creator-controlled.
+   * Members are explicitly invited by the Creator via `/group-create` or `/group-add`.
+   * Key distribution and membership command signatures are fully verified.
+   * Forward secrecy key rotation occurs on exits (`/group-exit`) and removals (`/group-remove`).
+2. **UNSECURE (Open / Public Group)**:
+   * Anyone can dynamically request to join using `/group-join <alias>`.
+   * The joining node resolves the group's metadata, validates the creator's metadata signature, joins the group's GossipSub topic, and broadcasts a signed `GCMD:JOIN` command.
+   * All online group members receive the join request, record the new member locally, and securely share their local `GKEY`s with the new member via 1:1 secure channels.
+
 Security guarantees:
 *   **Decentralized Control**: No central server. Membership changes are validated using the Creator's digital signature.
 *   **Forward Secrecy**: When a member is removed or exits, all remaining members rotate their local Group Keys (`GKEY`) and share them *only* with the remaining members, preventing the former member from decrypting future messages.
