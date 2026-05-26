@@ -548,12 +548,22 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 			}
 		}
 		if isRelay {
+			// 1. Add the short relay-id format
 			relayAddrStr := fmt.Sprintf("/p2p/%s/p2p-circuit/p2p/%s", p.String(), target.String())
 			ma, err := multiaddr.NewMultiaddr(relayAddrStr)
 			if err == nil {
 				h.Peerstore().AddAddr(target, ma, 5*time.Minute)
-				logger.Debug().Str("target", target.String()).Str("relay", p.String()).Msg("Added dynamic circuit relay address to peerstore")
 			}
+			
+			// 2. Add the full physical transport relay address format
+			for _, addr := range h.Peerstore().Addrs(p) {
+				fullRelayAddrStr := fmt.Sprintf("%s/p2p/%s/p2p-circuit/p2p/%s", addr.String(), p.String(), target.String())
+				fullMa, err := multiaddr.NewMultiaddr(fullRelayAddrStr)
+				if err == nil {
+					h.Peerstore().AddAddr(target, fullMa, 5*time.Minute)
+				}
+			}
+			logger.Debug().Str("target", target.String()).Str("relay", p.String()).Msg("Added dynamic circuit relay addresses to peerstore")
 		}
 	}
 
@@ -583,7 +593,7 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 		logger.Warn().Err(errWrite).Str("target", target.String()).Msg("transmitEnvelope: Direct write failed, falling back to mailbox")
 		err = errWrite
 	} else {
-		logger.Debug().Err(err).Str("target", target.String()).Msg("transmitEnvelope: Direct dial failed, falling back to mailbox storage")
+		logger.Warn().Err(err).Str("target", target.String()).Msg("transmitEnvelope: Dial failed, falling back to mailbox storage")
 	}
 	encodedEnvelope := base64.StdEncoding.EncodeToString([]byte(finalWireEnvelope))
 	return StoreOfflineMessage(ctx, h, target, h.ID().String(), encodedEnvelope)
