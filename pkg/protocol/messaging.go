@@ -536,6 +536,12 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 }
 
 func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWireEnvelope string) error {
+	if target == h.ID() {
+		logger.Info().Msg("transmitEnvelope: Self-message detected, processing locally without network dial")
+		go ProcessSecureEnvelope(ctx, h, h.ID(), finalWireEnvelope)
+		return nil
+	}
+
 	// Query the DHT to find the target peer's actual addresses (including relay addresses)
 	// if we don't have them cached in peerstore. This is standard libp2p peer routing.
 	if len(h.Peerstore().Addrs(target)) == 0 && corenet.GlobalDHT != nil {
