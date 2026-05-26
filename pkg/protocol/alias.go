@@ -124,6 +124,7 @@ func handleAliasStream(s network.Stream) {
 					// Hapus alias lama
 					oldHash := GetAliasCoordinate(oldAlias)
 					delete(aliasStore, oldHash)
+					_ = corestore.DeleteAliasByHash(oldHash)
 					logger.Info().Str("oldAlias", oldAlias).Str("newAlias", aliasName).Msg("User updated name")
 				}
 
@@ -267,6 +268,7 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 	if hasOld && oldAlias != alias {
 		oldHash := GetAliasCoordinate(oldAlias)
 		delete(aliasStore, oldHash)
+		_ = corestore.DeleteAliasByHash(oldHash)
 	}
 
 	_ = corestore.SaveAlias(aliasHash, alias, myPeerID, pubKeyBytes)
@@ -352,6 +354,7 @@ func ResolveAlias(ctx context.Context, h host.Host, alias string) (string, error
 									if hasOld && oldAlias != alias {
 										oldHash := GetAliasCoordinate(oldAlias)
 										delete(aliasStore, oldHash)
+										_ = corestore.DeleteAliasByHash(oldHash)
 									}
 									
 									_ = corestore.SaveAlias(aliasHash, alias, peerID, pubKeyBytes)

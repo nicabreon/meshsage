@@ -323,90 +323,87 @@ sequenceDiagram
 
 ---
 
-## **4. Group Messaging Subsystem**
+## **4. Cryptographic Group Management Subsystem**
 
-Meshsage group messaging utilizes a **Sender Key** mechanism. Instead of performing expensive peer-to-peer DH operations for every group message, each group member generates a local key, shares it with all other group members *once* via their secure 1:1 channels, and then broadcasts group messages over GossipSub encrypted with that key.
+Meshsage group messaging utilizes a **Sender Key** mechanism combined with **Cryptographic Ownership Governance**. Every group is managed by a **Creator** who signs the group's metadata and controls membership (adding or removing members). 
 
-### **A. Group Joining & Key Distribution**
-When joining or creating a group:
+Security guarantees:
+*   **Decentralized Control**: No central server. Membership changes are validated using the Creator's digital signature.
+*   **Forward Secrecy**: When a member is removed or exits, all remaining members rotate their local Group Keys (`GKEY`) and share them *only* with the remaining members, preventing the former member from decrypting future messages.
+*   **Collision Isolation**: Naming collisions (groups with the same alias) are isolated cryptographically because nodes only accept and decrypt messages if they have shared keys with the sender.
+
+### **A. Group Creation & Key Distribution**
+When a group is created:
+1. The Creator generates a unique `GroupID` and signs the **Group Metadata** (binding `GroupID`, `GroupAlias`, `CreatorID`, and creation timestamp).
+2. The Creator registers the `GroupAlias` to the Kademlia DHT Alias Registry.
+3. The Creator generates their local 32-byte group encryption key (`GKEY`) and shares the Metadata + `GKEY` with the initial member(s) over secure 1:1 channels (Double Ratchet).
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Alice as Alice
-    actor Bob as Bob
-    actor Charlie as Charlie
+    actor Creator as Creator (Alice)
+    actor Member as Member (Bob)
+    participant DHT as DHT Registry
     
-    Alice->>Alice: Create group "GRP_TEST" with members: [Bob, Charlie]
-    Alice->>Alice: Generate a random 32-byte local Sender Key (SK_Alice)
-    Alice->>Alice: Save SK_Alice to SQLite group_keys
-    
-    par Share Key with Bob
-        Alice->>Alice: Derive 1:1 Session with Bob (Double Ratchet)
-        Alice->>Bob: Send E2EE Message: GKEY:GRP_TEST:<SK_Alice>
-        Bob->>Bob: Save SK_Alice in group_sender_keys for GRP_TEST
-    and Share Key with Charlie
-        Alice->>Alice: Derive 1:1 Session with Charlie (Double Ratchet)
-        Alice->>Charlie: Send E2EE Message: GKEY:GRP_TEST:<SK_Alice>
-        Charlie->>Charlie: Save SK_Alice in group_sender_keys for GRP_TEST
-    end
-    
-    Note over Alice, Charlie: All members join the GossipSub topic "GRP_TEST".
+    Creator->>Creator: Generate Group ID & Sign Group Metadata
+    Creator->>DHT: Register group alias (e.g., @kopi-senja) -> Group ID
+    Creator->>Creator: Generate local Group Key (GKEY_Alice)
+    Creator->>Member: Send Group Metadata + GKEY_Alice (Secure 1:1 Double Ratchet)
+    Note over Member: Verify Creator Signature & Save Metadata to SQLite
+    Creator->>Swarm: Subscribe GossipSub Topic (Group ID)
+    Member->>Swarm: Subscribe GossipSub Topic (Group ID)
 ```
 
 ---
 
-### **B. Group Message Flow & Offline Fan-out**
-To send a group message, the sender broadcasts it via GossipSub. To ensure offline members don't miss the message, the sender also conducts a **Symmetric Fan-out** via the offline mailbox for any member that is currently offline.
+### **B. Member Management & Key Rotation**
+Only the Creator is authorized to add or remove members by broadcasting signed command envelopes (`GCMD`).
+
+#### **Add Member (Creator Only)**
+1. The Creator sends the Group Metadata and their current `GKEY` to the new member via a 1:1 secure channel.
+2. The Creator broadcasts `GCMD:ADD:<new_member>` signed by the Creator to the group.
+3. All existing members verify the Creator's signature, save the new member to their SQLite database, and share their own local `GKEY`s with the new member via secure 1:1 channels.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Alice as Alice
-    participant GossipSub as GossipSub Topic (GRP_TEST)
-    actor Bob as Bob (Online)
-    actor Charlie as Charlie (Offline)
-    participant Relay as Mailbox Relay Node
-
-    %% Group Encryption
-    Alice->>Alice: Retrieve local key SK_Alice from SQLite
-    Alice->>Alice: Encrypt message payload with SK_Alice (AES-GCM)
-    Alice->>Alice: Rotate SK_Alice:<br/>SK_Alice = HMAC-SHA256(SK_Alice, "GROUP_RATCHET")
-    Alice->>Alice: Sign encrypted payload using Alice's Private Identity Key
-    Alice->>Alice: Build GroupMessage{SenderID: Alice, Payload: Ciphertext, Signature: Sig}
-
-    %% GossipSub Send
-    Alice->>GossipSub: Publish GroupMessage
-    GossipSub->>Bob: Deliver GroupMessage (Real-time)
+    actor Creator as Creator (Alice)
+    actor Existing as Member (Bob)
+    actor New as New Member (Charlie)
+    participant Swarm as GossipSub Topic (Group ID)
     
-    %% Bob processing
-    activate Bob
-    Bob->>Bob: Retrieve SK_Alice from SQLite group_sender_keys
-    Bob->>Bob: Decrypt Payload using SK_Alice
-    Bob->>Bob: Verify Alice's signature using Alice's Public Identity Key
-    Bob->>Bob: Rotate Bob's copy of SK_Alice in SQLite:<br/>SK_Alice = HMAC-SHA256(SK_Alice, "GROUP_RATCHET")
-    Bob->>Bob: Display decrypted message to user
-    deactivate Bob
+    Creator->>New: Send Group Metadata + GKEY_Alice (Secure 1:1)
+    Creator->>Swarm: Broadcast control message GCMD:ADD:Charlie (Signed by Alice)
+    Swarm->>Existing: Deliver GCMD:ADD:Charlie
+    Note over Existing: Verify Alice's Signature & Add Charlie to SQL
+    Existing->>New: Send GKEY_Bob (Secure 1:1)
+    Note over New: Charlie now has keys to decrypt group messages from Alice & Bob
+```
 
-    %% Offline Fan-out
-    Note over Alice: Alice detects Charlie is offline (not receiving/direct send fails).
-    Alice->>Alice: Wrap group message: GRPM:GRP_TEST:<GroupMessageBytes>
-    Alice->>Relay: Store in Mailbox for Charlie (via /p2p-core/mailbox/1.0.0 STORE)
-    Note over Relay: Relay saves offline group message under Charlie's coordinate.
+#### **Remove Member & Key Rotation (Creator Only)**
+1. The Creator broadcasts `GCMD:REMOVE:<target_member>` signed by the Creator to the group.
+2. All remaining members verify the Creator's signature and delete the removed member from their SQLite database.
+3. To enforce **Forward Secrecy**, the Creator and all remaining members **rotate their group encryption keys (generate new random `GKEY`s)** and share them *only* with the remaining members. The removed member is excluded, losing access to all subsequent group communication.
 
-    Note over Charlie: Charlie comes online later.
-    Charlie->>Relay: FETCH mailbox messages (via /p2p-core/mailbox/1.0.0 FETCH)
-    Relay-->>Charlie: Deliver wrapped group message: GRPM:GRP_TEST:<GroupMessageBytes>
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Creator as Creator (Alice)
+    actor Remaining as Member (Bob)
+    actor Kicked as Kicked Member (Charlie)
+    participant Swarm as GossipSub Topic (Group ID)
+
+    Creator->>Swarm: Broadcast control message GCMD:REMOVE:Charlie (Signed by Alice)
+    Swarm->>Remaining: Deliver GCMD:REMOVE:Charlie
+    Note over Remaining: Verify Alice's Signature & Delete Charlie from SQL
     
-    %% Charlie decrypts
-    activate Charlie
-    Charlie->>Charlie: Parse GroupMessage envelope
-    Charlie->>Charlie: Retrieve SK_Alice from SQLite group_sender_keys
-    Charlie->>Charlie: Decrypt Payload using SK_Alice
-    Charlie->>Charlie: Verify Alice's signature using Alice's Public Identity Key
-    Charlie->>Charlie: Rotate Charlie's copy of SK_Alice in SQLite:<br/>SK_Alice = HMAC-SHA256(SK_Alice, "GROUP_RATCHET")
-    Charlie->>Charlie: Display decrypted message to user
-    deactivate Charlie
+    Note over Creator, Remaining: Key Rotation Sequence (Forward Secrecy)
+    Creator->>Creator: Generate new key GKEY_Alice_v2
+    Remaining->>Remaining: Generate new key GKEY_Bob_v2
+    
+    Creator->>Remaining: Share GKEY_Alice_v2 (Secure 1:1)
+    Remaining->>Creator: Share GKEY_Bob_v2 (Secure 1:1)
+    Note over Kicked: Charlie is bypassed and cannot decrypt future messages
 ```
 
 ---
