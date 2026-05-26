@@ -349,10 +349,15 @@ func LoadAlias(aliasHash string) (aliasName, peerID string, pubkeyBytes []byte, 
 }
 
 // FindAliasByPeerID looks up the registered alias name for a given peer ID.
+// It excludes aliases that are registered as group aliases.
 func FindAliasByPeerID(peerID string) (string, error) {
 	if DB == nil { return "", fmt.Errorf("database not initialized") }
 	var aliasName string
-	row := DB.QueryRow(`SELECT alias_name FROM alias_store WHERE peer_id = ? LIMIT 1`, peerID)
+	row := DB.QueryRow(`
+		SELECT alias_name FROM alias_store 
+		WHERE peer_id = ? 
+		  AND alias_name NOT IN (SELECT group_alias FROM group_metadata)
+		LIMIT 1`, peerID)
 	err := row.Scan(&aliasName)
 	return aliasName, err
 }

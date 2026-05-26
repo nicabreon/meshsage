@@ -325,8 +325,14 @@ func StartTUI(ctx context.Context, h host.Host, processCmd func(string)) {
 						aliasName = "None"
 					}
 
+					idStr := h.ID().String()
+					shortID := idStr
+					if len(idStr) > 8 {
+						shortID = "..." + idStr[len(idStr)-8:]
+					}
+
 					statusText = fmt.Sprintf("ID: %s | Alias: %s | Role: %s | Peers: %d | Esc: Toggle Focus | Ctrl-C: Quit",
-						h.ID().String()[:12]+"...", aliasName, role, len(peers))
+						shortID, aliasName, role, len(peers))
 				}
 
 				p.Send(statusUpdateMsg(statusText))

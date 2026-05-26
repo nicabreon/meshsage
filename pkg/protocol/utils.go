@@ -8,14 +8,17 @@ import (
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
 )
 
-// FormatPeerID returns the full PeerID for traceability
+// FormatPeerID returns a shortened, unique PeerID representation for UI/logs
 func FormatPeerID(id string) string {
+	if len(id) > 8 {
+		return "..." + id[len(id)-8:]
+	}
 	return id
 }
 
 // MessageEvent represents a structured, decrypted chat or log event for client frontends
 type MessageEvent struct {
-	Type      string `json:"type"`      // "direct", "group", "file"
+	Type      string `json:"type"` // "direct", "group", "file"
 	Timestamp string `json:"timestamp"`
 	Sender    string `json:"sender"`
 	GroupID   string `json:"group_id,omitempty"`
@@ -27,18 +30,13 @@ var MessageCallback func(event MessageEvent)
 
 // FormatSender returns a human-friendly sender label:
 //   - "@alias" if the peer has a known alias registered locally
-//   - "12D3...AUV" (short) if no alias is registered
+//   - "...abc12345" (short) if no alias is registered
 func FormatSender(peerID string) string {
-	short := peerID
-	if len(peerID) > 16 {
-		short = peerID[:8] + "..." + peerID[len(peerID)-6:]
-	}
-
 	// Prefer alias — cleaner display in group chat
 	if alias, err := corestore.FindAliasByPeerID(peerID); err == nil && alias != "" {
 		return alias
 	}
-	return short
+	return FormatPeerID(peerID)
 }
 
 // GetAliasCoordinate ensures the alias starts with @ and returns its hex hash
