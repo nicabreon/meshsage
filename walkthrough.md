@@ -1,181 +1,182 @@
-# Comprehensive Walkthrough: E2E Verification & Architecture Stabilization
+# Developer Walkthrough & System Architecture Guide
 
-This document provides a detailed walkthrough of all system improvements, automated E2E test scenarios, and cryptographic verification logs. It covers core private messaging, local caching, alias hijacking protection, and the newly implemented secure/unsecure group governance system.
-
----
-
-## 1. Overview of Codebase Improvements
-
-### A. Local Alias Caching & Hijacking Protection
-We modified [alias.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/alias.go) to optimize alias resolution and preserve governance:
-*   **Immediate Local Cache:** Registering nodes (via `RegisterAlias`) immediately persist their new alias to local SQLite and in-memory caches (`aliasStore` and `ownerStore`). This eliminates redundant network lookups on the registering node.
-*   **Persistent Restore:** Updated `loadPersistedAliases` to restore SQLite alias registrations into memory on node boot.
-*   **Support for Multiple Aliases:** Removed the restrictive "one alias per public key" deletion logic. Nodes can now own their user alias and multiple group aliases concurrently, while maintaining cryptographic hijacking protection.
-
-### B. Network Stability & Reliability
-Transient P2P dialing issues were resolved in [main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/node/main.go) and [discovery.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/network/discovery.go):
-*   **DHT Peer Routing (`FindPeer`):** Integrated DHT routing queries when peerstore addresses are missing, allowing nodes to dynamically resolve relay-assisted multiaddresses (e.g. `p2p-circuit`).
-*   **Rendezvous Swarm Discovery:** Enabled DHT Rendezvous tag-based announcements to automate peer discovery in multi-node setups.
-*   **Self-Messaging Short-circuit:** Configured `transmitEnvelope` to bypass TCP/UDP dials entirely when sending messages to self (`target == h.ID()`).
-*   **Test Environment Isolation:** Supplied nodes with `-peer` to target local relays while ignoring production bootstrap relays (`DefaultSeeds`), preventing alias ownership conflicts (`ERROR_ALREADY_OWNED`).
-
-### C. Cryptographic Group Governance (SECURE & UNSECURE Groups)
-We updated [group.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/group.go) and [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go) to implement decentralized group access control:
-*   **SECURE (Closed Group):** Access is governed by the Creator. Invitations (`GINVITE`) carry verified digital signatures. Voluntary exits (`/group-exit`) or kicks (`/group-remove`) trigger an HMAC-based Group Ratchet key rotation to achieve Forward Secrecy.
-*   **UNSECURE (Open Group):** Anyone joins dynamically using `/group-join`. The joining node resolves metadata from the Creator, joins GossipSub, and broadcasts `GCMD:JOIN`. Existing members automatically save the peer and securely share their local key (`GKEY`) via secure 1:1 Double Ratchet channels.
-*   **E2EE Implementation:** Message payloads are fully E2EE encrypted using Sender Keys (Group Ratchets) for both SECURE and UNSECURE types.
+Welcome to the **Meshsage** development guide. This document serves as a comprehensive, developer-facing overview of the platform's architecture, cryptographic protocols, database layout, user interface design, and testing validation suite.
 
 ---
 
-## 2. Core Messaging & Swarm Test Verification (Scenarios 1-5)
+## 1. System Architecture & Component Layering
 
-Verification of core private messaging, store-and-forward, mDNS, and hijacking protection is automated via [e2e_test_scenarios.sh](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/e2e_test_scenarios.sh).
+Meshsage is a completely decentralized, serverless peer-to-peer (P2P) messaging application. It is structured into four distinct layers:
 
-### Node Identities
-*   **Relay (Port 6001)**: `12D3KooWMuRGHZZG6ZRDJ4dy4aegKkdv1zwof3xtrzegPjuc77KA`
-*   **Alice (Port 6002)**: `12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9` (@alice)
-*   **Bob (Port 6003)**: `12D3KooWJKdw7ZqVnoG1x2uH2ohJEAWhyviXuHwk2mVNAXk8pmjs` (@bob)
-*   **Charlie (Port 6004)**: `12D3KooWQ5ey8EUFVd1YsazgwnxkqHk4n5nS39ym4WtkSCAvL7nM` (@charlie)
-
-### Test Results
-
-#### Scenario 1: 1:1 Messaging (Online) - Alice -> Bob
-*   **Action:** Alice sends an online message to Bob.
-*   **Original Message:** `Halo Bob! Ini pesan online pertama dari Alice.`
-*   **Receipt Verification in Bob's Log:**
-    ```text
-    [HANDSHAKE] Receiving new X3DH Handshake from 12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9
-    [HANDSHAKE] Deriving shared secret from receiver's Pre-Key...
-    [HANDSHAKE] Initial session established. RootKey: mGbJ3n...
-    [Message from 12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9]: Halo Bob! Ini pesan online pertama dari Alice.
-    ```
-
-#### Scenario 2: 1:1 Messaging (Offline) - Alice -> Bob (Offline)
-*   **Action:** Bob is stopped. Alice sends a message, which is automatically saved in the Relay Mailbox. Bob restarts and fetches the message.
-*   **Original Message:** `Halo Bob! Ini pesan offline saat kamu sedang tidak aktif.`
-*   **Receipt Verification in Bob's Log after `/fetch`:**
-    ```text
-    [Message from 12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9]: Halo Bob! Ini pesan offline saat kamu sedang tidak aktif.
-    ```
-
-#### Scenario 3: Group Chat (Online) - Alice, Bob, Charlie
-*   **Action:** Members join `GRP_TEST`. Alice publishes a group message.
-*   **Encryption Verification in Alice's Log:**
-    ```text
-    [GROUP E2EE] --- LAYER 1: GROUP ENCRYPTION ---
-    [GROUP E2EE] Original Text: Halo teman-teman! Kita semua online di grup.
-    [GROUP E2EE] Encrypted Result (B64): XX8ExfU3/zxDEfRMAjrWGbhBO2Rc2mhD3v36RXMbTWw/lVbBuLJ34rSYZVJY73e1IpJcjzIG5uNI1xHtmVl3RLFxHffXEevGI0SB5ExCZ+2Ab6SMUrAuJDArTHun
-    [Group Ratchet] Rotated our local key for group GRP_TEST
-    ```
-*   **Decryption Verification in Bob's Log:**
-    ```text
-    [GROUP E2EE] --- LAYER 1: GROUP DECRYPTION ---
-    [GROUP E2EE] Decrypted Result: Halo teman-teman! Kita semua online di grup.
-    [Group Security] Message verified with Digital Signature.
-    [Group GRP_TEST] @Alice: Halo teman-teman! Kita semua online di grup.
-    ```
-
-#### Scenario 4: Group Chat (Offline Alternately)
-*   **Action:** Charlie goes offline. Alice sends a group message (Bob receives online). Bob goes offline, Charlie boots up and fetches.
-*   **Encryption Verification in Alice's Log:**
-    ```text
-    [GROUP E2EE] Original Text: Halo grup! Charlie sedang offline saat ini.
-    ```
-*   **Group Restore & Fetch in Charlie's Log:**
-    ```text
-    [GROUP HANDSHAKE] Sharing our local key for group GRP_TEST with member @alice...
-    [Group] Successfully joined room: GRP_TEST with 3 members
-    [Mailbox] Auto-restored group membership on startup groupID=GRP_TEST
-    [GROUP E2EE] --- LAYER 1: GROUP DECRYPTION (OFFLINE) ---
-    [GROUP E2EE] Decrypted Result: Halo grup! Charlie sedang offline saat ini.
-    ```
-
-#### Scenario 5: Alias Hijacking Protection & Local Caching
-*   **Action:** Alice registers `@super-alice`. Bob attempts to hijack `@super-alice` with his own key.
-*   **Verification:** Bob's registration is rejected by closest DHT peers.
-    ```text
-    [Alias] Successfully registered '@super-alice' on 2 nodes with Digital Signature!
-    ...
-    [Alias DHT] REJECTED: Someone tried to steal alias @super-alice
-    ```
-
----
-
-## 3. Cryptographic Group Management Verification (Group Tests 1-4)
-
-Detailed validation of group access control, secure join protocols, and key rotations is automated via [test_groups_e2e.sh](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/test_groups_e2e.sh).
-
-### Node Identities
-*   **Relay (Port 8001)**: `12D3KooWQkTJ9vZpuH6caeeTvJhhkXYkAHuSk3qc4cYyjtqHpFBK`
-*   **Alice (Port 8002)**: `12D3KooWGYZMvXJRiX4KqFXXSv3DSMXLKhJwcdfFxhkywDaTHY5z` (@alice)
-*   **Bob (Port 8003)**: `12D3KooWDgLzdQoBvXQdU3B1fy5HruFZMfE4qVo3LQdYzi6omd7G` (@bob)
-
-### Verification Logs & Scenarios
-
-#### TEST 1: SECURE (Closed/Invite) Group Chat
-*   **Description:** Alice creates `@sec-group` inviting Bob. Bob auto-joins the invite, exchanging keys. Both chat securely.
-*   **Receipt Verification in Bob's Log:**
-    ```text
-    [Alias DHT] Verified & Registered @sec-group to 12D3KooWGYZMvXJRiX4KqFXXSv3DSMXLKhJwcdfFxhkywDaTHY5z
-    [handshake] Receiving new X3DH Handshake from Alice
-    [handshake] Received and saved Group Session Key (via Double Ratchet) group=group_6f596437
-    [Group] Successfully joined room: @sec-group (SECURE, group_6f596437) with 1 members
-    [Group @sec-group] @alice: Hello Bob in closed room!
-    ```
-*   **Receipt Verification in Alice's Log:**
-    ```text
-    [Group @sec-group] @bob: Hi Alice!
-    ```
-
-#### TEST 2: Forward Secrecy on Voluntary Exit
-*   **Description:** Bob exits `@sec-group` voluntarily. Remaining members rotate keys. Bob must be unable to decrypt subsequent messages.
-*   **Exit Event Verification:**
-    ```text
-    [Group @sec-group] Bob voluntary left the group
-    [Group Ratchet] Rotating local group key for group_6f596437 (Forward Secrecy)
-    [Group Handshake] Resharing rotated GKEY with remaining members only
-    ```
-*   **Bob's Isolation Verification:** Alice sends a message after Bob left. Bob receives nothing, and his local group registry is purged.
-
-#### TEST 3: UNSECURE (Open/Public) Group Chat
-*   **Description:** Alice creates public `@pub-group` with no initial members. Bob resolves the metadata signature from the network and joins. Bob chats, and Alice receives it.
-*   **Bob Join Verification:**
-    ```text
-    [Alias DHT] Resolving group metadata for @pub-group...
-    [Alias DHT] Metadata found. Creator: @alice. Group Type: UNSECURE.
-    [Group] Successfully joined room: @pub-group (UNSECURE, group_a190b)
-    [Group Handshake] Broadcasting GCMD:JOIN to GossipSub...
-    [Group Handshake] Received Alice's GKEY via Double Ratchet!
-    ```
-*   **Receipt Verification in Alice's Log:**
-    ```text
-    [Group @pub-group] @bob: Hello everyone in public room!
-    ```
-
-#### TEST 4: Forward Secrecy on Kick (Remove)
-*   **Description:** Alice (Creator) removes Bob from `@pub-group`. Remaining members rotate keys. Bob is blocked from future decryptions.
-*   **Kicked Event Verification:**
-    ```text
-    [Group @pub-group] Creator Alice removed @bob from the group
-    [Group] You have been removed from group @pub-group (Purging local metadata)
-    [Group Ratchet] Rotating local group key for group_a190b (Forward Secrecy)
-    ```
-
----
-
-## 4. How to Execute Tests
-
-Ensure the latest binaries are built before running the E2E scripts:
-```bash
-go build -o test_meshsage cmd/node/main.go
+```
+┌────────────────────────────────────────────────────────┐
+│               Terminal TUI (Bubble Tea)                │
+└──────────────────────────┬─────────────────────────────┘
+                           ▼
+┌────────────────────────────────────────────────────────┐
+│            Protocol & Cryptographic Services           │
+│   (1:1 Double Ratchet, Sender Keys, X3DH, Aliases)     │
+└─────┬────────────────────┬───────────────────────┬─────┘
+      │                    │                       │
+      ▼                    ▼                       ▼
+┌───────────┐        ┌───────────┐           ┌───────────┐
+│  SQLite   │        │ Kademlia  │           │ GossipSub │
+│ Storage   │        │    DHT    │           │  PubSub   │
+└───────────┘        └───────────┘           └───────────┘
 ```
 
-### Run Swarm Scenarios
-```bash
-bash e2e_test_scenarios.sh
+### A. Networking Layer (libp2p)
+*   **Kademlia DHT:** Used to advertise and locate peers, store routing records, and register cryptographic usernames/aliases.
+*   **GossipSub:** The underlying PubSub protocol used for real-time group chat communication and cluster replication events.
+*   **mDNS Discovery:** Enables automatic discovery of neighboring peers on the local area network (LAN) without requiring internet or DHT bootstrap relays.
+
+### B. Cryptographic Layer
+*   **X3DH (Extended Triple Diffie-Hellman):** Establishes a shared secret between two nodes when sending the first message, utilizing identity keys, ephemeral keys, and pre-keys uploaded to Relays.
+*   **Double Ratchet:** Used for 1:1 messaging. It rotates encryption keys for every single message (Diffie-Hellman ratchet and KDF chain ratchet), guaranteeing **Forward Secrecy** and **Post-compromise Security**.
+*   **Sender Key (Group Ratchet):** Used for group chat. Each member generates a local key (`GKEY`) and shares it securely via 1:1 Double Ratchet channels with other members. Group messages are published via GossipSub encrypted with the sender's current ratchet key.
+
+### C. Storage Layer (SQLite)
+A local SQLite database (running in WAL mode for safe concurrency) acts as the node's long-term memory:
+*   **`pre_keys` / `skipped_keys`**: Manages cryptographic pre-keys for X3DH and skipped message keys to handle out-of-order packet delivery.
+*   **`sessions`**: Stores Double Ratchet states, ratchet keys, and message counters per peer.
+*   **`messages`**: Persists incoming/outgoing chat history.
+*   **`alias_store`**: Maintains the map between human-readable usernames and libp2p Peer IDs.
+*   **`group_metadata` / `group_members_v2`**: Stores group configurations, membership lists, roles (Creator vs Member), and signature verifications.
+
+---
+
+## 2. Key Protocol Workflows
+
+### Workflow A: Username (Alias) Registration & Lookup
+To prevent username hijacking, registrations must present a digital signature proving key ownership.
+1.  **Registration:** The client signs `@alias + PeerID + PubKey` and registers it on closest DHT nodes.
+2.  **DHT Validation:** Closest nodes verify the signature, ensure the alias isn't registered to a different key, and persist it to SQLite.
+3.  **On-Demand Caching:** When resolving an alias, the resolver fetches it from closest nodes and caches it locally in SQLite for fast, offline future reads.
+
+### Workflow B: End-to-End Encrypted Group Chats
+Meshsage group chats support two models:
+*   **SECURE (Closed):** The Creator signs group metadata. Adding or removing members broadcasts signed commands (`GCMD:ADD`, `GCMD:REMOVE`). When a member is removed or exits, remaining members automatically regenerate their local `GKEY`s (Forward Secrecy).
+*   **UNSECURE (Open):** Anyone runs `/group-join <alias>`. The client resolves metadata from the DHT, queries the Creator for signature proofs, joins the GossipSub topic, and broadcasts `GCMD:JOIN`. Existing online members automatically record the peer and share their keys.
+
+---
+
+## 3. Terminal User Interface (TUI) Architecture
+
+The user interface is built using **Bubble Tea** and **Lipgloss**, implementing a split-pane command line experience:
+1.  **System Log Viewport (Top, Yellow Border):** Displays system-level logs (such as connection updates, key rotation events, and DHT queries) formatted with native ANSI terminal colors.
+2.  **Chat Viewport (Middle, Blue Border):** Renders incoming user-facing messages, status receipts, latency statistics, and group announcements.
+3.  **Status Bar (Green Background):** Shows the local Peer ID, registered alias, network role (Client vs Relay), and active peer connections.
+4.  **Command Input (Bottom):** Text input field with focus toggles. Commands start with `/`.
+
+### UI Controls:
+*   **`Esc`**: Toggle focus between typing commands and scrolling viewports.
+*   **`Tab`**: Switch scrolling active pane between System Logs and Chat Messages.
+*   **`Ctrl-D`**: Dump raw plain-text logs directly to a text file.
+*   **`Ctrl-C`**: Gracefully close all network services and exit.
+
+---
+
+## 4. Automated Testing Scenarios (E2E Validation)
+
+The platform is validated using two automated Bash test scripts.
+
+### Test Suite 1: Core Swarm & Messaging Scenarios
+**Script:** `bash e2e_test_scenarios.sh`
+*   **Scenario 1: 1:1 Messaging (Online):** Verifies X3DH handshakes and direct Double Ratchet messaging between Alice and Bob.
+*   **Scenario 2: Store-and-Forward (Offline):** Stops Bob, has Alice send a message (stored on Relay), restarts Bob, and calls `/fetch` to decrypt the offline message.
+*   **Scenario 3: Group Chat (Online):** Alice, Bob, and Charlie join a group and exchange messages over GossipSub.
+*   **Scenario 4: Group Chat (Alternating Offline):** Simulates alternating offline sequences (e.g. Bob offline, Charlie online, then vice versa) and verifies offline group mailbox storage and recovery.
+*   **Scenario 5: Hijacking Protection:** Verifies that Bob cannot register or hijack Alice's username (`@super-alice`) since his cryptographic signature does not match.
+
+### Test Suite 2: Cryptographic Group Governance Scenarios
+**Script:** `bash test_groups_e2e.sh`
+*   **TEST 1: SECURE Group Invites:** Verifies closed group creation, invitation dispatch (`GINVITE`), auto-joining, and secure messaging.
+*   **TEST 2: Forward Secrecy on Exit:** Verifies that when Bob leaves the closed group, remaining members rotate keys, preventing Bob from reading future messages.
+*   **TEST 3: UNSECURE Group Joins:** Verifies public group creation, open joins without creator intervention, and automated key exchange.
+*   **TEST 4: Forward Secrecy on Kick:** Verifies that when the Creator removes Bob, keys are rotated, blocking Bob from subsequent decryptions.
+
+---
+
+## 5. E2E Test Execution Logs Reference
+
+### Swarm & Core Messaging Validation Output:
+```text
+==================================================
+SKENARIO 1: 1:1 Messaging (Online) - Alice -> Bob
+==================================================
+>> SKENARIO 1: SUCCESS (Message received online)
+
+==================================================
+SKENARIO 2: 1:1 Messaging (Offline) - Alice -> Bob (Offline)
+==================================================
+>> SKENARIO 2: SUCCESS (Offline message received via Mailbox)
+
+==================================================
+SKENARIO 3: Group Chat (Online) - Alice, Bob, Charlie
+==================================================
+>> SKENARIO 3: SUCCESS (All online members received the group message)
+
+==================================================
+SKENARIO 4: Group Chat (Offline Alternately)
+==================================================
+>> SKENARIO 4: SUCCESS (Group offline alternation sync works perfectly)
+
+==================================================
+SKENARIO 5: Alias Hijacking Protection & Local Caching
+==================================================
+1. Alice registering @super-alice...
+   -> Alice successfully registered @super-alice locally and on the swarm.
+2. Bob attempting to register @super-alice (hijacking)...
+   -> Bob was rejected when attempting to register @super-alice (Hijacking Protection Success!).
+>> SKENARIO 5: SUCCESS
 ```
 
-### Run Cryptographic Group Governance Scenarios
-```bash
-bash test_groups_e2e.sh
+### Group Governance Validation Output:
+```text
+=== MEMULAI GROUP CHAT E2E SETUP ===
+[Compile] Building latest meshsage binary...
+[Relay] Starting Relay on port 8001...
+Relay Address: /ip4/127.0.0.1/tcp/8001/p2p/12D3KooWQkTJ9vZpuH6caeeTvJhhkXYkAHuSk3qc4cYyjtqHpFBK
+[Clients] Starting Alice (8002) and Bob (8003)...
+Alice ID: 12D3KooWGYZMvXJRiX4KqFXXSv3DSMXLKhJwcdfFxhkywDaTHY5z
+Bob ID: 12D3KooWDgLzdQoBvXQdU3B1fy5HruFZMfE4qVo3LQdYzi6omd7G
+[Alias] Registering @alice and @bob...
+   -> @alice registered successfully.
+   -> @bob registered successfully.
+==================================================
+TEST 1: SECURE (Closed/Invite) Group Chat
+==================================================
+Alice creating SECURE group @sec-group inviting @bob...
+   -> Alice created @sec-group successfully.
+   -> Bob auto-joined @sec-group invitation successfully.
+Alice sending message to @sec-group...
+   -> Bob successfully received and decrypted the secure message.
+Bob sending message to @sec-group...
+   -> Alice successfully received and decrypted Bob's message.
+==================================================
+TEST 2: Forward Secrecy on Voluntary Exit
+==================================================
+Bob voluntary exiting @sec-group...
+   -> Bob local database exited @sec-group.
+   -> Alice received Bob exit control command.
+Alice sending message to @sec-group after Bob left...
+   -> SUCCESS: Bob did not receive messages sent after exiting.
+==================================================
+TEST 3: UNSECURE (Open/Public) Group Chat
+==================================================
+Alice creating UNSECURE group @pub-group...
+   -> Alice created @pub-group successfully.
+Bob joining @pub-group...
+   -> Bob resolved and joined @pub-group successfully.
+Bob sending message to @pub-group...
+   -> Alice received Bob's message in the open group.
+==================================================
+TEST 4: Forward Secrecy on Kick (Remove)
+==================================================
+Alice removing Bob from @pub-group...
+   -> Bob was kicked and removed from @pub-group locally.
+Alice sending message to @pub-group after kicking Bob...
+   -> SUCCESS: Bob did not receive messages sent after being kicked.
+=== GROUP CHAT E2E SUCCESS ===
+Pembersihan node P2P...
 ```
