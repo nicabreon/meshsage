@@ -66,11 +66,18 @@ docker-compose up -d --build
 ```
 
 ### **3. Automated E2E Testing**
-We have an automated End-to-End test script that validates the Double Ratchet implementation, Offline Mailbox, and Group Messaging in various scenarios:
-```bash
-bash e2e_test_scenarios.sh
-```
-Check out the [Test Walkthrough](test_walkthrough.md) for detailed results and cryptographic verification logs.
+We have two automated End-to-End test scripts to validate the entire platform:
+
+1. **Core Messaging and Network Scenarios**: Validates the Double Ratchet implementation, Offline Mailbox, mDNS, and Alias Hijacking Protection:
+   ```bash
+   bash e2e_test_scenarios.sh
+   ```
+2. **Cryptographic Group Governance**: Validates SECURE/UNSECURE group chats, metadata signatures, and Forward Secrecy key rotations:
+   ```bash
+   bash test_groups_e2e.sh
+   ```
+
+Check out the [Test Walkthrough](walkthrough.md) for detailed results, test cases, and cryptographic verification logs.
 
 ---
 
