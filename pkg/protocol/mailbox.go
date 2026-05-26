@@ -37,6 +37,7 @@ const (
 var (
 	notifyRegistry = make(map[string]network.Stream)
 	notifyMutex    sync.RWMutex
+	processedMailboxMessages sync.Map
 )
 
 func SetupMailbox(h host.Host, isClientOnly bool) {
@@ -403,6 +404,12 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 
 		parts := strings.Split(line, " ")
 		if len(parts) < 4 || parts[0] != "MSG" { continue }
+
+		msgHash := parts[1]
+		if _, loaded := processedMailboxMessages.LoadOrStore(msgHash, true); loaded {
+			logger.Debug().Str("hash", msgHash).Msg("Mailbox: Message already processed, skipping duplicate")
+			continue
+		}
 
 		foundCount++
 		senderPubkey := parts[2]
