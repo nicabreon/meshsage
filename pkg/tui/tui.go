@@ -194,7 +194,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.chatViewport.Width = msg.Width - 4
 		m.chatViewport.Height = chatHeight
 
-		m.input.Width = msg.Width - 20
+		// Recalculate content with new width so wrapping updates
+		m.logViewport.SetContent(strings.Join(m.logs, ""))
+		m.chatViewport.SetContent(strings.Join(m.chats, ""))
+
+		m.input.Width = msg.Width - 22
 	}
 
 	var cmd tea.Cmd

@@ -26,7 +26,7 @@ type MessageEvent struct {
 var MessageCallback func(event MessageEvent)
 
 // FormatSender returns a human-friendly sender label:
-//   - "@alias | 12D3...AUV" if the peer has a known alias
+//   - "@alias" if the peer has a known alias registered locally
 //   - "12D3...AUV" (short) if no alias is registered
 func FormatSender(peerID string) string {
 	short := peerID
@@ -34,9 +34,9 @@ func FormatSender(peerID string) string {
 		short = peerID[:8] + "..." + peerID[len(peerID)-6:]
 	}
 
-	// Check local DB alias store (fast single-query)
+	// Prefer alias — cleaner display in group chat
 	if alias, err := corestore.FindAliasByPeerID(peerID); err == nil && alias != "" {
-		return fmt.Sprintf("%s | %s", alias, short)
+		return alias
 	}
 	return short
 }
