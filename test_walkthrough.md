@@ -1,10 +1,10 @@
-# Walkthrough: Pengujian E2E Otomatis & Bukti Enkripsi/Dekripsi Pesan
+# Walkthrough: Automated E2E Testing & Message Encryption/Decryption Proofs
 
-Pengujian end-to-end (E2E) otomatis berhasil diselesaikan menggunakan skrip [e2e_test_scenarios.sh](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/e2e_test_scenarios.sh). Seluruh skenario (Scenario 1, 2, 3, dan 4) selesai dengan status **SUCCESS** dan terbukti melakukan enkripsi serta dekripsi E2EE dengan benar baik dalam kondisi online maupun offline.
+Automated end-to-end (E2E) testing was successfully completed using the [e2e_test_scenarios.sh](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/e2e_test_scenarios.sh) script. All scenarios (Scenarios 1, 2, 3, and 4) finished with a status of **SUCCESS** and proved that E2EE encryption and decryption work correctly in both online and offline states.
 
 ---
 
-## Ringkasan Identitas Node pada Pengujian
+## Testing Node Identity Summary
 
 * **Dedicated Relay Port 6001**: `12D3KooWMuRGHZZG6ZRDJ4dy4aegKkdv1zwof3xtrzegPjuc77KA`
 * **Alice Port 6002**: `12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9` (@alice)
@@ -13,13 +13,13 @@ Pengujian end-to-end (E2E) otomatis berhasil diselesaikan menggunakan skrip [e2e
 
 ---
 
-## Skenario & Bukti Log Hasil Pengujian
+## Scenarios & Verification Log Evidence
 
-### SKENARIO 1: 1:1 Messaging (Online) - Alice -> Bob
+### SCENARIO 1: 1:1 Messaging (Online) - Alice -> Bob
 
-* **Tindakan**: Alice mengirim pesan secara online ke Bob yang juga aktif secara online.
-* **Pesan Asli**: `Halo Bob! Ini pesan online pertama dari Alice.`
-* **Bukti Penerimaan pada Log Bob**:
+* **Action**: Alice sends an online message to Bob, who is also actively online.
+* **Original Message**: `Halo Bob! Ini pesan online pertama dari Alice.`
+* **Receipt Proof in Bob's Log**:
   ```text
   [HANDSHAKE] Receiving new X3DH Handshake from 12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9
   [HANDSHAKE] Deriving shared secret from receiver's Pre-Key...
@@ -29,36 +29,36 @@ Pengujian end-to-end (E2E) otomatis berhasil diselesaikan menggunakan skrip [e2e
 
 ---
 
-### SKENARIO 2: 1:1 Messaging (Offline) - Alice -> Bob (Offline)
+### SCENARIO 2: 1:1 Messaging (Offline) - Alice -> Bob (Offline)
 
-* **Tindakan**: Bob dimatikan, kemudian Alice mengirim pesan langsung ke Bob. Pesan tersebut secara otomatis dialihkan ke Mailbox Relay. Setelah Bob dinyalakan kembali, Bob melakukan `/fetch`.
-* **Pesan Asli**: `Halo Bob! Ini pesan offline saat kamu sedang tidak aktif.`
-* **Bukti Penerimaan pada Log Bob setelah /fetch**:
+* **Action**: Bob is turned off, then Alice sends a message to Bob. The message is automatically routed to the Relay Mailbox. After Bob is turned back on, Bob calls `/fetch`.
+* **Original Message**: `Halo Bob! Ini pesan offline saat kamu sedang tidak aktif.`
+* **Receipt Proof in Bob's Log after /fetch**:
   ```text
   [Message from 12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9]: Halo Bob! Ini pesan offline saat kamu sedang tidak aktif.
   ```
 
 ---
 
-### SKENARIO 3: Group Chat (Online) - Alice, Bob, Charlie
+### SCENARIO 3: Group Chat (Online) - Alice, Bob, Charlie
 
-* **Tindakan**: Seluruh anggota bergabung ke grup `GRP_TEST`. Alice mengirim pesan grup secara online saat semua anggota aktif.
-* **Pesan Asli**: `Halo teman-teman! Kita semua online di grup.`
-* **Bukti Enkripsi pada Log Alice**:
+* **Action**: All members join group `GRP_TEST`. Alice sends a group message online while all members are active.
+* **Original Message**: `Halo teman-teman! Kita semua online di grup.`
+* **Encryption Proof in Alice's Log**:
   ```text
   [GROUP E2EE] --- LAYER 1: GROUP ENCRYPTION ---
   [GROUP E2EE] Original Text: Halo teman-teman! Kita semua online di grup.
   [GROUP E2EE] Encrypted Result (B64): XX8ExfU3/zxDEfRMAjrWGbhBO2Rc2mhD3v36RXMbTWw/lVbBuLJ34rSYZVJY73e1IpJcjzIG5uNI1xHtmVl3RLFxHffXEevGI0SB5ExCZ+2Ab6SMUrAuJDArTHun
   [Group Ratchet] Rotated our local key for group GRP_TEST
   ```
-* **Bukti Dekripsi pada Log Bob**:
+* **Decryption Proof in Bob's Log**:
   ```text
   [GROUP E2EE] --- LAYER 1: GROUP DECRYPTION ---
   [GROUP E2EE] Decrypted Result: Halo teman-teman! Kita semua online di grup.
   [Group Security] Message from @12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9 verified with Digital Signature.
   [Group GRP_TEST] @12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9: Halo teman-teman! Kita semua online di grup.
   ```
-* **Bukti Dekripsi pada Log Charlie**:
+* **Decryption Proof in Charlie's Log**:
   ```text
   [GROUP E2EE] --- LAYER 1: GROUP DECRYPTION ---
   [GROUP E2EE] Decrypted Result: Halo teman-teman! Kita semua online di grup.
@@ -67,55 +67,54 @@ Pengujian end-to-end (E2E) otomatis berhasil diselesaikan menggunakan skrip [e2e
 
 ---
 
-### SKENARIO 4: Group Chat (Offline Bergantian)
+### SCENARIO 4: Group Chat (Offline Alternately)
 
-Skenario ini memverifikasi fungsionalitas pesan grup saat anggota offline bergantian serta pemulihan otomatis group membership pada startup node.
+This scenario verifies group messaging functionality when members are offline alternately, as well as automatic group membership recovery on node startup.
 
-#### 1. Charlie Offline, Alice mengirim pesan grup:
-* **Pesan Asli**: `Halo grup! Charlie sedang offline saat ini.`
-* **Bukti Enkripsi pada Log Alice**:
+#### 1. Charlie Offline, Alice sends group message:
+* **Original Message**: `Halo grup! Charlie sedang offline saat ini.`
+* **Encryption Proof in Alice's Log**:
   ```text
   [GROUP E2EE] --- LAYER 1: GROUP ENCRYPTION ---
   [GROUP E2EE] Original Text: Halo grup! Charlie sedang offline saat ini.
   [GROUP E2EE] Encrypted Result (B64): 4YF4S+UHH9XTGjAkwghjW/2R2EoaWK6oLEyIsbW8NjUC/Dw4GsBjnvarupHqQ2VxCg3wnRnN8s7pgS3Zdkec0fF8HEKZuD1D0TOaSsetiCsfLl6yOqePIAaEiLDuQXA=
   ```
-* **Bukti Penerimaan Online pada Log Bob**:
+* **Online Receipt Proof in Bob's Log**:
   ```text
   [GROUP E2EE] --- LAYER 1: GROUP DECRYPTION ---
   [GROUP E2EE] Decrypted Result: Halo grup! Charlie sedang offline saat ini.
   [Group GRP_TEST] @12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9: Halo grup! Charlie sedang offline saat ini.
   ```
 
-#### 2. Bob Offline, Charlie dinyalakan kembali:
-* **Bukti Pemulihan Group pada Startup Charlie**:
+#### 2. Bob Offline, Charlie turned back on:
+* **Group Recovery Proof on Charlie Startup**:
   ```text
   [Alias DHT] Loaded 2 persisted aliases from database.
   [GROUP HANDSHAKE] Sharing our local key for group GRP_TEST with member 12D3KooWPvLqf5C8dxsnCyThSiNHVBSRbRTbwXubbsSrWdcTJuq9 via Double Ratchet...
   [Group] Successfully joined room: GRP_TEST with 3 members
   [90m2026-05-22T09:32:47+07:00 [0m [32mINF [0m [1mAuto-restored group membership on startup [0m [36mgroupID= [0mGRP_TEST
   ```
-* **Charlie melakukan `/fetch` untuk pesan offline**:
+* **Charlie calls `/fetch` for offline messages**:
   ```text
   [GROUP E2EE] --- LAYER 1: GROUP DECRYPTION (OFFLINE) ---
   [GROUP E2EE] Decrypted Result: Halo grup! Charlie sedang offline saat ini.
   ```
 
-#### 3. Charlie mengirim pesan grup baru saat Bob offline:
-* **Pesan Asli**: `Halo Alice! Saya sudah online kembali. Bob kemana?`
-* **Bukti Enkripsi pada Log Charlie**:
+#### 3. Charlie sends new group message while Bob is offline:
+* **Original Message**: `Halo Alice! Saya sudah online kembali. Bob kemana?`
+* **Encryption Proof in Charlie's Log**:
   ```text
   [GROUP E2EE] --- LAYER 1: GROUP ENCRYPTION ---
   [GROUP E2EE] Original Text: Halo Alice! Saya sudah online kembali. Bob kemana?
   ```
-* **Bukti Penerimaan Online pada Log Alice**:
+* **Online Receipt Proof in Alice's Log**:
   ```text
   [GROUP E2EE] --- LAYER 1: GROUP DECRYPTION ---
   [GROUP E2EE] Decrypted Result: Halo Alice! Saya sudah online kembali. Bob kemana?
-  [Group GRP_TEST] @12D3KooWQ5ey8EUFVd1YsazgwnxkqHk4n5nS39ym4WtkSCAvL7nM (Offline): Halo Alice! Saya sudah online kembali. Bob kemana?
   ```
 
-#### 4. Bob Dinyalakan Kembali & Mengambil Pesan Offline:
-* **Bob melakukan `/fetch`**:
+#### 4. Bob turned back on & retrieves offline messages:
+* **Bob calls `/fetch`**:
   ```text
   [GROUP E2EE] --- LAYER 1: GROUP DECRYPTION (OFFLINE) ---
   [GROUP E2EE] Decrypted Result: Halo Alice! Saya sudah online kembali. Bob kemana?
@@ -123,10 +122,10 @@ Skenario ini memverifikasi fungsionalitas pesan grup saat anggota offline bergan
 
 ---
 
-## Verifikasi Akhir
+## Final Verification
 
-Seluruh fungsionalitas platform pesan terdistribusi (Meshsage) telah diverifikasi bekerja dengan stabil:
-1. **Double Ratchet & X3DH**: Pengiriman pesan 1:1 online dan offline aman dan tidak mengalami error decryption.
-2. **GossipSub Group Messaging**: Distribusi pesan grup online bekerja secara real-time.
-3. **Offline Group Mailbox**: Pesan grup saat anggota offline disimpan di mailbox relay server dan dapat diambil kembali secara utuh.
-4. **Group State Restoration**: Saat node restart, keanggotaan grup dipulihkan secara otomatis dari SQLite database sehingga node dapat langsung bertukar pesan tanpa harus bergabung kembali secara manual.
+All functionalities of the distributed messaging platform (Meshsage) have been verified to work stably:
+1. **Double Ratchet & X3DH**: Online and offline 1:1 messaging is secure with no decryption errors.
+2. **GossipSub Group Messaging**: Real-time distribution of group messages works flawlessly.
+3. **Offline Group Mailbox**: Group messages sent while members are offline are saved in the relay mailbox server and retrieved completely intact.
+4. **Group State Restoration**: When a node restarts, group membership is automatically restored from the SQLite database, allowing immediate key exchanges and communication without manual rejoin commands.
