@@ -41,6 +41,95 @@ var (
 	processedMutex    sync.Mutex
 )
 
+// ---------------------------------------------------------------------------
+// PENDING MESSAGE BUFFER
+// Stores messages that arrived before the sender's group key was available.
+// Flushed automatically once the key arrives via GKEY or GINVITE.
+// ---------------------------------------------------------------------------
+
+const (
+	pendingMsgTTL     = 5 * time.Minute
+	pendingMsgMaxPerSender = 20
+)
+
+type pendingGroupMsg struct {
+	receivedAt time.Time
+	gMsg       GroupMessage
+	ctx        context.Context
+	session    *GroupSession
+	groupID    string
+}
+
+var (
+	// pendingGroupMessages: groupID → senderID → []pendingGroupMsg
+	pendingGroupMessages   = make(map[string]map[string][]pendingGroupMsg)
+	pendingGroupMessagesMu sync.Mutex
+)
+
+// bufferPendingMessage stores a group message that cannot be decrypted yet (missing key).
+func bufferPendingMessage(groupID, senderID string, msg pendingGroupMsg) {
+	pendingGroupMessagesMu.Lock()
+	defer pendingGroupMessagesMu.Unlock()
+
+	if pendingGroupMessages[groupID] == nil {
+		pendingGroupMessages[groupID] = make(map[string][]pendingGroupMsg)
+	}
+
+	existing := pendingGroupMessages[groupID][senderID]
+
+	// Prune expired messages
+	now := time.Now()
+	pruned := existing[:0]
+	for _, m := range existing {
+		if now.Sub(m.receivedAt) < pendingMsgTTL {
+			pruned = append(pruned, m)
+		}
+	}
+
+	// Enforce max-per-sender cap (drop oldest if over limit)
+	if len(pruned) >= pendingMsgMaxPerSender {
+		pruned = pruned[1:]
+	}
+
+	pendingGroupMessages[groupID][senderID] = append(pruned, msg)
+	logger.Debug().
+		Str("group", groupID).
+		Str("sender", FormatPeerID(senderID)).
+		Int("buffered", len(pendingGroupMessages[groupID][senderID])).
+		Msg("[Group Buffer] Message buffered (senderKey not yet available)")
+}
+
+// FlushPendingGroupMessages tries to decrypt all buffered messages for a given
+// group+sender after their key has been received.
+// Called from messaging.go after SaveGroupSenderKey().
+func FlushPendingGroupMessages(groupID, senderID string) {
+	pendingGroupMessagesMu.Lock()
+	pending, ok := pendingGroupMessages[groupID][senderID]
+	if !ok || len(pending) == 0 {
+		pendingGroupMessagesMu.Unlock()
+		return
+	}
+	// Take ownership of the slice and clear from map
+	pendingGroupMessages[groupID][senderID] = nil
+	pendingGroupMessagesMu.Unlock()
+
+	logger.Info().
+		Str("group", groupID).
+		Str("sender", FormatPeerID(senderID)).
+		Int("count", len(pending)).
+		Msg("[Group Buffer] Flushing buffered messages after key received")
+
+	now := time.Now()
+	for _, pm := range pending {
+		// Drop TTL-expired entries
+		if now.Sub(pm.receivedAt) >= pendingMsgTTL {
+			logger.Debug().Str("group", groupID).Msg("[Group Buffer] Dropping expired buffered message")
+			continue
+		}
+		decryptAndDispatchGroupMsg(pm.ctx, pm.session, pm.groupID, pm.gMsg)
+	}
+}
+
 // checkAndMarkProcessed returns true if the message signature has already been processed
 func checkAndMarkProcessed(signature string) bool {
 	if signature == "" {
@@ -169,6 +258,105 @@ func shareKeyWithMember(ctx context.Context, h host.Host, priv crypto.PrivKey, g
 	}
 }
 
+// sendGroupKeyRequest broadcasts a GREQ control message to ask all existing members
+// to share their current group key. Called when a new member joins and has no keys yet.
+func sendGroupKeyRequest(ctx context.Context, h host.Host, groupID string) {
+	groupsMutex.Lock()
+	session, exists := activeGroups[groupID]
+	groupsMutex.Unlock()
+
+	if !exists {
+		return
+	}
+
+	privKey := h.Peerstore().PrivKey(h.ID())
+	if privKey == nil {
+		return
+	}
+
+	payload := fmt.Sprintf("GCMD:GREQ:%s", h.ID().String())
+	dataToSign := []byte(payload + h.ID().String())
+	sigBytes, err := privKey.Sign(dataToSign)
+	if err != nil {
+		return
+	}
+	sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
+
+	gMsg := GroupMessage{
+		SenderID:  h.ID().String(),
+		Payload:   payload,
+		Signature: sigB64,
+	}
+	msgBytes, _ := json.Marshal(gMsg)
+
+	if err := session.Topic.Publish(ctx, msgBytes); err != nil {
+		logger.Warn().Err(err).Str("group", groupID).Msg("[GREQ] Failed to broadcast key request")
+	} else {
+		logger.Info().Str("group", groupID).Msg("[GREQ] Broadcast group key request to existing members")
+	}
+}
+
+// decryptAndDispatchGroupMsg handles decryption + callback for a single group message.
+// Used by both the live listener and the pending-message flusher.
+func decryptAndDispatchGroupMsg(ctx context.Context, session *GroupSession, groupID string, gMsg GroupMessage) {
+	meta, errLoad := corestore.LoadGroupMetadata(groupID)
+	if errLoad != nil { return }
+
+	var plaintext string
+	if meta.GroupType == "SECURE" {
+		// Look up the sender's key for this group
+		senderKey, err := corestore.GetGroupSenderKey(groupID, gMsg.SenderID)
+		if err != nil {
+			// Key still not available — re-buffer (should not normally happen after flush)
+			logger.Warn().Msgf("[Group %s] Still no key for %s after flush, dropping", meta.GroupAlias, FormatPeerID(gMsg.SenderID))
+			return
+		}
+
+		// Decrypt message using the Sender's specific key
+		plaintext, err = corecrypto.DecryptMessage(senderKey, gMsg.Payload)
+		if err != nil {
+			logger.Error().Msgf("[Group %s] Failed to decrypt message from %s (Key mismatch)", meta.GroupAlias, FormatPeerID(gMsg.SenderID))
+			return
+		}
+
+		// Rotate sender key in our DB
+		hKDF := hmac.New(sha256.New, senderKey)
+		hKDF.Write([]byte("GROUP_RATCHET"))
+		nextSenderKey := hKDF.Sum(nil)
+		corestore.SaveGroupSenderKey(groupID, gMsg.SenderID, nextSenderKey)
+	} else {
+		// Plain text for UNSECURE groups
+		plaintext = gMsg.Payload
+	}
+
+	// Verify signature
+	if gMsg.Signature != "" {
+		sID, _ := peer.Decode(gMsg.SenderID)
+		pubKey, err := sID.ExtractPublicKey()
+		if err == nil {
+			dataToVerify := []byte(gMsg.Payload + gMsg.SenderID)
+			sigBytes, _ := base64.StdEncoding.DecodeString(gMsg.Signature)
+			valid, _ := pubKey.Verify(dataToVerify, sigBytes)
+			if !valid {
+				logger.Warn().Msgf("[Group Warning] REJECTED: Invalid signature from %s in group %s", FormatPeerID(gMsg.SenderID), meta.GroupAlias)
+				return
+			}
+		}
+	}
+
+	ts := time.Now().Format("02/01 15:04:05")
+	logger.Displayf("\033[92m[%s] [Group %s] %s: %s\033[0m\n", ts, meta.GroupAlias, FormatSender(gMsg.SenderID), plaintext)
+	if MessageCallback != nil {
+		MessageCallback(MessageEvent{
+			Type:      "group",
+			Timestamp: ts,
+			Sender:    gMsg.SenderID,
+			GroupID:   groupID,
+			Content:   plaintext,
+		})
+	}
+}
+
 func listenGroupMessages(ctx context.Context, session *GroupSession, groupID string) {
 	for {
 		msg, err := session.Sub.Next(ctx)
@@ -196,58 +384,26 @@ func listenGroupMessages(ctx context.Context, session *GroupSession, groupID str
 		meta, errLoad := corestore.LoadGroupMetadata(groupID)
 		if errLoad != nil { continue }
 
-		var plaintext string
 		if meta.GroupType == "SECURE" {
-			// Look up the sender's key for this group
-			senderKey, err := corestore.GetGroupSenderKey(groupID, gMsg.SenderID)
+			// Check if we have the sender's key
+			_, err := corestore.GetGroupSenderKey(groupID, gMsg.SenderID)
 			if err != nil {
-				logger.Warn().Msgf("[Group %s] Received message from %s but no key found yet", meta.GroupAlias, FormatPeerID(gMsg.SenderID))
+				// Key not available yet — buffer the message instead of dropping it
+				bufferPendingMessage(groupID, gMsg.SenderID, pendingGroupMsg{
+					receivedAt: time.Now(),
+					gMsg:       gMsg,
+					ctx:        ctx,
+					session:    session,
+					groupID:    groupID,
+				})
+				// Actively request the key via GREQ so we don't just wait passively
+				go sendGroupKeyRequest(ctx, session.Host, groupID)
 				continue
 			}
-
-			// Decrypt message using the Sender's specific key
-			plaintext, err = corecrypto.DecryptMessage(senderKey, gMsg.Payload)
-			if err != nil {
-				logger.Error().Msgf("[Group %s] Failed to decrypt message from %s (Key mismatch)", meta.GroupAlias, FormatPeerID(gMsg.SenderID))
-				continue
-			}
-
-			// Rotate sender key in our DB
-			hKDF := hmac.New(sha256.New, senderKey)
-			hKDF.Write([]byte("GROUP_RATCHET"))
-			nextSenderKey := hKDF.Sum(nil)
-			corestore.SaveGroupSenderKey(groupID, gMsg.SenderID, nextSenderKey)
-		} else {
-			// Plain text for UNSECURE groups
-			plaintext = gMsg.Payload
 		}
 
-		// Verify signature
-		if gMsg.Signature != "" {
-			sID, _ := peer.Decode(gMsg.SenderID)
-			pubKey, err := sID.ExtractPublicKey()
-			if err == nil {
-				dataToVerify := []byte(gMsg.Payload + gMsg.SenderID)
-				sigBytes, _ := base64.StdEncoding.DecodeString(gMsg.Signature)
-				valid, _ := pubKey.Verify(dataToVerify, sigBytes)
-				if !valid {
-					logger.Warn().Msgf("[Group Warning] REJECTED: Invalid signature from %s in group %s", FormatPeerID(gMsg.SenderID), meta.GroupAlias)
-					continue
-				}
-			}
-		}
-
-		ts := time.Now().Format("02/01 15:04:05")
-		logger.Displayf("\033[92m[%s] [Group %s] %s: %s\033[0m\n", ts, meta.GroupAlias, FormatSender(gMsg.SenderID), plaintext)
-		if MessageCallback != nil {
-			MessageCallback(MessageEvent{
-				Type:      "group",
-				Timestamp: ts,
-				Sender:    gMsg.SenderID,
-				GroupID:   groupID,
-				Content:   plaintext,
-			})
-		}
+		// We have the key (or it's UNSECURE) — decrypt and dispatch
+		decryptAndDispatchGroupMsg(ctx, session, groupID, gMsg)
 	}
 }
 
@@ -333,6 +489,22 @@ func ProcessGroupMessage(groupID string, msgBytes []byte) {
 		senderKey, err := corestore.GetGroupSenderKey(groupID, gMsg.SenderID)
 		if err != nil {
 			logger.Warn().Msgf("[Group %s] Received offline message from %s but no key found yet", meta.GroupAlias, FormatPeerID(gMsg.SenderID))
+
+			// Buffer offline message too — key may arrive soon via GREQ/GKEY
+			groupsMutex.Lock()
+			session := activeGroups[groupID]
+			groupsMutex.Unlock()
+
+			if session != nil {
+				bufferPendingMessage(groupID, gMsg.SenderID, pendingGroupMsg{
+					receivedAt: time.Now(),
+					gMsg:       gMsg,
+					ctx:        context.Background(),
+					session:    session,
+					groupID:    groupID,
+				})
+				go sendGroupKeyRequest(context.Background(), session.Host, groupID)
+			}
 			return
 		}
 
@@ -460,6 +632,23 @@ func ProcessGroupControlMessage(ctx context.Context, h host.Host, groupID string
 			go shareKeyWithMember(ctx, h, h.Peerstore().PrivKey(h.ID()), groupID, target, localKey)
 		}
 
+	case "GREQ":
+		// Key request from a new member — share our current local key with them
+		requesterID := target
+		if requesterID == h.ID().String() {
+			return // Don't respond to our own request
+		}
+
+		logger.Info().
+			Str("group", meta.GroupAlias).
+			Str("requester", FormatPeerID(requesterID)).
+			Msg("[GREQ] Received key request, sharing local key")
+
+		localKey, err := corestore.GetGroupLocalKey(groupID)
+		if err == nil {
+			go shareKeyWithMember(ctx, h, h.Peerstore().PrivKey(h.ID()), groupID, requesterID, localKey)
+		}
+
 	case "ADD":
 		// Only valid if sender is Creator
 		if gMsg.SenderID != meta.CreatorID {
@@ -555,4 +744,48 @@ func ProcessGroupControlMessage(ctx context.Context, h host.Host, groupID string
 		groupsMutex.Unlock()
 		_ = corestore.DeleteGroupMetadata(groupID)
 	}
+}
+
+// SendGroupControlMessage broadcasts a group control command (signed by sender) to the GossipSub topic
+func SendGroupControlMessage(ctx context.Context, h host.Host, groupID string, action string, target string) error {
+	groupsMutex.Lock()
+	session, exists := activeGroups[groupID]
+	groupsMutex.Unlock()
+
+	if !exists {
+		return fmt.Errorf("group session not active locally")
+	}
+
+	payload := fmt.Sprintf("GCMD:%s:%s", action, target)
+	privKey := h.Peerstore().PrivKey(h.ID())
+	dataToSign := []byte(payload + h.ID().String())
+	sigBytes, err := privKey.Sign(dataToSign)
+	if err != nil {
+		return err
+	}
+	sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
+
+	gMsg := GroupMessage{
+		SenderID:  h.ID().String(),
+		Payload:   payload,
+		Signature: sigB64,
+	}
+	msgBytes, err := json.Marshal(gMsg)
+	if err != nil {
+		return err
+	}
+
+	return session.Topic.Publish(ctx, msgBytes)
+}
+
+// ExitGroupLocally closes the GossipSub topic subscription and removes metadata locally
+func ExitGroupLocally(groupID string) {
+	groupsMutex.Lock()
+	defer groupsMutex.Unlock()
+	if session, exists := activeGroups[groupID]; exists {
+		session.Sub.Cancel()
+		session.Topic.Close()
+		delete(activeGroups, groupID)
+	}
+	_ = corestore.DeleteGroupMetadata(groupID)
 }

@@ -317,12 +317,15 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		if strings.HasPrefix(env.Content, "GKEY:") {
 			parts := strings.SplitN(env.Content, ":", 3)
 			if len(parts) == 3 {
+				groupID := parts[1]
 				keyBytes, _ := base64.StdEncoding.DecodeString(parts[2])
-				corestore.SaveGroupSenderKey(parts[1], senderID.String(), keyBytes)
+				corestore.SaveGroupSenderKey(groupID, senderID.String(), keyBytes)
 				logger.Info().
-					Str("group", parts[1]).
+					Str("group", groupID).
 					Str("peerID", senderID.String()).
 					Msg("Received and saved Group Session Key (via Double Ratchet)")
+				// Flush any buffered messages that were waiting for this key
+				go FlushPendingGroupMessages(groupID, senderID.String())
 				return
 			}
 		}
@@ -378,6 +381,8 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 			if invite.GKey != "" {
 				keyBytes, _ := base64.StdEncoding.DecodeString(invite.GKey)
 				_ = corestore.SaveGroupSenderKey(invite.Meta.GroupID, invite.Meta.CreatorID, keyBytes)
+				// Flush any buffered messages waiting for the creator's key
+				go FlushPendingGroupMessages(invite.Meta.GroupID, invite.Meta.CreatorID)
 			}
 			return
 		}
