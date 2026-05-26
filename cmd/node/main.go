@@ -195,8 +195,10 @@ func main() {
 				}
 
 				if isInfra {
-					logger.Info().Str("peerID", remoteID.String()).Msg("IDENTIFIED INFRASTRUCTURE: Triggering Pre-Key refill and Mailbox sync")
+					logger.Info().Str("peerID", remoteID.String()).Msg("IDENTIFIED INFRASTRUCTURE: Triggering Pre-Key refill, Mailbox fetch, and Notification subscription")
 					go coreproto.AutoRefillPreKeys(ctx, host, remoteID, priv)
+					go coreproto.FetchMailboxMessages(ctx, host, remoteID, priv)
+					go coreproto.SubscribeNotifications(ctx, host, remoteID, nil)
 				} else {
 					logger.Debug().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure)")
 				}
