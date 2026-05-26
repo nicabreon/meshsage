@@ -303,9 +303,6 @@ func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID,
 }
 
 func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, env MessageEnvelope) {
-	// Persist to SQLite
-	corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content)
-
 	switch env.Type {
 	case MsgTypeStatus:
 		logger.Displayf("[Status Report] Peer %s marked your message %s as: %s\n", 
@@ -396,6 +393,9 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 			}
 		}
 
+		// Persist to SQLite only for actual user-visible chat messages
+		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content)
+
 		ts := time.Now().Format("02/01 15:04:05")
 		logger.Displayf("\033[92m[%s] [Message from %s]: %s\033[0m\n", ts, FormatSender(senderID.String()), env.Content)
 		if MessageCallback != nil {
@@ -410,6 +410,9 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		go SendStatusUpdate(ctx, h, senderID, env.ID, StatusDelivered)
 		
 	case MsgTypeFile:
+		// Persist to SQLite
+		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content)
+
 		parts := strings.Split(env.Content, ":")
 		if len(parts) >= 4 {
 			ts := time.Now().Format("02/01 15:04:05")

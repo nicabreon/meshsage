@@ -74,6 +74,11 @@ type model struct {
 	focus        focusState
 	width        int
 	height       int
+
+	// Command history support
+	history      []string
+	historyIdx   int
+	tempInput    string
 }
 
 func initialModel(ctx context.Context, h host.Host, processCmd func(string)) model {
@@ -97,6 +102,9 @@ func initialModel(ctx context.Context, h host.Host, processCmd func(string)) mod
 		chatViewport: vpChat,
 		focus:        focusInput,
 		statusText:   "Initializing Node Status...",
+		history:      make([]string, 0),
+		historyIdx:   0,
+		tempInput:    "",
 	}
 }
 
@@ -139,6 +147,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.focus == focusLogs {
 				m.focus = focusChats
 			}
+		case tea.KeyUp:
+			if m.focus == focusInput && len(m.history) > 0 {
+				if m.historyIdx == len(m.history) {
+					m.tempInput = m.input.Value()
+				}
+				if m.historyIdx > 0 {
+					m.historyIdx--
+					m.input.SetValue(m.history[m.historyIdx])
+					m.input.SetCursor(len(m.input.Value()))
+				}
+			}
+		case tea.KeyDown:
+			if m.focus == focusInput && len(m.history) > 0 {
+				if m.historyIdx < len(m.history)-1 {
+					m.historyIdx++
+					m.input.SetValue(m.history[m.historyIdx])
+					m.input.SetCursor(len(m.input.Value()))
+				} else if m.historyIdx == len(m.history)-1 {
+					m.historyIdx = len(m.history)
+					m.input.SetValue(m.tempInput)
+					m.input.SetCursor(len(m.input.Value()))
+				}
+			}
 		case tea.KeyEnter:
 			if m.focus == focusInput {
 				val := strings.TrimSpace(m.input.Value())
@@ -150,6 +181,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.chatViewport.SetContent(strings.Join(m.chats, ""))
 					m.chatViewport.GotoBottom()
+
+					// Save command to history if it's different from the last entered one
+					if len(m.history) == 0 || m.history[len(m.history)-1] != val {
+						m.history = append(m.history, val)
+					}
+					m.historyIdx = len(m.history)
+					m.tempInput = ""
 
 					go m.processCmd(val)
 					m.input.SetValue("")
