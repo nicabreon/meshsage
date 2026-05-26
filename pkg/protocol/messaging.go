@@ -173,7 +173,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 
 	} else if strings.HasPrefix(envelope, "X3DH:") {
 		// 2. Jalur Handshake X3DH (Lengkap)
-		fmt.Printf("[HANDSHAKE] Receiving new X3DH Handshake from %s\n", FormatPeerID(senderID.String()))
+		logger.Info().Str("peerID", senderID.String()).Msg("Receiving new X3DH Handshake")
 		// Format baru: X3DH:keyID:ePub:senderRatchetPub:encryptedPayload
 		parts := strings.SplitN(envelope, ":", 5)
 		if len(parts) < 4 { return }
@@ -191,13 +191,13 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 
 		privKeyB64, err := corestore.FindPrivateKeyByID(keyID)
 		if err != nil || privKeyB64 == "" {
-			fmt.Printf("[HANDSHAKE Error] Receiver's Pre-Key %s not found (Already used or expired).\n", keyID)
+			logger.Error().Str("keyID", keyID).Msg("Receiver's Pre-Key not found (Already used or expired)")
 			return
 		}
 		privKeyBytes, _ := base64.StdEncoding.DecodeString(privKeyB64)
 		ePubBytes, _ := base64.StdEncoding.DecodeString(ePubB64)
 
-		fmt.Printf("[HANDSHAKE] Deriving shared secret from receiver's Pre-Key...\n")
+		logger.Debug().Msg("Deriving shared secret from receiver's Pre-Key...")
 		aesKey, err = corecrypto.DeriveSharedSecret(privKeyBytes, ePubBytes)
 		if err != nil { return }
 
@@ -249,7 +249,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		sendChainB64 := base64.StdEncoding.EncodeToString(sendChainKey)
 		recvChainB64 := base64.StdEncoding.EncodeToString(recvChainKey)
 
-		fmt.Printf("[HANDSHAKE] Initial session established. RootKey: %s...\n", rootKeyB64[:6])
+		logger.Info().Str("rootKey", rootKeyB64[:6]).Msg("Initial session established")
 		// BUG-1 FIX: Clear ALL stale skipped keys from old epochs before saving new session.
 		// Old skipped keys (keyed by peerID+counter) belong to a different ratchet epoch
 		// and will always fail decryption with "cipher: message authentication failed".
@@ -307,7 +307,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 
 	switch env.Type {
 	case MsgTypeStatus:
-		fmt.Printf("\n[Status Report] Peer %s marked your message %s as: %s\n> ", 
+		logger.Displayf("[Status Report] Peer %s marked your message %s as: %s\n", 
 			FormatPeerID(senderID.String()), env.RefID, env.Status)
 		return
 
@@ -335,15 +335,33 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 			}
 		}
 
-		fmt.Printf("\n[Message from %s]: %s\n> ", FormatPeerID(senderID.String()), env.Content)
+		ts := time.Now().Format("02/01 15:04:05")
+		logger.Displayf("\033[92m[%s] [Message from %s]: %s\033[0m\n", ts, FormatSender(senderID.String()), env.Content)
+		if MessageCallback != nil {
+			MessageCallback(MessageEvent{
+				Type:      "direct",
+				Timestamp: ts,
+				Sender:    senderID.String(),
+				Content:   env.Content,
+			})
+		}
 		// OTOMATIS: Kirim status "delivered" (Centang 2)
 		go SendStatusUpdate(ctx, h, senderID, env.ID, StatusDelivered)
 		
 	case MsgTypeFile:
 		parts := strings.Split(env.Content, ":")
 		if len(parts) >= 4 {
-			fmt.Printf("\n[FILE Notification from %s]: %s (%s bytes)\n", FormatPeerID(senderID.String()), parts[2], parts[3])
-			fmt.Printf(">> To download, use: /download %s %s\n> ", parts[0], parts[1])
+			ts := time.Now().Format("02/01 15:04:05")
+			logger.Displayf("\033[92m[%s] [FILE from %s]: %s (%s bytes)\033[0m\n", ts, FormatSender(senderID.String()), parts[2], parts[3])
+			logger.Displayf("\033[33m>> To download, use: /download %s %s\033[0m\n", parts[0], parts[1])
+			if MessageCallback != nil {
+				MessageCallback(MessageEvent{
+					Type:      "file",
+					Timestamp: ts,
+					Sender:    senderID.String(),
+					Content:   env.Content,
+				})
+			}
 		}
 	
 	case MsgTypeGroup:
@@ -558,7 +576,7 @@ func StartChatPrompt(ctx context.Context, h host.Host, priv crypto.PrivKey) {
 			if err != nil { return }
 			msg = strings.TrimSpace(msg)
 			if msg != "" {
-				processCommand(ctx, h, priv, msg)
+				ProcessCommand(ctx, h, priv, msg)
 			}
 		}
 	}()
@@ -575,22 +593,24 @@ func StartChatPrompt(ctx context.Context, h host.Host, priv crypto.PrivKey) {
 			if err == nil && info.Mode().IsRegular() {
 				content, err := os.ReadFile(inputPath)
 				if err == nil && len(content) > 0 {
+					// Clear the file immediately before processing to avoid race conditions with subsequent writes
+					os.WriteFile(inputPath, []byte(""), 0644)
+					
 					lines := strings.Split(string(content), "\n")
 					for _, line := range lines {
 						cmd := strings.TrimSpace(line)
 						if cmd != "" {
 							logger.Debug().Str("command", cmd).Msg("Executing automated command from file")
-							processCommand(ctx, h, priv, cmd)
+							ProcessCommand(ctx, h, priv, cmd)
 						}
 					}
-					os.WriteFile(inputPath, []byte(""), 0644)
 				}
 			}
 		}
 	}()
 }
 
-func processCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgStr string) {
+func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgStr string) {
 	msgStr = strings.TrimSpace(msgStr)
 	if msgStr == "" { return }
 
@@ -607,7 +627,7 @@ func processCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 				pings := ping.Ping(ctx, h, targetID)
 				for i := 0; i < 3; i++ {
 					res := <-pings
-					if res.Error == nil { fmt.Printf("[Latency] Ping %d: %v\n", i+1, res.RTT) }
+					if res.Error == nil { logger.Displayf("[Latency] Ping %d: %v\n", i+1, res.RTT) }
 				}
 			}
 		}
@@ -658,7 +678,11 @@ func processCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		if len(parts) == 2 {
 			alias := parts[1]
 			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
-			RegisterAlias(ctx, h, alias, h.ID().String())
+			err := RegisterAlias(ctx, h, alias, h.ID().String())
+			if err != nil {
+				logger.Error().Err(err).Str("alias", alias).Msg("COMMAND: Failed to register alias")
+				logger.Displayf("[Error] Failed to register alias %s: %v\n", alias, err)
+			}
 		}
 		return
 	}
@@ -675,13 +699,20 @@ func processCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 					logger.Debug().Str("alias", parts[1]).Str("peerID", targetStr).Msg("COMMAND: Alias resolved successfully")
 				} else {
 					logger.Error().Err(err).Str("alias", parts[1]).Msg("COMMAND: Failed to resolve alias")
+					logger.Displayf("[Error] Failed to resolve alias %s: %v\n", targetStr, err)
+					return
 				}
 			}
 			targetID, err := peer.Decode(targetStr)
 			if err == nil {
 				logger.Debug().Str("peerID", targetID.String()).Msg("COMMAND: Calling SendMessage")
-				_ = SendMessage(ctx, h, priv, targetID, parts[2])
-				logger.Info().Str("peerID", targetID.String()).Msg("Message sent successfully (request submitted)")
+				errSend := SendMessage(ctx, h, priv, targetID, parts[2])
+				if errSend == nil {
+					logger.Info().Str("peerID", targetID.String()).Msg("Message sent successfully")
+				} else {
+					logger.Error().Err(errSend).Str("peerID", targetID.String()).Msg("Failed to send message")
+					logger.Displayf("[Error] Failed to send message to %s: %v\n", FormatPeerID(targetID.String()), errSend)
+				}
 			} else {
 				logger.Error().Err(err).Str("target", targetStr).Msg("COMMAND: Invalid Peer ID or unresolvable alias")
 			}
@@ -698,7 +729,13 @@ func processCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 			targetStr := parts[2]
 			if strings.HasPrefix(targetStr, "@") {
 				resolved, err := ResolveAlias(ctx, h, targetStr)
-				if err == nil { targetStr = resolved }
+				if err == nil { 
+					targetStr = resolved 
+				} else {
+					logger.Error().Err(err).Str("alias", targetStr).Msg("COMMAND: Failed to resolve alias for upload")
+					logger.Displayf("[Error] Failed to resolve alias %s: %v\n", targetStr, err)
+					return
+				}
 			}
 			targetID, err := peer.Decode(targetStr)
 			if err == nil {
@@ -706,8 +743,13 @@ func processCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 				if err == nil {
 					fileName := filepath.Base(filePath)
 					fileMsg := fmt.Sprintf("FILE:%s:%d:%s", fileName, len(fileData), base64.StdEncoding.EncodeToString(fileData))
-					_ = SendMessage(ctx, h, priv, targetID, fileMsg)
-					fmt.Printf("[Success] Encrypted file %s sent to %s\n", fileName, FormatPeerID(targetID.String()))
+					errSend := SendMessage(ctx, h, priv, targetID, fileMsg)
+					if errSend == nil {
+						logger.Displayf("[Success] Encrypted file %s sent to %s\n", fileName, FormatPeerID(targetID.String()))
+					} else {
+						logger.Error().Err(errSend).Str("peerID", targetID.String()).Msg("Failed to send file")
+						logger.Displayf("[Error] Failed to send file %s to %s: %v\n", fileName, FormatPeerID(targetID.String()), errSend)
+					}
 				}
 			}
 		}
@@ -716,6 +758,6 @@ func processCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 
 	// DESIGN-05 FIX: Input tidak dikenal sebagai command → tampilkan error, jangan broadcast ke semua peer.
 	// Perilaku broadcast lama sangat berbahaya (typo command = kirim ke semua orang).
-	fmt.Printf("[Error] Unknown command: '%s'\n", msgStr)
-	fmt.Printf("Available commands: /msg, /group, /join, /fetch, /register, /upload, /latency\n> ")
+	logger.Displayf("[Error] Unknown command: '%s'\n", msgStr)
+	logger.Displayf("Available commands: /msg, /group, /join, /fetch, /register, /upload, /latency\n")
 }

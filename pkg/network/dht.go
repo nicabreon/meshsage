@@ -17,7 +17,7 @@ var (
 func SetupDHT(ctx context.Context, h host.Host) (*dht.IpfsDHT, error) {
 	var err error
 	once.Do(func() {
-		GlobalDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeServer))
+		GlobalDHT, err = dht.New(ctx, h, dht.Mode(dht.ModeAuto))
 		if err != nil {
 			return
 		}

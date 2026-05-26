@@ -327,6 +327,15 @@ func LoadAlias(aliasHash string) (aliasName, peerID string, pubkeyBytes []byte, 
 	return
 }
 
+// FindAliasByPeerID looks up the registered alias name for a given peer ID.
+func FindAliasByPeerID(peerID string) (string, error) {
+	if DB == nil { return "", fmt.Errorf("database not initialized") }
+	var aliasName string
+	row := DB.QueryRow(`SELECT alias_name FROM alias_store WHERE peer_id = ? LIMIT 1`, peerID)
+	err := row.Scan(&aliasName)
+	return aliasName, err
+}
+
 // DeleteAliasByPubkey removes an old alias when a user changes their name
 func DeleteAliasByHash(aliasHash string) error {
 	if DB == nil { return nil }

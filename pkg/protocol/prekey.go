@@ -192,10 +192,13 @@ func verifyBatchSignature(batch PreKeyBatch) error {
 }
 
 func UploadPreKeys(ctx context.Context, h host.Host, relayID peer.ID, batch PreKeyBatch) error {
-	s, err := h.NewStream(ctx, relayID, PreKeyProtocolID)
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	s, err := h.NewStream(dialCtx, relayID, PreKeyProtocolID)
+	cancel()
 	if err != nil { return err }
 	defer s.Close()
 
+	_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	jsonBatch, _ := json.Marshal(batch)
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
@@ -210,13 +213,17 @@ func UploadPreKeys(ctx context.Context, h host.Host, relayID peer.ID, batch PreK
 }
 
 func FetchPreKey(ctx context.Context, h host.Host, relayID peer.ID, targetID string) (string, string, string, error) {
-	s, err := h.NewStream(ctx, relayID, PreKeyProtocolID)
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	s, err := h.NewStream(dialCtx, relayID, PreKeyProtocolID)
+	cancel()
 	if err != nil { return "", "", "", err }
 	defer s.Close()
 
+	_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = s.Write([]byte(fmt.Sprintf("FETCH %s\n", targetID)))
 	if err != nil { return "", "", "", err }
 
+	_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := bufio.NewReader(s)
 	resp, err := buf.ReadString('\n')
 	if err != nil { return "", "", "", err }
@@ -249,12 +256,16 @@ func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKe
 	}
 	if !isInfra { return nil }
 
-	s, err := h.NewStream(ctx, relayID, PreKeyProtocolID)
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	s, err := h.NewStream(dialCtx, relayID, PreKeyProtocolID)
+	cancel()
 	if err != nil { return err }
 	
+	_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = s.Write([]byte(fmt.Sprintf("COUNT %s\n", h.ID().String())))
 	if err != nil { s.Reset(); return err }
 
+	_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := bufio.NewReader(s)
 	resp, err := buf.ReadString('\n')
 	s.Close()

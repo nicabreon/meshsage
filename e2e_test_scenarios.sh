@@ -193,6 +193,33 @@ else
     echo ">> SKENARIO 4: FAILED"
 fi
 
+echo "=================================================="
+echo "SKENARIO 5: Alias Hijacking Protection & Local Caching"
+echo "=================================================="
+echo "1. Alice mendaftarkan alias @super-alice..."
+echo "/register super-alice" > test_e2e_run/alice/input
+sleep 5
+
+# Verifikasi Alice menyimpannya secara lokal dan berhasil mendaftarkannya
+if grep -q "Successfully registered '@super-alice'" test_e2e_run/alice/log; then
+    echo "   -> Alice berhasil mendaftarkan @super-alice secara lokal dan ke swarm."
+else
+    echo "   -> FAILED: Alice gagal mendaftarkan @super-alice."
+fi
+
+echo "2. Bob mencoba mendaftarkan alias @super-alice (alias hijacking)..."
+echo "/register super-alice" > test_e2e_run/bob/input
+sleep 5
+
+# Verifikasi Bob ditolak oleh jaringan karena @super-alice sudah dimiliki Alice
+if grep -q "Registration rejected by peer" test_e2e_run/bob/log || grep -q "failed to register alias" test_e2e_run/bob/log; then
+    echo "   -> Bob ditolak ketika mencoba mendaftarkan alias @super-alice (Sukses Proteksi Hijacking!)."
+    echo ">> SKENARIO 5: SUCCESS"
+else
+    echo "   -> FAILED: Bob berhasil meregistrasi alias @super-alice milik Alice!"
+    echo ">> SKENARIO 5: FAILED"
+fi
+
 # Cleanup
 echo "Pembersihan node P2P..."
 kill $RELAY_PID $ALICE_PID $BOB_PID $CHARLIE_PID || true

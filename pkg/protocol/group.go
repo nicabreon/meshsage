@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -34,9 +35,28 @@ type GroupSession struct {
 }
 
 var (
-	activeGroups = make(map[string]*GroupSession)
-	groupsMutex  sync.Mutex
+	activeGroups      = make(map[string]*GroupSession)
+	groupsMutex       sync.Mutex
+	processedMessages = make(map[string]bool)
+	processedMutex    sync.Mutex
 )
+
+// checkAndMarkProcessed returns true if the message signature has already been processed
+func checkAndMarkProcessed(signature string) bool {
+	if signature == "" {
+		return false
+	}
+	processedMutex.Lock()
+	defer processedMutex.Unlock()
+	if processedMessages[signature] {
+		return true
+	}
+	if len(processedMessages) > 10000 {
+		processedMessages = make(map[string]bool)
+	}
+	processedMessages[signature] = true
+	return false
+}
 
 // JoinGroup joins a GossipSub topic and initializes Sender Keys
 func JoinGroup(ctx context.Context, h host.Host, priv crypto.PrivKey, groupID string, members []string) error {
@@ -93,7 +113,7 @@ func JoinGroup(ctx context.Context, h host.Host, priv crypto.PrivKey, groupID st
 	// 5. Start listener goroutine
 	go listenGroupMessages(ctx, session, groupID)
 
-	fmt.Printf("[Group] Successfully joined room: %s with %d members\n", groupID, len(members))
+	logger.Displayf("[Group] Successfully joined room: %s with %d members\n", groupID, len(members))
 	return nil
 }
 
@@ -101,12 +121,17 @@ func shareKeyWithMember(ctx context.Context, h host.Host, priv crypto.PrivKey, g
 	target, err := peer.Decode(memberID)
 	if err != nil { return }
 
-	fmt.Printf("[GROUP HANDSHAKE] Sharing our local key for group %s with member %s via Double Ratchet...\n", groupID, FormatPeerID(memberID))
+	logger.Debug().Msgf("[GROUP HANDSHAKE] Sharing our local key for group %s with member %s via Double Ratchet...", groupID, FormatPeerID(memberID))
 	// Format: GKEY:<groupID>:<Base64Key>
 	shareMsg := fmt.Sprintf("GKEY:%s:%s", groupID, base64.StdEncoding.EncodeToString(key))
 	
 	// We use the 1:1 SendMessage which is already secure (X3DH)
-	_ = SendMessage(ctx, h, priv, target, shareMsg)
+	errSend := SendMessage(ctx, h, priv, target, shareMsg)
+	if errSend != nil {
+		logger.Error().Err(errSend).Str("group", groupID).Str("member", memberID).Msg("[GROUP HANDSHAKE] Failed to share group key")
+	} else {
+		logger.Debug().Str("group", groupID).Str("member", memberID).Msg("[GROUP HANDSHAKE] Group key shared successfully")
+	}
 }
 
 func listenGroupMessages(ctx context.Context, session *GroupSession, groupID string) {
@@ -124,29 +149,32 @@ func listenGroupMessages(ctx context.Context, session *GroupSession, groupID str
 		// Don't process our own messages
 		if gMsg.SenderID == session.Host.ID().String() { continue }
 
+		// Skip duplicate processing
+		if checkAndMarkProcessed(gMsg.Signature) { continue }
+
 		// Look up the sender's key for this group
 		senderKey, err := corestore.GetGroupSenderKey(groupID, gMsg.SenderID)
 		if err != nil {
-			fmt.Printf("[Group %s] Received message from %s but no key found yet\n", groupID, FormatPeerID(gMsg.SenderID))
+			logger.Warn().Msgf("[Group %s] Received message from %s but no key found yet", groupID, FormatPeerID(gMsg.SenderID))
 			continue
 		}
 
 		// Decrypt message using the Sender's specific key
-		fmt.Printf("[GROUP E2EE] --- LAYER 1: GROUP DECRYPTION ---\n")
-		fmt.Printf("[GROUP E2EE] Incoming Ciphertext: %s\n", gMsg.Payload)
+		logger.Debug().Msg("[GROUP E2EE] --- LAYER 1: GROUP DECRYPTION ---")
+		logger.Debug().Msgf("[GROUP E2EE] Incoming Ciphertext: %s", gMsg.Payload)
 		plaintext, err := corecrypto.DecryptMessage(senderKey, gMsg.Payload)
 		if err != nil {
-			fmt.Printf("[Group %s] Failed to decrypt message from %s (Key mismatch)\n", groupID, FormatPeerID(gMsg.SenderID))
+			logger.Error().Msgf("[Group %s] Failed to decrypt message from %s (Key mismatch)", groupID, FormatPeerID(gMsg.SenderID))
 			continue
 		}
-		fmt.Printf("[GROUP E2EE] Decrypted Result: %s\n", plaintext)
+		logger.Debug().Msgf("[GROUP E2EE] Decrypted Result: %s", plaintext)
 
 		// --- RATCHET: Putar kunci pengirim di database kita agar sinkron dengan pesan dia selanjutnya ---
 		hKDF := hmac.New(sha256.New, senderKey)
 		hKDF.Write([]byte("GROUP_RATCHET"))
 		nextSenderKey := hKDF.Sum(nil)
 		corestore.SaveGroupSenderKey(groupID, gMsg.SenderID, nextSenderKey)
-		fmt.Printf("[Group Ratchet] Rotated sender key for @%s in group %s\n", FormatPeerID(gMsg.SenderID), groupID)
+		logger.Debug().Msgf("[Group Ratchet] Rotated sender key for @%s in group %s", FormatPeerID(gMsg.SenderID), groupID)
 
 		// --- VERIFIKASI TANDA TANGAN ---
 		if gMsg.Signature != "" {
@@ -157,14 +185,24 @@ func listenGroupMessages(ctx context.Context, session *GroupSession, groupID str
 				sigBytes, _ := base64.StdEncoding.DecodeString(gMsg.Signature)
 				valid, _ := pubKey.Verify(dataToVerify, sigBytes)
 				if !valid {
-					fmt.Printf("[Group Warning] REJECTED: Invalid signature from %s in group %s\n", FormatPeerID(gMsg.SenderID), groupID)
+					logger.Warn().Msgf("[Group Warning] REJECTED: Invalid signature from %s in group %s", FormatPeerID(gMsg.SenderID), groupID)
 					continue
 				}
-				fmt.Printf("[Group Security] Message from @%s verified with Digital Signature.\n", FormatPeerID(gMsg.SenderID))
+				logger.Debug().Msgf("[Group Security] Message from @%s verified with Digital Signature.", FormatPeerID(gMsg.SenderID))
 			}
 		}
 
-		fmt.Printf("\n[Group %s] @%s: %s\n> ", groupID, FormatPeerID(gMsg.SenderID), plaintext)
+		ts := time.Now().Format("02/01 15:04:05")
+		logger.Displayf("\033[92m[%s] [Group %s] %s: %s\033[0m\n", ts, groupID, FormatSender(gMsg.SenderID), plaintext)
+		if MessageCallback != nil {
+			MessageCallback(MessageEvent{
+				Type:      "group",
+				Timestamp: ts,
+				Sender:    gMsg.SenderID,
+				GroupID:   groupID,
+				Content:   plaintext,
+			})
+		}
 	}
 }
 
@@ -183,11 +221,11 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 	if err != nil { return err }
 
 	// 2. Encrypt the payload with our key
-	fmt.Printf("[GROUP E2EE] --- LAYER 1: GROUP ENCRYPTION ---\n")
-	fmt.Printf("[GROUP E2EE] Original Text: %s\n", message)
+	logger.Debug().Msg("[GROUP E2EE] --- LAYER 1: GROUP ENCRYPTION ---")
+	logger.Debug().Msgf("[GROUP E2EE] Original Text: %s", message)
 	encrypted, err := corecrypto.EncryptMessage(localKey, message)
 	if err == nil {
-		fmt.Printf("[GROUP E2EE] Encrypted Result (B64): %s\n", encrypted)
+		logger.Debug().Msgf("[GROUP E2EE] Encrypted Result (B64): %s", encrypted)
 	}
 	if err != nil { return err }
 
@@ -196,7 +234,7 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 	hKDF.Write([]byte("GROUP_RATCHET"))
 	nextLocalKey := hKDF.Sum(nil)
 	corestore.SaveGroupLocalKey(groupID, nextLocalKey)
-	fmt.Printf("[Group Ratchet] Rotated our local key for group %s\n", groupID)
+	logger.Debug().Msgf("[Group Ratchet] Rotated our local key for group %s", groupID)
 
 	// 3. DIGITAL SIGNATURE: Tanda tangani Payload + SenderID
 	privKey := h.Peerstore().PrivKey(h.ID())
@@ -251,19 +289,22 @@ func ProcessGroupMessage(groupID string, msgBytes []byte) {
 	err := json.Unmarshal(msgBytes, &gMsg)
 	if err != nil { return }
 
+	// Skip duplicate processing
+	if checkAndMarkProcessed(gMsg.Signature) { return }
+
 	// Look up the sender's key for this group
 	senderKey, err := corestore.GetGroupSenderKey(groupID, gMsg.SenderID)
 	if err != nil {
-		fmt.Printf("[Group %s] Received offline message from %s but no key found yet\n", groupID, FormatPeerID(gMsg.SenderID))
+		logger.Warn().Msgf("[Group %s] Received offline message from %s but no key found yet", groupID, FormatPeerID(gMsg.SenderID))
 		return
 	}
 
 	// Decrypt message using the Sender's specific key
-	fmt.Printf("[GROUP E2EE] --- LAYER 1: GROUP DECRYPTION (OFFLINE) ---\n")
-	fmt.Printf("[GROUP E2EE] Incoming Ciphertext: %s\n", gMsg.Payload)
+	logger.Debug().Msg("[GROUP E2EE] --- LAYER 1: GROUP DECRYPTION (OFFLINE) ---")
+	logger.Debug().Msgf("[GROUP E2EE] Incoming Ciphertext: %s", gMsg.Payload)
 	plaintext, err := corecrypto.DecryptMessage(senderKey, gMsg.Payload)
 	if err != nil {
-		fmt.Printf("[Group %s] Failed to decrypt offline message from %s (Key mismatch)\n", groupID, FormatPeerID(gMsg.SenderID))
+		logger.Error().Msgf("[Group %s] Failed to decrypt offline message from %s (Key mismatch)", groupID, FormatPeerID(gMsg.SenderID))
 		return
 	}
 
@@ -272,9 +313,9 @@ func ProcessGroupMessage(groupID string, msgBytes []byte) {
 	hKDF.Write([]byte("GROUP_RATCHET"))
 	nextSenderKey := hKDF.Sum(nil)
 	corestore.SaveGroupSenderKey(groupID, gMsg.SenderID, nextSenderKey)
-	fmt.Printf("[Group Ratchet] Rotated sender key for @%s in group %s\n", FormatPeerID(gMsg.SenderID), groupID)
+	logger.Debug().Msgf("[Group Ratchet] Rotated sender key for @%s in group %s", FormatPeerID(gMsg.SenderID), groupID)
 	
-	fmt.Printf("[GROUP E2EE] Decrypted Result: %s\n", plaintext)
+	logger.Debug().Msgf("[GROUP E2EE] Decrypted Result: %s", plaintext)
 
 	// --- VERIFIKASI TANDA TANGAN (OFFLINE) ---
 	if gMsg.Signature != "" {
@@ -285,14 +326,24 @@ func ProcessGroupMessage(groupID string, msgBytes []byte) {
 			sigBytes, _ := base64.StdEncoding.DecodeString(gMsg.Signature)
 			valid, _ := pubKey.Verify(dataToVerify, sigBytes)
 			if !valid {
-				fmt.Printf("[Group Warning] REJECTED: Invalid signature on offline message from %s\n", FormatPeerID(gMsg.SenderID))
+				logger.Warn().Msgf("[Group Warning] REJECTED: Invalid signature on offline message from %s", FormatPeerID(gMsg.SenderID))
 				return
 			}
-			fmt.Printf("[Group Security] Offline Message from @%s verified.\n", FormatPeerID(gMsg.SenderID))
+			logger.Debug().Msgf("[Group Security] Offline Message from @%s verified.", FormatPeerID(gMsg.SenderID))
 		}
 	}
 
-	fmt.Printf("\n[Group %s] @%s (Offline): %s\n> ", groupID, FormatPeerID(gMsg.SenderID), plaintext)
+	ts := time.Now().Format("02/01 15:04:05")
+	logger.Displayf("\033[92m[%s] [Group %s] %s (Offline): %s\033[0m\n", ts, groupID, FormatSender(gMsg.SenderID), plaintext)
+	if MessageCallback != nil {
+		MessageCallback(MessageEvent{
+			Type:      "group",
+			Timestamp: ts,
+			Sender:    gMsg.SenderID,
+			GroupID:   groupID,
+			Content:   plaintext,
+		})
+	}
 }
 
 // RestoreGroups loads groups that we are members of from the database and joins them.

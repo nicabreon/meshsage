@@ -117,7 +117,9 @@ func handleNotifyStream(s network.Stream) {
 }
 
 func SubscribeNotifications(ctx context.Context, h host.Host, relayID peer.ID, statusChan chan<- bool) {
-	s, err := h.NewStream(ctx, relayID, protocol.ID(NotifyProtocolID))
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	s, err := h.NewStream(dialCtx, relayID, protocol.ID(NotifyProtocolID))
+	cancel()
 	if err != nil {
 		if statusChan != nil { statusChan <- false }
 		return
@@ -294,10 +296,13 @@ func StoreOfflineMessage(ctx context.Context, h host.Host, targetID peer.ID, sen
 		}
 	}
 
+	// Query closest peers once from DHT
+	var closest []peer.ID
+	dhtCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	closest, _ = corenet.GlobalDHT.GetClosestPeers(dhtCtx, coord)
+	cancel()
+
 	if len(infraPeers) == 0 {
-		dhtCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		closest, _ := corenet.GlobalDHT.GetClosestPeers(dhtCtx, coord)
-		cancel()
 		for _, p := range closest {
 			if p != h.ID() && p != targetID { hybridPeers = append(hybridPeers, p) }
 		}
@@ -307,33 +312,61 @@ func StoreOfflineMessage(ctx context.Context, h host.Host, targetID peer.ID, sen
 	for _, p := range infraPeers {
 		if p != targetID { targetPeers[p] = true }
 	}
-	dhtCtx2, cancel2 := context.WithTimeout(ctx, 3*time.Second)
-	closest, _ := corenet.GlobalDHT.GetClosestPeers(dhtCtx2, coord)
-	cancel2()
 	for _, p := range closest {
 		if len(targetPeers) >= 3 { break }
 		if p != h.ID() && p != targetID { targetPeers[p] = true }
 	}
 
+	var mu sync.Mutex
 	successCount := 0
-	logger.Debug().Str("hash", msgHash).Int("targets", len(targetPeers)).Msg("Starting offline storage distribution")
 
-	for p := range targetPeers {
-		s, err := h.NewStream(ctx, p, protocol.ID(MailboxProtocolID))
-		if err != nil { continue }
-
-		cmd := fmt.Sprintf("STORE %s %s %s %s\n", msgHash, coord, senderPubkeyB64, payloadB64)
-		_, err = s.Write([]byte(cmd))
-		if err != nil { s.Close(); continue }
-
-		respBuf := bufio.NewReader(s)
-		resp, _ := respBuf.ReadString('\n')
-		s.Close()
-
-		if strings.TrimSpace(resp) == "OK" {
+	// If the local node acts as a relay, and the target is not itself, we can store it locally
+	storeLocally := corenet.ShouldActAsRelay() && targetID != h.ID()
+	if storeLocally {
+		err := corestore.SaveMailboxMessage(msgHash, coord, senderPubkeyB64, payloadB64)
+		if err == nil {
 			successCount++
+			logger.Debug().Str("hash", msgHash).Str("coord", coord).Msg("Message stored in local mailbox (self-relay)")
+			NotifyRecipient(coord)
+			BroadcastClusterEvent(ctx, ClusterEvent{
+				Type: "MAILBOX_ADD", Hash: msgHash, OwnerID: coord, Sender: senderPubkeyB64, Payload: payloadB64,
+			})
+		} else {
+			logger.Error().Err(err).Msg("Failed to store mailbox message locally")
 		}
 	}
+
+	logger.Debug().Str("hash", msgHash).Int("targets", len(targetPeers)).Bool("storeLocally", storeLocally).Msg("Starting offline storage distribution")
+
+	var wg sync.WaitGroup
+	for p := range targetPeers {
+		wg.Add(1)
+		go func(peerID peer.ID) {
+			defer wg.Done()
+
+			dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			s, err := h.NewStream(dialCtx, peerID, protocol.ID(MailboxProtocolID))
+			cancel()
+			if err != nil { return }
+			defer s.Close()
+
+			_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			cmd := fmt.Sprintf("STORE %s %s %s %s\n", msgHash, coord, senderPubkeyB64, payloadB64)
+			_, err = s.Write([]byte(cmd))
+			if err != nil { return }
+
+			_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
+			respBuf := bufio.NewReader(s)
+			resp, _ := respBuf.ReadString('\n')
+
+			if strings.TrimSpace(resp) == "OK" {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(p)
+	}
+	wg.Wait()
 
 	if successCount == 0 { return fmt.Errorf("failed to store message on any node") }
 	logger.Info().Int("nodes", successCount).Msg("Offline message stored successfully")
@@ -344,15 +377,20 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 	coord := GetMailboxCoordinate(h.ID())
 	logger.Debug().Str("coord", coord).Str("peerID", relayID.String()).Msg("Starting mailbox fetch")
 	
-	s, err := h.NewStream(ctx, relayID, protocol.ID(MailboxProtocolID))
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	s, err := h.NewStream(dialCtx, relayID, protocol.ID(MailboxProtocolID))
+	cancel()
 	if err != nil { return }
 	defer s.Close()
 
-	s.Write([]byte(fmt.Sprintf("FETCH %s\n", coord)))
+	_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, err = s.Write([]byte(fmt.Sprintf("FETCH %s\n", coord)))
+	if err != nil { return }
 	buf := bufio.NewReader(s)
 
 	foundCount := 0
 	for {
+		_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
 		line, err := buf.ReadString('\n')
 		if err != nil { break }
 		line = strings.TrimSpace(line)

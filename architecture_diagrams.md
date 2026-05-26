@@ -408,3 +408,76 @@ sequenceDiagram
     Charlie->>Charlie: Display decrypted message to user
     deactivate Charlie
 ```
+
+---
+
+## **5. Alias Registration & Resolution Subsystem**
+
+Meshsage implements a secure, decentralized identity registry mapping human-readable usernames (e.g., `@alice`) to cryptographic `PeerID`s. This subsystem protects against hijacking through digital signatures and optimizes lookup performance using on-demand caching.
+
+### **A. Secure Alias Registration**
+To prevent alias hijacking, registering an alias requires presenting a digital signature proving ownership of the corresponding public key.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Alice as Alice
+    participant Swarm as DHT / Swarm Nodes
+    participant SQLite as SQLite DB / Memory
+
+    Alice->>Alice: Generate Signature over:<br/>data = "@alice" + Alice_PeerID + Alice_Pubkey_B64
+    Alice->>Swarm: Connect via /p2p-core/alias/1.0.0
+    Alice->>Swarm: Send: REGISTER @alice Alice_PeerID Alice_Pubkey_B64 Signature_B64
+
+    activate Swarm
+    Swarm->>Swarm: 1. Derive PeerID from Pubkey & verify it matches Alice_PeerID
+    Swarm->>Swarm: 2. Verify signature using Alice_Pubkey
+    Swarm->>Swarm: 3. Check if "@alice" is already registered to a different key
+    alt Verification Fails (Hijack Attempt)
+        Swarm-->>Alice: Respond: ERROR_ALREADY_OWNED / ERROR_INVALID_SIGNATURE
+    else Verification Success
+        Swarm->>SQLite: Save to alias_store database table
+        Swarm->>Swarm: Update local memory maps (aliasStore & ownerStore)
+        Swarm-->>Alice: Respond: OK
+    end
+    deactivate Swarm
+```
+
+### **B. On-Demand Resolution & Cache Propagation**
+Resolving an alias employs a hybrid local-first resolution search with fallback lookup cache propagation.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Bob as Bob
+    participant MemBob as Bob's Local Memory/DB
+    actor Relay as Dedicated Relay Node
+    participant MemRelay as Relay's Local Memory/DB
+    actor Alice as Alice (@alice)
+
+    Bob->>MemBob: 1. Panggil ResolveAlias("@alice") & cek aliasStore
+    alt Ditemukan di Cache Lokal (Fast Path)
+        MemBob-->>Bob: Kembalikan Peer ID (Selesai)
+    else Tidak Ditemukan di Cache Lokal
+        Bob->>Relay: 2. Kirim stream RESOLVE @alice (Slow Path)
+        
+        activate Relay
+        Relay->>MemRelay: 3. Cek local memory ONLY (mencegah infinite loop)
+        
+        alt Relay memiliki cache @alice
+            MemRelay-->>Bob: Kembalikan FOUND Alice_PeerID Alice_Pubkey_B64
+        else Relay tidak memiliki cache
+            Relay-->>Bob: Kembalikan NOT_FOUND
+            Note over Bob: Bob melakukan DHT kueri ke swarm terdekat / Alice langsung
+            Bob->>Alice: Kirim stream RESOLVE @alice
+            Alice-->>Bob: Kembalikan FOUND Alice_PeerID Alice_Pubkey_B64
+            
+            critical 4. Validasi Kunci Publik & Caching Lokal
+                Bob->>Bob: Derive PeerID dari Alice_Pubkey & cocokkan dengan Alice_PeerID
+                Bob->>MemBob: Simpan ke SQLite & Memory (aliasStore & ownerStore)
+            end
+        end
+        deactivate Relay
+    end
+```
+

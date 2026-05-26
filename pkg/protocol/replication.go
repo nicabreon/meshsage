@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/nicabreon/meshsage/pkg/logger"
 	corenet "github.com/nicabreon/meshsage/pkg/network"
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
 )
@@ -80,11 +80,11 @@ func SetupReplicationHandler(h host.Host) {
 		}
 
 		manifestCIDStr := string(buf)
-		fmt.Printf("[Replication] Received request to cache file: %s\n", manifestCIDStr)
+		logger.Info().Str("manifestCID", manifestCIDStr).Msg("Received request to cache file")
 
 		go replicateFile(manifestCIDStr)
 	})
-	fmt.Println("[Replication] Relay is ready to Auto-Cache files.")
+	logger.Info().Msg("Relay is ready to Auto-Cache files.")
 }
 
 // replicateFile is run by the Relay to proactively fetch and store chunks
@@ -94,25 +94,25 @@ func replicateFile(manifestCIDStr string) {
 
 	mCID, err := cid.Decode(manifestCIDStr)
 	if err != nil {
-		fmt.Printf("[Replication Error] Invalid CID: %v\n", err)
+		logger.Error().Err(err).Str("manifestCID", manifestCIDStr).Msg("Invalid CID")
 		return
 	}
 
 	// 1. Fetch Manifest
 	mBlock, err := corenet.GlobalBlockService.GetBlock(ctx, mCID)
 	if err != nil {
-		fmt.Printf("[Replication Error] Failed to fetch manifest: %v\n", err)
+		logger.Error().Err(err).Str("manifestCID", manifestCIDStr).Msg("Failed to fetch manifest")
 		return
 	}
 
 	var manifest corestore.FileManifest
 	if err := json.Unmarshal(mBlock.RawData(), &manifest); err != nil {
-		fmt.Printf("[Replication Error] Failed to parse manifest: %v\n", err)
+		logger.Error().Err(err).Str("manifestCID", manifestCIDStr).Msg("Failed to parse manifest")
 		return
 	}
 
 	// 2. Fetch all chunks (This automatically pulls them to the Relay's Blockstore)
-	fmt.Printf("[Replication] Fetching %d chunks to local cache...\n", len(manifest.Chunks))
+	logger.Info().Msgf("Fetching %d chunks to local cache...", len(manifest.Chunks))
 	var cids []cid.Cid
 	for _, cStr := range manifest.Chunks {
 		c, _ := cid.Decode(cStr)
@@ -131,7 +131,7 @@ func replicateFile(manifestCIDStr string) {
 		fetched++
 	}
 
-	fmt.Printf("[Replication Success] Cached %d/%d chunks for %s!\n", fetched, len(manifest.Chunks), manifest.Name)
+	logger.Info().Msgf("Cached %d/%d chunks for %s!", fetched, len(manifest.Chunks), manifest.Name)
 }
 
 // SetupClusterSync joins the gossip topic for metadata replication
@@ -152,16 +152,16 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 
 			// DESIGN-07 FIX: Verifikasi signature HMAC-SHA256 untuk cluster event
 			if !VerifyClusterHMAC(event, ClusterSecretKey) {
-				fmt.Printf("[Cluster Error] Invalid HMAC signature for event type %s from peer %s\n", event.Type, msg.ReceivedFrom.String())
+				logger.Error().Str("type", event.Type).Str("peerID", msg.ReceivedFrom.String()).Msg("Invalid HMAC signature for cluster event")
 				continue
 			}
 
 			switch event.Type {
 			case "MAILBOX_ADD":
-				fmt.Printf("[Cluster] Syncing mailbox message for %s\n", event.OwnerID)
+				logger.Info().Str("ownerID", event.OwnerID).Msg("Syncing mailbox message from cluster")
 				corestore.SaveMailboxMessage(event.Hash, event.OwnerID, event.Sender, event.Payload)
 			case "MAILBOX_PURGE":
-				fmt.Printf("[Cluster] Purging message %s from cluster\n", event.Hash)
+				logger.Info().Str("hash", event.Hash).Msg("Purging message from cluster")
 				corestore.DeleteMailboxMessageByHash(event.Hash)
 			case "PREKEY_ADD":
 				// BUG-07 FIX: Replicate pre-keys across relay nodes
@@ -169,7 +169,7 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 					// event.Hash = KeyID, event.Payload = PublicKey, event.Sender = Signature
 					err := corestore.SavePreKey(event.OwnerID, event.Hash, event.Payload, "", event.Sender)
 					if err == nil {
-						fmt.Printf("[Cluster] Synced pre-key for %s (KeyID: %s)\n", event.OwnerID[:8], event.Hash[:8])
+						logger.Info().Str("ownerID", event.OwnerID[:8]).Str("keyID", event.Hash[:8]).Msg("Synced pre-key from cluster")
 					}
 				}
 			}
@@ -196,14 +196,17 @@ func SendReplicationRequest(ctx context.Context, h host.Host, manifestCID string
 	peers := h.Network().Peers()
 	count := 0
 	for _, p := range peers {
-		s, err := h.NewStream(ctx, p, ReplicationProtocol)
+		dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		s, err := h.NewStream(dialCtx, p, ReplicationProtocol)
+		cancel()
 		if err == nil {
+			_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			_, _ = s.Write([]byte(manifestCID))
 			s.Close()
 			count++
 		}
 	}
 	if count > 0 {
-		fmt.Printf("[Replication] Sent replication request to %d relays.\n", count)
+		logger.Info().Int("count", count).Msg("Sent replication request to relays")
 	}
 }

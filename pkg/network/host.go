@@ -13,6 +13,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
+	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/nicabreon/meshsage/pkg/logger"
 	"strings"
 	"os"
@@ -57,16 +58,22 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 		return nil, fmt.Errorf("failed to create resource manager: %w", err)
 	}
 
+	portStr := "0"
+	parts := strings.Split(cfg.ListenAddr, "/")
+	if len(parts) >= 5 {
+		portStr = parts[4]
+	}
+
 	opts := []libp2p.Option{
 		// 1. Identity
 		libp2p.Identity(cfg.PrivateKey),
 		// 2. Connection Management & Resource Limits
 		libp2p.ConnectionManager(cm),
 		libp2p.ResourceManager(rm),
-		// 3. Listen Address (Auto-detect & Support both TCP/UDP)
+		// 3. Listen Address (Auto-detect & Support both TCP/UDP, IPv4 & IPv6)
 		libp2p.ListenAddrStrings(
-			cfg.ListenAddr,
-			strings.Replace(cfg.ListenAddr, "/tcp/", "/udp/", 1)+"/quic-v1",
+			fmt.Sprintf("/ip4/0.0.0.0/udp/%s/quic-v1", portStr),
+			fmt.Sprintf("/ip6/::/udp/%s/quic-v1", portStr),
 		),
 
 		// 3. NAT Traversal & Port Forwarding
@@ -75,9 +82,8 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 		libp2p.EnableHolePunching(), // Aktifkan DCUtR (Hole Punching)
 
 		// 4. Transport & Security
-		libp2p.DefaultTransports, // Memastikan QUIC, WebRTC, dll aktif
+		libp2p.Transport(libp2pquic.NewTransport), // Hanya gunakan QUIC (UDP)
 		libp2p.EnableRelay(),
-		libp2p.EnableRelayService(),
 		// 5. Address Factory: Paksa iklan alamat publik yang terlihat oleh orang lain
 		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 			// Kita ambil semua alamat yang libp2p pikir kita punya
@@ -90,7 +96,7 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 
 // Paksa status publik jika diminta (khusus Dedicated Relay)
 if cfg.ForcePublic {
-	opts = append(opts, libp2p.ForceReachabilityPublic())
+	opts = append(opts, libp2p.ForceReachabilityPublic(), libp2p.EnableRelayService())
 }
 
 // Tambahkan AutoRelay dengan sumber dinamis

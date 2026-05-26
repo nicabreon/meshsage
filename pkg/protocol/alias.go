@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -55,10 +56,12 @@ func loadPersistedAliases() {
 		pubKey, err := crypto.UnmarshalPublicKey(pubkeyBytes)
 		if err != nil { continue }
 		aliasStore[aliasHash] = AliasRecord{PeerID: peerID, PubKey: pubKey}
+		pubKeyStr := base64.StdEncoding.EncodeToString(pubkeyBytes)
+		ownerStore[pubKeyStr] = aliasName
 		count++
 	}
 	if count > 0 {
-		fmt.Printf("[Alias DHT] Loaded %d persisted aliases from database.\n", count)
+		logger.Info().Int("count", count).Msg("Loaded persisted aliases from database")
 	}
 }
 
@@ -121,7 +124,7 @@ func handleAliasStream(s network.Stream) {
 					// Hapus alias lama
 					oldHash := GetAliasCoordinate(oldAlias)
 					delete(aliasStore, oldHash)
-					fmt.Printf("[Alias DHT] User updated name: @%s -> @%s\n", oldAlias, aliasName)
+					logger.Info().Str("oldAlias", oldAlias).Str("newAlias", aliasName).Msg("User updated name")
 				}
 
 				// Cek apakah nama alias baru ini sudah diambil orang lain?
@@ -130,7 +133,7 @@ func handleAliasStream(s network.Stream) {
 				if exists {
 					if !existing.PubKey.Equals(pubKey) {
 						aliasMutex.Unlock()
-						fmt.Printf("[Alias DHT] REJECTED: Someone tried to steal @%s\n", aliasName)
+						logger.Warn().Str("alias", aliasName).Msg("REJECTED: Someone tried to steal alias")
 						s.Write([]byte("ERROR_ALREADY_OWNED\n"))
 						return
 					}
@@ -151,7 +154,7 @@ func handleAliasStream(s network.Stream) {
 				ownerStore[pubKeyStr] = aliasName
 				aliasMutex.Unlock()
 
-				fmt.Printf("[Alias DHT] Verified & Registered %s to %s (hash: %s)\n", aliasName, FormatPeerID(targetPeerID), aliasHash)
+				logger.Displayf("[Alias DHT] Verified & Registered %s to %s (hash: %s)\n", aliasName, FormatPeerID(targetPeerID), aliasHash)
 				s.Write([]byte("OK\n"))
 			}
 		case "RESOLVE":
@@ -167,7 +170,9 @@ func handleAliasStream(s network.Stream) {
 				
 				if exists {
 					logger.Info().Str("alias", aliasName).Str("peerID", record.PeerID).Msg("ALIAS SERVICE: Alias resolved from memory")
-					response := fmt.Sprintf("FOUND %s\n", record.PeerID)
+					pubKeyBytes, _ := crypto.MarshalPublicKey(record.PubKey)
+					pubKeyB64 := base64.StdEncoding.EncodeToString(pubKeyBytes)
+					response := fmt.Sprintf("FOUND %s %s\n", record.PeerID, pubKeyB64)
 					s.Write([]byte(response))
 				} else {
 					logger.Debug().Str("alias", aliasName).Msg("ALIAS SERVICE: Alias not found in local memory")
@@ -196,76 +201,203 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 	}
 	sigB64 := base64.StdEncoding.EncodeToString(signature)
 
-	// 2. Cari node terdekat di DHT
-	closestPeers, err := corenet.GlobalDHT.GetClosestPeers(ctx, coord)
+	// 2. Cari node terdekat di DHT dengan timeout 3 detik
+	dhtCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	closestPeers, err := corenet.GlobalDHT.GetClosestPeers(dhtCtx, coord)
+	cancel()
 	if err != nil || len(closestPeers) == 0 {
 		closestPeers = h.Network().Peers()
 	}
 
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	successCount := 0
+
 	logger.Debug().Int("peer_count", len(closestPeers)).Str("alias", alias).Msg("CLIENT: Iterating peers for registration")
 	for _, p := range closestPeers {
 		if p == h.ID() { continue }
-		logger.Debug().Str("peerID", p.String()).Msg("CLIENT: Sending registration to peer")
-		s, err := h.NewStream(ctx, p, AliasProtocolID)
-		if err != nil { continue }
+		wg.Add(1)
+		go func(peerID peer.ID) {
+			defer wg.Done()
 
-		// Format: REGISTER <alias_name> <peer_id> <pubkey_b64> <sig_b64>
-		cmd := fmt.Sprintf("REGISTER %s %s %s %s\n", alias, myPeerID, pubKeyB64, sigB64)
-		_, err = s.Write([]byte(cmd))
-		
-		// Baca respon
-		respBuf := bufio.NewReader(s)
-		resp, _ := respBuf.ReadString('\n')
-		s.Close()
+			dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
 
-		if strings.TrimSpace(resp) == "OK" {
-			logger.Info().Str("peerID", p.String()).Msg("CLIENT: Registration accepted by peer")
-			successCount++
-		} else {
-			fmt.Printf("[Alias Error from %s]: %s\n", FormatPeerID(p.String()), strings.TrimSpace(resp))
-		}
+			s, err := h.NewStream(dialCtx, peerID, AliasProtocolID)
+			if err != nil {
+				logger.Debug().Err(err).Str("peerID", peerID.String()).Msg("CLIENT: Failed to dial peer for alias registration")
+				return
+			}
+			defer s.Close()
+
+			// Format: REGISTER <alias_name> <peer_id> <pubkey_b64> <sig_b64>
+			cmd := fmt.Sprintf("REGISTER %s %s %s %s\n", alias, myPeerID, pubKeyB64, sigB64)
+			_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, err = s.Write([]byte(cmd))
+			if err != nil { return }
+
+			_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
+			respBuf := bufio.NewReader(s)
+			resp, err := respBuf.ReadString('\n')
+			if err != nil { return }
+
+			if strings.TrimSpace(resp) == "OK" {
+				logger.Info().Str("peerID", peerID.String()).Msg("CLIENT: Registration accepted by peer")
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			} else {
+				logger.Warn().Str("peerID", peerID.String()).Str("response", strings.TrimSpace(resp)).Msg("CLIENT: Registration rejected by peer")
+			}
+		}(p)
 	}
+	wg.Wait()
 
 	if successCount == 0 {
 		return fmt.Errorf("failed to register alias (maybe already owned by someone else?)")
 	}
-	fmt.Printf("[Alias] Successfully registered '%s' on %d nodes with Digital Signature!\n", alias, successCount)
+
+	// Save to local database and memory
+	aliasHash := GetAliasCoordinate(alias)
+	pubKeyStr := base64.StdEncoding.EncodeToString(pubKeyBytes)
+
+	aliasMutex.Lock()
+	// Clean up old alias for this public key if it changed
+	oldAlias, hasOld := ownerStore[pubKeyStr]
+	if hasOld && oldAlias != alias {
+		oldHash := GetAliasCoordinate(oldAlias)
+		delete(aliasStore, oldHash)
+	}
+
+	_ = corestore.SaveAlias(aliasHash, alias, myPeerID, pubKeyBytes)
+	aliasStore[aliasHash] = AliasRecord{PeerID: myPeerID, PubKey: pubKey}
+	ownerStore[pubKeyStr] = alias
+	aliasMutex.Unlock()
+
+	logger.Displayf("[Alias] Successfully registered '%s' on %d nodes with Digital Signature!\n", alias, successCount)
 	return nil
 }
 
-// ResolveAlias queries the closest DHT nodes to find the PeerID for a given alias
+// ResolveAlias queries local memory first, then the closest DHT nodes to find the PeerID for a given alias
 func ResolveAlias(ctx context.Context, h host.Host, alias string) (string, error) {
-	coord := GetAliasCoordinate(alias)
-	
-	closestPeers, err := corenet.GlobalDHT.GetClosestPeers(ctx, coord)
+	if !strings.HasPrefix(alias, "@") {
+		alias = "@" + alias
+	}
+	aliasHash := GetAliasCoordinate(alias)
+
+	// 1. Check local memory first (fastest path - covers aliases registered on this node)
+	aliasMutex.RLock()
+	record, exists := aliasStore[aliasHash]
+	aliasMutex.RUnlock()
+	if exists {
+		logger.Debug().Str("alias", alias).Str("peerID", record.PeerID).Msg("RESOLVE: Found in local memory")
+		return record.PeerID, nil
+	}
+
+	// 2. Query the network
+	coord := aliasHash
+	dhtCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	closestPeers, err := corenet.GlobalDHT.GetClosestPeers(dhtCtx, coord)
+	cancel()
 	if err != nil || len(closestPeers) == 0 {
 		closestPeers = h.Network().Peers()
 	}
 
+	// Buffer size = number of peers so goroutines never block on send
+	resChan := make(chan string, len(closestPeers)+1)
+	var wg sync.WaitGroup
+
 	for _, p := range closestPeers {
 		if p == h.ID() { continue }
-		s, err := h.NewStream(ctx, p, AliasProtocolID)
-		if err != nil { continue }
+		wg.Add(1)
+		go func(peerID peer.ID) {
+			defer wg.Done()
 
-		_, err = s.Write([]byte(fmt.Sprintf("RESOLVE %s\n", alias)))
-		if err != nil {
-			s.Close()
-			continue
-		}
+			dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
 
-		buf := bufio.NewReader(s)
-		line, err := buf.ReadString('\n')
-		s.Close()
-		
-		if err != nil { continue }
-		
-		line = strings.TrimSpace(line)
-		parts := strings.Split(line, " ")
-		if len(parts) == 2 && parts[0] == "FOUND" {
-			return parts[1], nil
-		}
+			s, err := h.NewStream(dialCtx, peerID, AliasProtocolID)
+			if err != nil { return }
+			defer s.Close()
+
+			cmd := fmt.Sprintf("RESOLVE %s\n", alias)
+			_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, err = s.Write([]byte(cmd))
+			if err != nil { return }
+
+			_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
+			respBuf := bufio.NewReader(s)
+			resp, err := respBuf.ReadString('\n')
+			if err != nil { return }
+
+			resp = strings.TrimSpace(resp)
+			if strings.HasPrefix(resp, "FOUND ") {
+				parts := strings.SplitN(resp, " ", 3)
+				if len(parts) >= 2 && parts[1] != "" {
+					peerID := parts[1]
+					
+					// Cache the resolved alias locally if public key is provided and matches the peer ID
+					if len(parts) == 3 && parts[2] != "" {
+						pubKeyBytes, err := base64.StdEncoding.DecodeString(parts[2])
+						if err == nil {
+							pubKey, err := crypto.UnmarshalPublicKey(pubKeyBytes)
+							if err == nil {
+								derivedID, err := peer.IDFromPublicKey(pubKey)
+								if err == nil && derivedID.String() == peerID {
+									aliasHash := GetAliasCoordinate(alias)
+									aliasMutex.Lock()
+									
+									pubKeyStr := base64.StdEncoding.EncodeToString(pubKeyBytes)
+									oldAlias, hasOld := ownerStore[pubKeyStr]
+									if hasOld && oldAlias != alias {
+										oldHash := GetAliasCoordinate(oldAlias)
+										delete(aliasStore, oldHash)
+									}
+									
+									_ = corestore.SaveAlias(aliasHash, alias, peerID, pubKeyBytes)
+									aliasStore[aliasHash] = AliasRecord{PeerID: peerID, PubKey: pubKey}
+									ownerStore[pubKeyStr] = alias
+									aliasMutex.Unlock()
+									
+									logger.Debug().Str("alias", alias).Str("peerID", peerID).Msg("RESOLVE: Cached resolved alias locally")
+								}
+							}
+						}
+					}
+
+					// Non-blocking send: channel is buffered so this won't block
+					select {
+					case resChan <- peerID:
+					default:
+					}
+				}
+			}
+		}(p)
 	}
 
-	return "", fmt.Errorf("alias '%s' not found in network", alias)
+	// Wait for all goroutines then close channel in background
+	go func() {
+		wg.Wait()
+		close(resChan)
+	}()
+
+	// Use a deadline-bounded loop to drain the channel instead of a plain select
+	// This avoids the race where close(resChan) fires before a goroutine sends its result
+	timeoutCh := time.After(5 * time.Second)
+	for {
+		select {
+		case res, ok := <-resChan:
+			if !ok {
+				// Channel closed with no result found
+				return "", fmt.Errorf("alias '%s' not found in network", alias)
+			}
+			if res != "" {
+				return res, nil
+			}
+		case <-timeoutCh:
+			return "", fmt.Errorf("alias '%s' resolution timed out", alias)
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 }

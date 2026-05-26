@@ -21,13 +21,13 @@ import (
 	corenet "github.com/nicabreon/meshsage/pkg/network"
 	coreproto "github.com/nicabreon/meshsage/pkg/protocol"
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
+	coretui "github.com/nicabreon/meshsage/pkg/tui"
 )
 
 var (
 	DefaultSeeds = []string{
 		"/ip4/103.127.138.103/tcp/4004/p2p/12D3KooWFZTmWWGaeNFY7ro95DtiSoV5txAqv6iZCERy6vLWTA95",
 		"/ip4/103.127.138.103/udp/4004/quic-v1/p2p/12D3KooWFZTmWWGaeNFY7ro95DtiSoV5txAqv6iZCERy6vLWTA95",
-		"/dns4/relay-server/tcp/4001/p2p/12D3KooWGZubbUWWE3SpSHAXzfoyHy5otWSf3ce6AkM8xisZJGaR",
 	}
 )
 
@@ -40,6 +40,7 @@ func main() {
 	idFile := flag.String("identity", "./.data/node.key", "Path to the node identity key file")
 	dbFile := flag.String("db", "./.data/node.db", "Path to the database file")
 	debug := flag.Bool("debug", false, "Enable detailed debug logging")
+	isTUI := flag.Bool("tui", false, "Enable Terminal User Interface (TUI) mode")
 	flag.Parse()
 
 	logger.SetDebug(*debug)
@@ -140,7 +141,6 @@ func main() {
 
 	// Restore group memberships from database
 	_ = coreproto.RestoreGroups(ctx, host, priv)
-
 
 	if corenet.IsDedicated {
 		coreproto.SetupReplicationHandler(host)
@@ -252,14 +252,20 @@ func main() {
 		go corenet.StartNetworkMonitor(ctx, host)
 	}
 
-	logger.Info().Msg("Meshsage Node is ready and listening for peers...")
+	if *isTUI {
+		coretui.StartTUI(ctx, host, func(cmd string) {
+			coreproto.ProcessCommand(ctx, host, priv, cmd)
+		})
+	} else {
+		logger.Info().Msg("Meshsage Node is ready and listening for peers...")
 
-	go coreproto.StartChatPrompt(ctx, host, priv)
+		go coreproto.StartChatPrompt(ctx, host, priv)
 
-	// Wait for termination
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+		// Wait for termination
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+		<-stop
+	}
 
 	logger.Info().Msg("Shutting down Meshsage node...")
 }

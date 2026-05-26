@@ -2,10 +2,10 @@ package storage
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/nicabreon/meshsage/pkg/logger"
 	corenet "github.com/nicabreon/meshsage/pkg/network"
 )
 
@@ -16,7 +16,7 @@ func StartGarbageCollector(ctx context.Context, interval time.Duration, maxAgeDa
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	fmt.Printf("[GC] Garbage Collector started. Policy: Delete blocks older than %d days.\n", maxAgeDays)
+	logger.Info().Msgf("Garbage Collector started. Policy: Delete blocks older than %d days.", maxAgeDays)
 
 	for {
 		select {
@@ -29,16 +29,16 @@ func StartGarbageCollector(ctx context.Context, interval time.Duration, maxAgeDa
 }
 
 func runGC(maxAgeDays int) {
-	fmt.Println("[GC] Running scheduled cleanup...")
+	logger.Info().Msg("Running scheduled cleanup...")
 
 	expiredCIDs, err := GetExpiredBlocks(maxAgeDays)
 	if err != nil {
-		fmt.Printf("[GC Error] Failed to query expired blocks: %v\n", err)
+		logger.Error().Err(err).Msg("Failed to query expired blocks")
 		return
 	}
 
 	if len(expiredCIDs) == 0 {
-		fmt.Println("[GC] No expired blocks found.")
+		logger.Info().Msg("No expired blocks found.")
 		return
 	}
 
@@ -52,7 +52,7 @@ func runGC(maxAgeDays int) {
 		// Remove from Bitswap Blockstore
 		err = corenet.GlobalBlockStore.DeleteBlock(context.Background(), c)
 		if err != nil {
-			fmt.Printf("[GC Error] Failed to delete block %s: %v\n", cStr, err)
+			logger.Error().Err(err).Str("cid", cStr).Msg("Failed to delete block")
 			continue
 		}
 
@@ -61,5 +61,6 @@ func runGC(maxAgeDays int) {
 		deletedCount++
 	}
 
-	fmt.Printf("[GC Success] Cleaned up %d expired blocks from local storage.\n", deletedCount)
+	logger.Info().Msgf("Cleaned up %d expired blocks from local storage.", deletedCount)
 }
+
