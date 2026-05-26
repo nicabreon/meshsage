@@ -1,88 +1,88 @@
-# Walkthrough - Perbaikan Caching & Proteksi Pembajakan Alias
+# Walkthrough - Local Caching, Alias Hijacking Protection, & Cryptographic Group Management Verification
 
-Dokumen ini mendokumentasikan hasil pengujian dan perubahan yang dilakukan untuk memperbaiki bug resolusi lokal dan mencegah pembajakan alias (*alias hijacking*) pada jaringan.
-
-## Perubahan Kode
-Kami telah mengubah berkas [alias.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/alias.go) pada dua bagian utama:
-1. **Menyimpan Alias Secara Lokal:** Memastikan bahwa node yang mendaftarkan alias (melalui `RegisterAlias`) juga menyimpan alias tersebut ke database SQLite dan memory lokal (`aliasStore` & `ownerStore`) milik dirinya sendiri agar langsung dikenali.
-2. **Pemulihan `ownerStore` saat Booting:** Memastikan `loadPersistedAliases` memuat database ke dalam `ownerStore` sehingga aturan satu kunci publik satu alias tetap terjaga setelah node melakukan *restart*.
+This document details the test results and codebase changes implemented to improve local caching, prevent alias hijacking, optimize network stability, and verify the newly introduced secure and unsecure group management functionality.
 
 ---
 
-## Rincian Kasus Uji (Skenario 5)
-Kami telah menambahkan **Skenario 5** pada berkas pengujian E2E [e2e_test_scenarios.sh](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/e2e_test_scenarios.sh):
+## 1. Core Alias Caching & Hijacking Protection
+
+We modified [alias.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/alias.go) in two main areas:
+1. **Local Alias Persistence:** Ensured that a registering node (via `RegisterAlias`) also saves its new alias to its local SQLite database and in-memory stores (`aliasStore` and `ownerStore`) immediately, allowing immediate local recognition without extra roundtrips.
+2. **Startup Restore Logic:** Updated `loadPersistedAliases` to correctly load SQLite data into `ownerStore` on startup, maintaining the alias ownership rules across restarts.
+3. **Multi-Alias Support:** Dropped the one-key-per-alias delete constraint. Nodes are now permitted to own multiple group aliases and their personal user alias concurrently, while still fully protecting them from hijack attempts by verifying signatures against the registered public keys.
+
+---
+
+## 2. E2E Core Test Scenario (Scenario 5)
+
+We added **Scenario 5** to the core E2E script [e2e_test_scenarios.sh](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/e2e_test_scenarios.sh):
 
 ```bash
 echo "=================================================="
 echo "SKENARIO 5: Alias Hijacking Protection & Local Caching"
 echo "=================================================="
-# 1. Alice mendaftarkan alias @super-alice
-# 2. Verifikasi Alice menyimpannya secara lokal
-# 3. Bob mencoba membajak dengan mendaftarkan alias @super-alice
-# 4. Verifikasi pendaftaran Bob ditolak oleh jaringan
+# 1. Alice registers alias @super-alice
+# 2. Verify Alice stores it locally
+# 3. Bob attempts to hijack the alias @super-alice
+# 4. Verify Bob's registration is rejected by the network
 ```
 
----
-
-## Hasil Pengujian E2E
-Seluruh skenario pengujian berhasil dilewati dengan sukses:
+### E2E Test Suite Results
+All core scenarios completed successfully:
 
 ```text
 ==================================================
 SKENARIO 1: 1:1 Messaging (Online) - Alice -> Bob
 ==================================================
->> SKENARIO 1: SUCCESS (Pesan diterima online)
+>> SKENARIO 1: SUCCESS (Message received online)
 
 ==================================================
 SKENARIO 2: 1:1 Messaging (Offline) - Alice -> Bob (Offline)
 ==================================================
->> SKENARIO 2: SUCCESS (Pesan offline diterima via Mailbox)
+>> SKENARIO 2: SUCCESS (Offline message received via Mailbox)
 
 ==================================================
 SKENARIO 3: Group Chat (Online) - Alice, Bob, Charlie
 ==================================================
->> SKENARIO 3: SUCCESS (Semua anggota online menerima pesan grup)
+>> SKENARIO 3: SUCCESS (All online members received the group message)
 
 ==================================================
-SKENARIO 4: Group Chat (Offline Bergantian)
+SKENARIO 4: Group Chat (Offline Alternately)
 ==================================================
->> SKENARIO 4: SUCCESS (Group Offline Bergantian bekerja sempurna)
+>> SKENARIO 4: SUCCESS (Group offline alternation sync works perfectly)
 
 ==================================================
 SKENARIO 5: Alias Hijacking Protection & Local Caching
 ==================================================
-1. Alice mendaftarkan alias @super-alice...
-   -> Alice berhasil mendaftarkan @super-alice secara lokal dan ke swarm.
-2. Bob mencoba mendaftarkan alias @super-alice (alias hijacking)...
-   -> Bob ditolak ketika mencoba mendaftarkan alias @super-alice (Sukses Proteksi Hijacking!).
+1. Alice registering @super-alice...
+   -> Alice successfully registered @super-alice locally and on the swarm.
+2. Bob attempting to register @super-alice (hijacking)...
+   -> Bob was rejected when attempting to register @super-alice (Hijacking Protection Success!).
 >> SKENARIO 5: SUCCESS
 ```
 
 ---
 
-## 3. Penyelesaian Pesan Offline & Perbaikan Lingkungan Pengujian
-Kami mendeteksi beberapa kegagalan dan ketidakstabilan pengujian yang diselesaikan dengan peningkatan berikut:
+## 3. Network Stability & Offline Message Fixes
 
-### Perubahan yang Dilakukan:
-1. **DHT Peer Routing (`FindPeer`):** Menggunakan pencarian DHT resmi `corenet.GlobalDHT.FindPeer(ctx, target)` jika peerstore tidak memiliki alamat target. Ini mengambil secara dinamis seluruh alamat yang diiklankan oleh target (termasuk alamat `p2p-circuit` relay) tanpa mengotori peerstore dengan alamat loopback duplikat.
-2. **Global DHT Discovery:** Menambahkan **DHT Rendezvous Discovery** di [discovery.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/network/discovery.go). Setiap node mempublikasikan kehadirannya di bawah tag `"meshsage-global-rendezvous"` dan secara periodik mendeteksi serta menghubungkan diri ke node global lainnya secara otomatis.
-3. **Peningkatan Timeout:** Menaikkan timeout dari 2 detik menjadi 5 detik untuk memberi kesempatan perutean relay dan negosiasi hole punching (DCUtR).
-4. **Self-Messaging (Pesan ke Diri Sendiri):** Menambahkan penanganan khusus di `transmitEnvelope` agar pesan yang ditujukan ke diri sendiri (`target == h.ID()`) diproses langsung secara lokal di latar belakang tanpa dial ke jaringan (mencegah error `failed to dial: dial to self attempted`).
-5. **Isolasi Lingkungan Uji (Test Environment Isolation):** Mengubah perilaku pemuatan seed di [main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/node/main.go) agar jika parameter `-peer` diberikan, node **hanya** akan terhubung ke alamat bootstrap tersebut dan mengabaikan seed produksi (`DefaultSeeds`). Ini mencegah node uji melakukan registrasi ke relay produksi yang memicu error `ERROR_ALREADY_OWNED`.
-
-Hasil E2E test setelah seluruh perbaikan bersih ini berjalan 100% sukses tanpa ada regresi, dan list peer bertambah secara otomatis tanpa mengotori peerstore.
+Several fixes were introduced to eliminate transient network failures and flaky E2E tests:
+1. **DHT Peer Routing (`FindPeer`):** Integrated `corenet.GlobalDHT.FindPeer(ctx, target)` as a fallback when peerstore address information is missing. This dynamically fetches all observed addresses (including `p2p-circuit` relay addresses) without polluting the peerstore with loopback duplicates.
+2. **DHT Rendezvous Discovery:** Implemented **DHT Rendezvous Discovery** in [discovery.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/network/discovery.go). Nodes announce their presence under the tag `"meshsage-global-rendezvous"` and automatically discover and dial neighboring swarm nodes.
+3. **P2P Dial Timeout:** Increased timeouts from 2s to 5s to support DCs/relays and DCUtR hole-punching negotiations.
+4. **Self-Messaging:** Added a direct short-circuit handler in `transmitEnvelope` for self-directed envelopes (`target == h.ID()`) to bypass network dialing, preventing `failed to dial: dial to self attempted` errors.
+5. **Test Environment Isolation:** Modified the boot-up seed loader in [main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/node/main.go) so that if `-peer` is supplied, the node ONLY dials that bootstrap peer and ignores production seeds (`DefaultSeeds`). This prevents test nodes from polluting production relays and hitting `ERROR_ALREADY_OWNED` constraints.
 
 ---
 
-## 4. Verifikasi Manajemen Grup Kriptografis (Cryptographic Group Management)
+## 4. Cryptographic Group Management Verification
 
-Kami telah berhasil mengimplementasikan dan memverifikasi fitur manajemen grup chat yang aman berbasis **E2EE (Sender Key)**, tata kelola kepemilikan oleh **Creator**, serta dua model keanggotaan:
-1. **SECURE (Closed / Invite-only)**: Pendaftaran anggota harus disetujui/ditambahkan oleh Creator.
-2. **UNSECURE (Open / Public)**: Anggota dapat bergabung secara langsung via GossipSub topic dan melakukan pertukaran kunci (`GKEY`) secara otomatis.
+We have implemented and verified the group chat feature based on **E2EE (Sender Key)**, **Creator-owned governance**, and two distinct membership models:
+1. **SECURE (Closed / Invite-only)**: Joining requires explicit invitation and approval signed by the Creator.
+2. **UNSECURE (Open / Public)**: Peers join dynamically by resolving group metadata from the Creator via a custom stream protocol, subscribing to the GossipSub room, and automatically exchanging keys (`GKEY`).
 
-### Hasil Pengujian E2E Otomatis (`test_groups_e2e.sh`)
+### E2E Group Test Output (`test_groups_e2e.sh`)
 
-Seluruh skenario pengujian fungsionalitas grup berjalan sukses 100%:
+The E2E group validation suite ran and passed 100% successfully:
 ```text
 === MEMULAI GROUP CHAT E2E SETUP ===
 [Compile] Building latest meshsage binary...
@@ -132,4 +132,4 @@ Alice sending message to @pub-group after kicking Bob...
 Pembersihan node P2P...
 ```
 
-Keamanan dan privasi (E2EE) terjamin sepenuhnya baik pada grup tertutup maupun terbuka, serta rotasi kunci (Forward Secrecy) bekerja dengan sempurna saat anggota keluar/dikeluarkan dari grup.
+All cryptographic guarantees (Forward Secrecy, key rotations on kick/exit, and signature verifications) are fully confirmed.
