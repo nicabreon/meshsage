@@ -455,26 +455,26 @@ sequenceDiagram
     participant MemRelay as Relay's Local Memory/DB
     actor Alice as Alice (@alice)
 
-    Bob->>MemBob: 1. Panggil ResolveAlias("@alice") & cek aliasStore
-    alt Ditemukan di Cache Lokal (Fast Path)
-        MemBob-->>Bob: Kembalikan Peer ID (Selesai)
-    else Tidak Ditemukan di Cache Lokal
-        Bob->>Relay: 2. Kirim stream RESOLVE @alice (Slow Path)
+    Bob->>MemBob: 1. Call ResolveAlias("@alice") & check aliasStore
+    alt Found in Local Cache (Fast Path)
+        MemBob-->>Bob: Return Peer ID (Done)
+    else Not Found in Local Cache
+        Bob->>Relay: 2. Send stream RESOLVE @alice (Slow Path)
         
         activate Relay
-        Relay->>MemRelay: 3. Cek local memory ONLY (mencegah infinite loop)
+        Relay->>MemRelay: 3. Check local memory ONLY (prevents infinite loop)
         
-        alt Relay memiliki cache @alice
-            MemRelay-->>Bob: Kembalikan FOUND Alice_PeerID Alice_Pubkey_B64
-        else Relay tidak memiliki cache
-            Relay-->>Bob: Kembalikan NOT_FOUND
-            Note over Bob: Bob melakukan DHT kueri ke swarm terdekat / Alice langsung
-            Bob->>Alice: Kirim stream RESOLVE @alice
-            Alice-->>Bob: Kembalikan FOUND Alice_PeerID Alice_Pubkey_B64
+        alt Relay has cached @alice
+            MemRelay-->>Bob: Return FOUND Alice_PeerID Alice_Pubkey_B64
+        else Relay does not have cache
+            Relay-->>Bob: Return NOT_FOUND
+            Note over Bob: Bob performs DHT query to closest swarm / Alice directly
+            Bob->>Alice: Send stream RESOLVE @alice
+            Alice-->>Bob: Return FOUND Alice_PeerID Alice_Pubkey_B64
             
-            critical 4. Validasi Kunci Publik & Caching Lokal
-                Bob->>Bob: Derive PeerID dari Alice_Pubkey & cocokkan dengan Alice_PeerID
-                Bob->>MemBob: Simpan ke SQLite & Memory (aliasStore & ownerStore)
+            critical 4. Public Key Validation & Local Caching
+                Bob->>Bob: Derive PeerID from Alice_Pubkey & match with Alice_PeerID
+                Bob->>MemBob: Save to SQLite & Memory (aliasStore & ownerStore)
             end
         end
         deactivate Relay
