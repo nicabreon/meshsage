@@ -14,10 +14,11 @@ type MessageEnvelope struct {
 }
 
 const (
-	MsgTypeText   = "text"
-	MsgTypeStatus = "status"
-	MsgTypeFile   = "file"
-	MsgTypeGroup  = "group"
+	MsgTypeText         = "text"
+	MsgTypeStatus       = "status"
+	MsgTypeFile         = "file"
+	MsgTypeGroup        = "group"
+	MsgTypeHandshakeAck = "hshk_ack" // Silent bidirectional handshake confirmation (never shown to user)
 
 	StatusDelivered = "delivered"
 	StatusRead      = "read"

@@ -346,6 +346,13 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		return
 	}
 
+	// X3DH Handshake ACK: send a silent ack back to the initiator.
+	// This forces B to encrypt using its newly established send-chain,
+	// which in turn causes A to perform a DH ratchet step when it decrypts
+	// the ACK — completing the bidirectional Double Ratchet session fully
+	// without any user-visible message being shown on either side.
+	go sendHandshakeAck(ctx, h, senderID)
+
 	processDecryptedPayload(ctx, h, senderID, plaintextBytes)
 }
 
@@ -377,6 +384,13 @@ func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID,
 
 func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, env MessageEnvelope) {
 	switch env.Type {
+	case MsgTypeHandshakeAck:
+		// Silent: X3DH bidirectional handshake completed. No UI display.
+		// Receiving this ACK means both sides now have a fully operational
+		// Double Ratchet session in both directions.
+		logger.Info().Str("peerID", senderID.String()).Msg("X3DH handshake ACK received: bidirectional session established")
+		return
+
 	case MsgTypeStatus:
 		logger.Displayf("[Status Report] Peer %s marked your message %s as: %s\n", 
 			FormatPeerID(senderID.String()), env.RefID, env.Status)
@@ -701,6 +715,34 @@ func SendSessionReset(ctx context.Context, h host.Host, targetID peer.ID) error 
 func sendRequestX3DH(ctx context.Context, h host.Host, targetID peer.ID) {
 	logger.Info().Str("targetID", targetID.String()).Msg("Sending REQUEST_X3DH signal to peer")
 	_ = transmitEnvelope(ctx, h, targetID, "REQUEST_X3DH")
+}
+
+// sendHandshakeAck is called by the X3DH receiver (B) after successfully decrypting
+// the initiator's (A's) first X3DH message. It sends a silent MsgTypeHandshakeAck
+// envelope back to A via Double Ratchet, which:
+//   1. Forces B to use its newly established send-chain (proving B's session is live).
+//   2. Causes A to perform a DH ratchet step on receipt, completing the full
+//      bidirectional Double Ratchet session without any user-visible interaction.
+//
+// If the ACK cannot be delivered (peer offline), it falls back to mailbox storage
+// like any other message — the session will self-heal via the normal X3DH auto-recovery.
+func sendHandshakeAck(ctx context.Context, h host.Host, targetID peer.ID) {
+	privKey := h.Peerstore().PrivKey(h.ID())
+	if privKey == nil {
+		logger.Warn().Str("targetID", targetID.String()).Msg("sendHandshakeAck: local private key not available, skipping ACK")
+		return
+	}
+	ackID := fmt.Sprintf("hshk-%x", sha256.Sum256([]byte(targetID.String()+time.Now().String())))[:12]
+	ackEnv := MessageEnvelope{
+		ID:        ackID,
+		Type:      MsgTypeHandshakeAck,
+		Timestamp: time.Now().UnixNano(),
+	}
+	if err := sendSecureEnvelope(ctx, h, privKey, targetID, ackEnv); err != nil {
+		logger.Debug().Err(err).Str("targetID", targetID.String()).Msg("sendHandshakeAck: failed to send ACK (peer may be offline, will recover on next message)")
+	} else {
+		logger.Info().Str("targetID", targetID.String()).Msg("sendHandshakeAck: X3DH ACK sent — bidirectional session is now complete")
+	}
 }
 
 // deriveNextKeys is deprecated, logic moved to corecrypto.RatchetStep
