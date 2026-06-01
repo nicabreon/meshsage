@@ -15,6 +15,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
 	corenet "github.com/nicabreon/meshsage/pkg/network"
@@ -39,6 +40,12 @@ var (
 	groupsMutex       sync.Mutex
 	processedMessages = make(map[string]bool)
 	processedMutex    sync.Mutex
+
+	// GREQ rate-limiting: prevent spamming key requests when many messages arrive
+	// before the sender's key is available.
+	greqLastSent  = make(map[string]time.Time) // groupID → last GREQ sent time
+	greqRateMutex sync.Mutex
+	greqCooldown  = 30 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -248,9 +255,24 @@ func shareKeyWithMember(ctx context.Context, h host.Host, priv crypto.PrivKey, g
 	if err != nil { return }
 
 	logger.Debug().Msgf("[GROUP HANDSHAKE] Sharing our local key for group %s with member %s via Double Ratchet...", groupID, FormatPeerID(memberID))
-	shareMsg := fmt.Sprintf("GKEY:%s:%s", groupID, base64.StdEncoding.EncodeToString(key))
 	
-	errSend := SendMessage(ctx, h, priv, target, shareMsg)
+	// Load history of local keys
+	var keyB64s []string
+	history, errHist := corestore.GetGroupLocalKeyHistory(groupID)
+	if errHist == nil && len(history) > 0 {
+		for _, k := range history {
+			keyB64s = append(keyB64s, base64.StdEncoding.EncodeToString(k))
+		}
+	} else {
+		// Fallback to the single key
+		keyB64s = []string{base64.StdEncoding.EncodeToString(key)}
+	}
+
+	// Join the base64 keys with commas
+	payload := strings.Join(keyB64s, ",")
+	shareMsg := fmt.Sprintf("GKEY:%s:%s", groupID, payload)
+	
+	_, errSend := SendMessage(ctx, h, priv, target, shareMsg)
 	if errSend != nil {
 		logger.Error().Err(errSend).Str("group", groupID).Str("member", memberID).Msg("[GROUP HANDSHAKE] Failed to share group key")
 	} else {
@@ -258,9 +280,29 @@ func shareKeyWithMember(ctx context.Context, h host.Host, priv crypto.PrivKey, g
 	}
 }
 
+// shouldSendGREQ returns true if it is safe to send a GREQ for this group
+// (rate-limited to once per greqCooldown to prevent request storms).
+func shouldSendGREQ(groupID string) bool {
+	greqRateMutex.Lock()
+	defer greqRateMutex.Unlock()
+	if last, ok := greqLastSent[groupID]; ok {
+		if time.Since(last) < greqCooldown {
+			return false
+		}
+	}
+	greqLastSent[groupID] = time.Now()
+	return true
+}
+
 // sendGroupKeyRequest broadcasts a GREQ control message to ask all existing members
 // to share their current group key. Called when a new member joins and has no keys yet.
+// Rate-limited via shouldSendGREQ to prevent GREQ spam storms.
 func sendGroupKeyRequest(ctx context.Context, h host.Host, groupID string) {
+	if !shouldSendGREQ(groupID) {
+		logger.Debug().Str("group", groupID).Msg("[GREQ] Rate-limited: skipping duplicate key request")
+		return
+	}
+
 	groupsMutex.Lock()
 	session, exists := activeGroups[groupID]
 	groupsMutex.Unlock()
@@ -296,37 +338,85 @@ func sendGroupKeyRequest(ctx context.Context, h host.Host, groupID string) {
 	}
 }
 
+// decryptGroupMsg handles key ratchet (backward history and forward look-ahead) to decrypt secure group messages.
+func decryptGroupMsg(meta corestore.GroupMetadata, gMsg GroupMessage) (string, error) {
+	if meta.GroupType != "SECURE" {
+		return gMsg.Payload, nil
+	}
+
+	senderKey, err := corestore.GetGroupSenderKey(meta.GroupID, gMsg.SenderID)
+	if err != nil {
+		return "", err
+	}
+
+	decrypted := false
+	var plaintext string
+
+	// 1. Try decrypting using active key
+	plaintext, err = corecrypto.DecryptMessage(senderKey, gMsg.Payload)
+	if err == nil {
+		decrypted = true
+		// Rotate sender key in our DB
+		hKDF := hmac.New(sha256.New, senderKey)
+		hKDF.Write([]byte("GROUP_RATCHET"))
+		nextSenderKey := hKDF.Sum(nil)
+		corestore.SaveGroupSenderKey(meta.GroupID, gMsg.SenderID, nextSenderKey)
+	} else {
+		// 2. Try backward check: check historical keys
+		historyKeys, _ := corestore.GetGroupSenderKeyHistory(meta.GroupID, gMsg.SenderID)
+		for _, oldKey := range historyKeys {
+			plaintext, err = corecrypto.DecryptMessage(oldKey, gMsg.Payload)
+			if err == nil {
+				decrypted = true
+				logger.Debug().Msgf("[Group %s] Decrypted offline/out-of-order message from %s using historical key", meta.GroupAlias, FormatPeerID(gMsg.SenderID))
+				break
+			}
+		}
+
+		// 3. Try forward check: look-ahead ratcheting
+		if !decrypted {
+			tempKey := senderKey
+			for step := 1; step <= 10; step++ {
+				hKDF := hmac.New(sha256.New, tempKey)
+				hKDF.Write([]byte("GROUP_RATCHET"))
+				tempKey = hKDF.Sum(nil)
+
+				plaintext, err = corecrypto.DecryptMessage(tempKey, gMsg.Payload)
+				if err == nil {
+					decrypted = true
+					logger.Debug().Msgf("[Group %s] Decrypted message from %s using look-ahead key (+%d steps)", meta.GroupAlias, FormatPeerID(gMsg.SenderID), step)
+					// Update active key to new forward key + rotate once for next message
+					hKDF2 := hmac.New(sha256.New, tempKey)
+					hKDF2.Write([]byte("GROUP_RATCHET"))
+					nextSenderKey := hKDF2.Sum(nil)
+					corestore.SaveGroupSenderKey(meta.GroupID, gMsg.SenderID, nextSenderKey)
+					break
+				}
+			}
+		}
+	}
+
+	if !decrypted {
+		return "", fmt.Errorf("decryption failed (Key mismatch)")
+	}
+	return plaintext, nil
+}
+
 // decryptAndDispatchGroupMsg handles decryption + callback for a single group message.
 // Used by both the live listener and the pending-message flusher.
 func decryptAndDispatchGroupMsg(ctx context.Context, session *GroupSession, groupID string, gMsg GroupMessage) {
 	meta, errLoad := corestore.LoadGroupMetadata(groupID)
 	if errLoad != nil { return }
 
-	var plaintext string
-	if meta.GroupType == "SECURE" {
-		// Look up the sender's key for this group
-		senderKey, err := corestore.GetGroupSenderKey(groupID, gMsg.SenderID)
-		if err != nil {
-			// Key still not available — re-buffer (should not normally happen after flush)
-			logger.Warn().Msgf("[Group %s] Still no key for %s after flush, dropping", meta.GroupAlias, FormatPeerID(gMsg.SenderID))
-			return
+	plaintext, err := decryptGroupMsg(meta, gMsg)
+	if err != nil {
+		logger.Error().Msgf("[Group %s] Failed to decrypt message from %s: %s", meta.GroupAlias, FormatPeerID(gMsg.SenderID), err.Error())
+		
+		// Actively request keys via GREQ on decryption failure so we can recover
+		if meta.GroupType == "SECURE" {
+			go sendGroupKeyRequest(ctx, session.Host, groupID)
 		}
-
-		// Decrypt message using the Sender's specific key
-		plaintext, err = corecrypto.DecryptMessage(senderKey, gMsg.Payload)
-		if err != nil {
-			logger.Error().Msgf("[Group %s] Failed to decrypt message from %s (Key mismatch)", meta.GroupAlias, FormatPeerID(gMsg.SenderID))
-			return
-		}
-
-		// Rotate sender key in our DB
-		hKDF := hmac.New(sha256.New, senderKey)
-		hKDF.Write([]byte("GROUP_RATCHET"))
-		nextSenderKey := hKDF.Sum(nil)
-		corestore.SaveGroupSenderKey(groupID, gMsg.SenderID, nextSenderKey)
-	} else {
-		// Plain text for UNSECURE groups
-		plaintext = gMsg.Payload
+		return
 	}
 
 	// Verify signature
@@ -455,17 +545,29 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 	err := session.Topic.Publish(ctx, msgBytes)
 	if err != nil { return err }
 
-	// Fan-out to offline/mailbox members
+	// Fan-out via direct message ONLY to members who are NOT currently connected.
+	// Online peers already receive the message via GossipSub — sending GRPM to
+	// them too causes duplicate delivery and command spam in the terminal.
 	members, err := corestore.GetGroupMembersV2(groupID)
 	if err == nil {
 		for _, m := range members {
 			if m.PeerID == h.ID().String() { continue }
 			target, errDec := peer.Decode(m.PeerID)
-			if errDec == nil {
-				go func(t peer.ID) {
-					_ = SendMessage(ctx, h, privKey, t, "GRPM:"+groupID+":"+string(msgBytes))
-				}(target)
+			if errDec != nil { continue }
+
+			// Skip peers that are already directly connected — GossipSub will deliver.
+			if h.Network().Connectedness(target) == network.Connected {
+				logger.Debug().
+					Str("peer", FormatPeerID(m.PeerID)).
+					Str("group", groupID[:8]).
+					Msg("[Group Fan-out] Skipping GRPM: peer is online (GossipSub delivery)")
+				continue
 			}
+
+			// Peer is offline — send via mailbox/direct message
+			go func(t peer.ID) {
+				_, _ = SendMessage(ctx, h, privKey, t, "GRPM:"+groupID+":"+string(msgBytes))
+			}(target)
 		}
 	}
 
@@ -486,7 +588,7 @@ func ProcessGroupMessage(groupID string, msgBytes []byte) {
 
 	var plaintext string
 	if meta.GroupType == "SECURE" {
-		senderKey, err := corestore.GetGroupSenderKey(groupID, gMsg.SenderID)
+		_, err := corestore.GetGroupSenderKey(groupID, gMsg.SenderID)
 		if err != nil {
 			logger.Warn().Msgf("[Group %s] Received offline message from %s but no key found yet", meta.GroupAlias, FormatPeerID(gMsg.SenderID))
 
@@ -507,20 +609,30 @@ func ProcessGroupMessage(groupID string, msgBytes []byte) {
 			}
 			return
 		}
+	}
 
-		plaintext, err = corecrypto.DecryptMessage(senderKey, gMsg.Payload)
-		if err != nil {
-			logger.Error().Msgf("[Group %s] Failed to decrypt offline message from %s (Key mismatch)", meta.GroupAlias, FormatPeerID(gMsg.SenderID))
-			return
+	var errDec error
+	plaintext, errDec = decryptGroupMsg(meta, gMsg)
+	if errDec != nil {
+		logger.Error().Msgf("[Group %s] Failed to decrypt offline message from %s: %s", meta.GroupAlias, FormatPeerID(gMsg.SenderID), errDec.Error())
+		
+		if meta.GroupType == "SECURE" {
+			groupsMutex.Lock()
+			session := activeGroups[groupID]
+			groupsMutex.Unlock()
+			
+			if session != nil {
+				bufferPendingMessage(groupID, gMsg.SenderID, pendingGroupMsg{
+					receivedAt: time.Now(),
+					gMsg:       gMsg,
+					ctx:        context.Background(),
+					session:    session,
+					groupID:    groupID,
+				})
+				go sendGroupKeyRequest(context.Background(), session.Host, groupID)
+			}
 		}
-
-		// Rotate sender key in our DB
-		hKDF := hmac.New(sha256.New, senderKey)
-		hKDF.Write([]byte("GROUP_RATCHET"))
-		nextSenderKey := hKDF.Sum(nil)
-		corestore.SaveGroupSenderKey(groupID, gMsg.SenderID, nextSenderKey)
-	} else {
-		plaintext = gMsg.Payload
+		return
 	}
 
 	// Verify signature

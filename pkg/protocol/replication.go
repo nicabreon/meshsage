@@ -172,6 +172,17 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 						logger.Info().Str("ownerID", event.OwnerID[:8]).Str("keyID", event.Hash[:8]).Msg("Synced pre-key from cluster")
 					}
 				}
+			case "PREKEY_CLEAR":
+				if event.OwnerID != "" {
+					// Only delete public-key-only entries (relay cache), preserve our own private keys
+					_ = corestore.DeletePublicPreKeysByOwner(event.OwnerID)
+					logger.Info().Str("ownerID", event.OwnerID[:8]).Msg("Synced pre-keys clear from cluster (preserved private keys)")
+				}
+			case "PREKEY_DELETE":
+				if event.Hash != "" {
+					_ = corestore.DeletePreKeyByID(event.Hash)
+					logger.Info().Str("keyID", event.Hash[:8]).Msg("Synced pre-key delete from cluster")
+				}
 			}
 		}
 	}()

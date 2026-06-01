@@ -36,7 +36,7 @@ func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 }
 
 // SetupDiscovery sets up mDNS discovery to automatically find local peers, and DHT routing discovery for global peers
-func SetupDiscovery(h host.Host) error {
+func SetupDiscovery(ctx context.Context, h host.Host) error {
 	// 1. Setup mDNS Service
 	n := &mdnsNotifee{h: h}
 	s := mdns.NewMdnsService(h, DiscoveryServiceTag, n)
@@ -46,11 +46,20 @@ func SetupDiscovery(h host.Host) error {
 
 	// 2. Setup DHT Rendezvous Discovery in the background
 	go func() {
-		// Wait for DHT bootstrapping to start
-		time.Sleep(5 * time.Second)
-		ctx := context.Background()
+		// Wait for DHT bootstrapping to start, with cancellation check
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+			return
+		}
 
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			// Don't advertise/discover if the network node is stopping
 			if h.Network().Peers() == nil {
 				return
@@ -92,8 +101,12 @@ func SetupDiscovery(h host.Host) error {
 				}
 			}
 			
-			// Poll peer discovery every 45 seconds
-			time.Sleep(45 * time.Second)
+			// Poll peer discovery every 45 seconds, with cancellation check
+			select {
+			case <-time.After(45 * time.Second):
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 

@@ -15,6 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
 	"github.com/nicabreon/meshsage/pkg/logger"
@@ -136,7 +137,7 @@ func main() {
 	}
 	_ = corenet.SetupBitswap(ctx, host, dhtRouting)
 	_ = corenet.SetupPubSub(ctx, host)
-	_ = corenet.SetupDiscovery(host)
+	_ = corenet.SetupDiscovery(ctx, host)
 
 	coreproto.SetupMessaging(host)
 	coreproto.SetupMailbox(host, *isClientOnly)
@@ -231,8 +232,25 @@ func main() {
 					continue
 				}
 
-				// Cek apakah sudah terhubung
-				if host.Network().Connectedness(pinfo.ID) != network.Connected {
+				if host.Network().Connectedness(pinfo.ID) == network.Connected {
+					// Verify connection is actually alive by trying to open a stream.
+					// Stale QUIC connections will fail this check.
+					go func(pid peer.ID) {
+						dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+						defer cancel()
+						str, errStream := host.NewStream(dialCtx, pid, "/ipfs/ping/1.0.0")
+						if errStream != nil {
+							logger.Warn().Str("peerID", pid.String()).Msg("Stale connection detected. Closing peer connection to trigger reconnect.")
+							host.Network().ClosePeer(pid)
+						} else {
+							str.Close()
+						}
+					}(pinfo.ID)
+				} else {
+					// Clear dial backoff to allow immediate reconnection attempt.
+					if s, ok := host.Network().(*swarm.Swarm); ok {
+						s.Backoff().Clear(pinfo.ID)
+					}
 					logger.Debug().Str("peerID", pinfo.ID.String()).Msg("Attempting to reconnect to seed...")
 					go func(pi peer.AddrInfo) {
 						if err := host.Connect(ctx, pi); err != nil {

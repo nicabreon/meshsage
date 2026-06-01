@@ -14,17 +14,37 @@ var DB *sql.DB
 
 // InitDatabase initializes the local SQLite database.
 func InitDatabase(dbPath string) error {
+	if DB != nil {
+		_ = DB.Close()
+		DB = nil
+	}
 	var err error
 	// modernc.org/sqlite uses the "sqlite" driver name
 	DB, err = sql.Open("sqlite", dbPath)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
-	
-	// Enable WAL mode for better concurrency
+
+	// Single writer: required for modernc/sqlite to avoid SQLITE_BUSY
+	DB.SetMaxOpenConns(1)
+
+	// Critical: set busy_timeout FIRST before any other PRAGMA.
+	// This prevents SQLITE_BUSY deadlocks when WAL from previous crash is still being
+	// checkpointed by the OS on reinstall-without-uninstall.
+	DB.Exec("PRAGMA busy_timeout=10000;") // 10s — allows WAL recovery time
 	DB.Exec("PRAGMA journal_mode=WAL;")
-	DB.Exec("PRAGMA busy_timeout=5000;")
-	DB.SetMaxOpenConns(1) // SQLite works best with 1 writer for modernc
+	DB.Exec("PRAGMA synchronous=NORMAL;")
+	DB.Exec("PRAGMA cache_size=-8000;")   // 8MB page cache
+	// Force checkpoint: clears any stale WAL file from a previous crashed session.
+	// Safe to call even if WAL is clean — it's a no-op in that case.
+	DB.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
+
+	// Perform SQLite integrity check on startup to verify database file health (after busy_timeout is set)
+	var integrityResult string
+	err = DB.QueryRow("PRAGMA integrity_check(1);").Scan(&integrityResult)
+	if err != nil || integrityResult != "ok" {
+		return fmt.Errorf("database integrity check failed: %s (err: %v)", integrityResult, err)
+	}
 
 	// Create messages table if it doesn't exist (For local history)
 	query := `
@@ -97,11 +117,29 @@ func InitDatabase(dbPath string) error {
 		PRIMARY KEY (group_id, sender_id)
 	);
 
+	-- 7b. Group Sender Keys History (for decrypting out-of-order or offline messages)
+	CREATE TABLE IF NOT EXISTS group_sender_key_history (
+		group_id TEXT,
+		sender_id TEXT,
+		sender_key TEXT,
+		saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (group_id, sender_id, sender_key)
+	);
+
 	-- 8. Local Group Keys (Our own keys that we share)
 	CREATE TABLE IF NOT EXISTS group_local_keys (
 		group_id TEXT PRIMARY KEY,
 		sender_key TEXT NOT NULL
 	);
+
+	-- 8b. Local Group Keys History
+	CREATE TABLE IF NOT EXISTS group_local_key_history (
+		group_id TEXT,
+		sender_key TEXT,
+		saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (group_id, sender_key)
+	);
+
 
 	-- 9. Group Members
 	CREATE TABLE IF NOT EXISTS group_members (
@@ -143,14 +181,77 @@ func InitDatabase(dbPath string) error {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 
-	// Performance & Concurrency Tuning
+	// Database versioning & migration runner
+	var currentVersion int
+	err = DB.QueryRow("PRAGMA user_version;").Scan(&currentVersion)
+	if err != nil {
+		return fmt.Errorf("failed to query database version: %w", err)
+	}
+
+	if currentVersion < 1 {
+		// Version 1: Initial schema with group_local_key_history table
+		// (Already created by IF NOT EXISTS query above)
+		_, err = DB.Exec("PRAGMA user_version = 1;")
+		if err != nil {
+			return fmt.Errorf("failed to update user_version to 1: %w", err)
+		}
+		currentVersion = 1
+	}
+
+	// Future migrations go here:
+	// if currentVersion < 2 { ... }
+
+	// Performance & Concurrency Tuning (applied again after schema creation)
+	// These are idempotent and safe to call multiple times.
 	DB.Exec("PRAGMA journal_mode = WAL;")
 	DB.Exec("PRAGMA synchronous = NORMAL;")
-	DB.Exec("PRAGMA busy_timeout = 5000;")
+	DB.Exec("PRAGMA busy_timeout = 10000;")
+	DB.Exec("PRAGMA wal_checkpoint(PASSIVE);")
 	DB.SetMaxOpenConns(1)
 
 	return nil
 }
+
+// EnsureColumn checks if a column exists in a table, and adds it if it is missing.
+// This is extremely useful for running ALTER TABLE commands dynamically during startup.
+func EnsureColumn(tableName, columnName, columnDefinition string) error {
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	// Query column info from SQLite table_info
+	rows, err := DB.Query(fmt.Sprintf("PRAGMA table_info(%s);", tableName))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	exists := false
+	for rows.Next() {
+		var cid int
+		var name, dType string
+		var notNull, pk int
+		var dfltVal interface{}
+		if err := rows.Scan(&cid, &name, &dType, &notNull, &dfltVal, &pk); err != nil {
+			return err
+		}
+		if strings.ToLower(name) == strings.ToLower(columnName) {
+			exists = true
+			break
+		}
+	}
+
+	if !exists {
+		// Column is missing, add it dynamically
+		alterQuery := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s;", tableName, columnName, columnDefinition)
+		_, err = DB.Exec(alterQuery)
+		if err != nil {
+			return fmt.Errorf("failed to add column %s to %s: %w", columnName, tableName, err)
+		}
+	}
+	return nil
+}
+
 
 // SavePreKey stores a signed one-time public key in the relay or local DB
 func SavePreKey(ownerID, keyID, pubKey, privKey, sig string) error {
@@ -158,6 +259,31 @@ func SavePreKey(ownerID, keyID, pubKey, privKey, sig string) error {
 		ownerID, keyID, pubKey, privKey, sig)
 	return err
 }
+
+// DeletePreKeysByOwner deletes all pre-keys associated with an owner ID
+func DeletePreKeysByOwner(ownerID string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec("DELETE FROM prekeys WHERE owner_id = ?", ownerID)
+	return err
+}
+
+// DeletePublicPreKeysByOwner deletes only pre-keys that have NO private key stored
+// (i.e. keys that belong to other users cached on this relay node).
+// This preserves the local node's own private keys during PREKEY_CLEAR cluster events.
+func DeletePublicPreKeysByOwner(ownerID string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec("DELETE FROM prekeys WHERE owner_id = ? AND (private_key IS NULL OR private_key = '')", ownerID)
+	return err
+}
+
+// DeletePreKeyByID deletes a specific pre-key by its unique key ID
+func DeletePreKeyByID(keyID string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec("DELETE FROM prekeys WHERE key_id = ?", keyID)
+	return err
+}
+
+
 
 // FindPrivateKeyByID retrieves the private key associated with a KeyID (for receivers)
 func FindPrivateKeyByID(keyID string) (string, error) {
@@ -332,6 +458,18 @@ func ClearSkippedKeys(peerID string) error {
 	return err
 }
 
+// DeleteSession removes the Double Ratchet session for a peer
+func DeleteSession(peerID string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec(`DELETE FROM sessions WHERE peer_id = ?`, peerID)
+	if err != nil {
+		return err
+	}
+	// Also clear skipped keys
+	_ = ClearSkippedKeys(peerID)
+	return nil
+}
+
 // SaveAlias persists an alias record to the database
 func SaveAlias(aliasHash, aliasName, peerID string, pubkeyBytes []byte) error {
 	if DB == nil { return fmt.Errorf("database not initialized") }
@@ -417,10 +555,47 @@ func RemoveBlockMetadata(cidStr string) error {
 // --- Group Messaging Helpers ---
 
 func SaveGroupLocalKey(groupID string, key []byte) error {
+	keyB64 := base64.StdEncoding.EncodeToString(key)
 	_, err := DB.Exec(`INSERT OR REPLACE INTO group_local_keys (group_id, sender_key) VALUES (?, ?)`,
-		groupID, base64.StdEncoding.EncodeToString(key))
-	return err
+		groupID, keyB64)
+	if err != nil {
+		return err
+	}
+
+	// Add to history
+	_, _ = DB.Exec(`INSERT OR IGNORE INTO group_local_key_history (group_id, sender_key) VALUES (?, ?)`,
+		groupID, keyB64)
+
+	// Prune history to keep only the last 20 keys
+	_, _ = DB.Exec(`DELETE FROM group_local_key_history WHERE group_id = ? AND rowid NOT IN (
+		SELECT rowid FROM group_local_key_history WHERE group_id = ? ORDER BY rowid DESC LIMIT 20
+	)`, groupID, groupID)
+
+	return nil
 }
+
+func GetGroupLocalKeyHistory(groupID string) ([][]byte, error) {
+	if DB == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+	rows, err := DB.Query(`SELECT sender_key FROM group_local_key_history WHERE group_id = ? ORDER BY rowid DESC`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys [][]byte
+	for rows.Next() {
+		var keyStr string
+		if err := rows.Scan(&keyStr); err == nil {
+			if k, errDec := base64.StdEncoding.DecodeString(keyStr); errDec == nil {
+				keys = append(keys, k)
+			}
+		}
+	}
+	return keys, nil
+}
+
 
 func GetGroupLocalKey(groupID string) ([]byte, error) {
 	var keyStr string
@@ -432,9 +607,43 @@ func GetGroupLocalKey(groupID string) ([]byte, error) {
 }
 
 func SaveGroupSenderKey(groupID, senderID string, key []byte) error {
+	keyB64 := base64.StdEncoding.EncodeToString(key)
 	_, err := DB.Exec(`INSERT OR REPLACE INTO group_sender_keys (group_id, sender_id, sender_key) VALUES (?, ?, ?)`,
-		groupID, senderID, base64.StdEncoding.EncodeToString(key))
-	return err
+		groupID, senderID, keyB64)
+	if err != nil {
+		return err
+	}
+
+	// Add to history
+	_, _ = DB.Exec(`INSERT OR IGNORE INTO group_sender_key_history (group_id, sender_id, sender_key) VALUES (?, ?, ?)`,
+		groupID, senderID, keyB64)
+
+	// Prune history to keep only the last 20 keys
+	_, _ = DB.Exec(`DELETE FROM group_sender_key_history WHERE group_id = ? AND sender_id = ? AND rowid NOT IN (
+		SELECT rowid FROM group_sender_key_history WHERE group_id = ? AND sender_id = ? ORDER BY rowid DESC LIMIT 20
+	)`, groupID, senderID, groupID, senderID)
+
+	return nil
+}
+
+func GetGroupSenderKeyHistory(groupID, senderID string) ([][]byte, error) {
+	rows, err := DB.Query(`SELECT sender_key FROM group_sender_key_history WHERE group_id = ? AND sender_id = ? ORDER BY rowid DESC`,
+		groupID, senderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys [][]byte
+	for rows.Next() {
+		var keyStr string
+		if err := rows.Scan(&keyStr); err == nil {
+			if k, errDec := base64.StdEncoding.DecodeString(keyStr); errDec == nil {
+				keys = append(keys, k)
+			}
+		}
+	}
+	return keys, nil
 }
 
 func GetGroupSenderKey(groupID, senderID string) ([]byte, error) {

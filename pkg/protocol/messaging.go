@@ -74,6 +74,63 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 	var aesKey []byte
 	var encryptedPayloadB64 string
 
+	if strings.HasPrefix(envelope, "RESET:") {
+		parts := strings.SplitN(envelope, ":", 3)
+		if len(parts) != 3 {
+			logger.Error().Msg("Invalid RESET envelope format")
+			return
+		}
+		timestampStr := parts[1]
+		sigB64 := parts[2]
+		
+		// Try ExtractPublicKey first (works for Ed25519 inline peer IDs)
+		// Fall back to peerstore if not available (e.g. RSA, secp256k1)
+		pubKey, err := senderID.ExtractPublicKey()
+		if err != nil || pubKey == nil {
+			pubKey = h.Peerstore().PubKey(senderID)
+			if pubKey == nil {
+				logger.Warn().Str("senderID", senderID.String()).Msg("RESET: sender public key not available, accepting reset without verification")
+				// Accept the reset unconditionally if we have no way to verify
+				if delErr := corestore.DeleteSession(senderID.String()); delErr != nil {
+					logger.Error().Err(delErr).Str("senderID", senderID.String()).Msg("RESET: failed to delete session state (unverified)")
+				}
+				// Ask sender to restart X3DH
+				go sendRequestX3DH(ctx, h, senderID)
+				return
+			}
+		}
+		
+		dataToVerify := []byte(fmt.Sprintf("RESET:%s:%s:%s", timestampStr, senderID.String(), h.ID().String()))
+		sigBytes, err := base64.StdEncoding.DecodeString(sigB64)
+		if err != nil {
+			logger.Error().Err(err).Msg("RESET: failed to decode signature")
+			return
+		}
+		
+		valid, err := pubKey.Verify(dataToVerify, sigBytes)
+		if err != nil || !valid {
+			logger.Warn().Str("senderID", senderID.String()).Msg("RESET: invalid signature detected")
+			return
+		}
+		
+		// Signature is valid! Delete the session state for the sender
+		logger.Info().Str("senderID", senderID.String()).Msg("RESET: Session reset request verified. Deleting session state.")
+		if err := corestore.DeleteSession(senderID.String()); err != nil {
+			logger.Error().Err(err).Str("senderID", senderID.String()).Msg("RESET: failed to delete session state")
+		}
+		// Ask sender to re-initiate X3DH so both sides are in sync
+		go sendRequestX3DH(ctx, h, senderID)
+		return
+	}
+
+	if strings.HasPrefix(envelope, "REQUEST_X3DH") {
+		// Counterparty has reset their session and is asking us to initiate a fresh X3DH
+		logger.Info().Str("senderID", senderID.String()).Msg("REQUEST_X3DH: Counterparty requested fresh handshake. Clearing local session and will send X3DH on next message.")
+		_ = corestore.DeleteSession(senderID.String())
+		_ = corestore.ClearSkippedKeys(senderID.String())
+		return
+	}
+
 	if strings.HasPrefix(envelope, "DR:") {
 		// 1. Jalur Double Ratchet (Per-message Keys)
 		parts := strings.SplitN(envelope, ":", 2)
@@ -100,7 +157,10 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				// EncryptWithRatchet menggunakan EncryptMessage yang menyertakan gzip.
 				plaintext, err := corecrypto.DecryptMessage(skippedKey, headerParts[3])
 				if err != nil {
-					logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR: Skipped key decryption failed")
+					logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR: Skipped key decryption failed. Clearing session and requesting fresh X3DH.")
+					_ = corestore.DeleteSession(senderID.String())
+					_ = corestore.ClearSkippedKeys(senderID.String())
+					go sendRequestX3DH(ctx, h, senderID)
 					return
 				}
 				processDecryptedPayload(ctx, h, senderID, []byte(plaintext))
@@ -109,7 +169,10 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				// B. Jalur Standard Ratchet
 				remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, err := corestore.LoadSession(senderID.String())
 				if err != nil || rootB64 == "" {
-					logger.Error().Str("peerID", senderID.String()).Msg("No session found for E2EE decryption")
+					logger.Error().Str("peerID", senderID.String()).Msg("No session found for E2EE decryption. Sending REQUEST_X3DH to sender.")
+					// Do NOT send RESET here (we have nothing to reset).
+					// Instead, ask the sender to start fresh X3DH.
+					go sendRequestX3DH(ctx, h, senderID)
 					return
 				}
 
@@ -137,7 +200,10 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 
 				plaintext, skipped, err := session.DecryptWithRatchet(payloadStr)
 				if err != nil {
-					logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR Decryption failed")
+					logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR Decryption failed. Clearing session and requesting fresh X3DH.")
+					_ = corestore.DeleteSession(senderID.String())
+					_ = corestore.ClearSkippedKeys(senderID.String())
+					go sendRequestX3DH(ctx, h, senderID)
 					return
 				}
 
@@ -192,7 +258,9 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 
 		privKeyB64, err := corestore.FindPrivateKeyByID(keyID)
 		if err != nil || privKeyB64 == "" {
-			logger.Error().Str("keyID", keyID).Msg("Receiver's Pre-Key not found (Already used or expired)")
+			logger.Error().Str("keyID", keyID).Str("senderID", senderID.String()).Msg("Receiver's Pre-Key not found (expired or rotated). Requesting fresh X3DH from sender.")
+			// Tell sender to fetch a fresh pre-key and retry with a new X3DH handshake.
+			go sendRequestX3DH(ctx, h, senderID)
 			return
 		}
 		privKeyBytes, _ := base64.StdEncoding.DecodeString(privKeyB64)
@@ -269,7 +337,12 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 	encryptedPayload, _ := base64.StdEncoding.DecodeString(encryptedPayloadB64)
 	plaintextBytes, err := corecrypto.DecryptMessageRaw(aesKey, encryptedPayload)
 	if err != nil {
-		logger.Error().Str("peerID", senderID.String()).Msg("E2EE Decryption failed")
+		logger.Error().Str("peerID", senderID.String()).Err(err).Msg("E2EE X3DH Decryption failed (message authentication failed). Clearing bad session and requesting fresh X3DH.")
+		// Clear the bad session we just saved so next attempt starts clean
+		_ = corestore.DeleteSession(senderID.String())
+		_ = corestore.ClearSkippedKeys(senderID.String())
+		// Ask sender to restart with a new X3DH
+		go sendRequestX3DH(ctx, h, senderID)
 		return
 	}
 
@@ -307,20 +380,40 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 	case MsgTypeStatus:
 		logger.Displayf("[Status Report] Peer %s marked your message %s as: %s\n", 
 			FormatPeerID(senderID.String()), env.RefID, env.Status)
+		// Forward to Flutter via StatusCallback
+		if StatusCallback != nil {
+			StatusCallback(StatusEvent{
+				RefID:  env.RefID,
+				Status: env.Status,
+				Sender: senderID.String(),
+			})
+		}
 		return
 
 	case MsgTypeText:
-		// Check for Group Key sharing (GKEY:groupID:base64Key)
+		// Check for Group Key sharing (GKEY:groupID:base64Key1,base64Key2,...)
 		if strings.HasPrefix(env.Content, "GKEY:") {
 			parts := strings.SplitN(env.Content, ":", 3)
 			if len(parts) == 3 {
 				groupID := parts[1]
-				keyBytes, _ := base64.StdEncoding.DecodeString(parts[2])
-				corestore.SaveGroupSenderKey(groupID, senderID.String(), keyBytes)
+				keysStr := parts[2]
+				keyB64s := strings.Split(keysStr, ",")
+				
+				// Process from oldest to newest so the newest becomes the active key
+				savedCount := 0
+				for i := len(keyB64s) - 1; i >= 0; i-- {
+					keyBytes, errDec := base64.StdEncoding.DecodeString(keyB64s[i])
+					if errDec == nil {
+						corestore.SaveGroupSenderKey(groupID, senderID.String(), keyBytes)
+						savedCount++
+					}
+				}
+				
 				logger.Info().
 					Str("group", groupID).
 					Str("peerID", senderID.String()).
-					Msg("Received and saved Group Session Key (via Double Ratchet)")
+					Int("keysCount", savedCount).
+					Msg("Received and saved Group Session Key(s) (via Double Ratchet)")
 				// Flush any buffered messages that were waiting for this key
 				go FlushPendingGroupMessages(groupID, senderID.String())
 				return
@@ -401,6 +494,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		if MessageCallback != nil {
 			MessageCallback(MessageEvent{
 				Type:      "direct",
+				MsgID:     env.ID,
 				Timestamp: ts,
 				Sender:    senderID.String(),
 				Content:   env.Content,
@@ -577,10 +671,41 @@ func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 	return transmitEnvelope(ctx, h, targetID, finalWireEnvelope)
 }
 
+// SendSessionReset sends a signed session reset signal to a target peer,
+// and deletes the local session state to force a new X3DH handshake next time.
+func SendSessionReset(ctx context.Context, h host.Host, targetID peer.ID) error {
+	privKey := h.Peerstore().PrivKey(h.ID())
+	if privKey == nil {
+		return fmt.Errorf("local private key not found in peerstore")
+	}
+	timestamp := time.Now().Unix()
+	dataToSign := []byte(fmt.Sprintf("RESET:%d:%s:%s", timestamp, h.ID().String(), targetID.String()))
+	sigBytes, err := privKey.Sign(dataToSign)
+	if err != nil {
+		logger.Error().Err(err).Str("targetID", targetID.String()).Msg("Failed to sign RESET signal")
+		return err
+	}
+	sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
+	resetEnvelope := fmt.Sprintf("RESET:%d:%s", timestamp, sigB64)
+	
+	// Delete local session first to clean up local state
+	_ = corestore.DeleteSession(targetID.String())
+	
+	logger.Info().Str("targetID", targetID.String()).Msg("Sending E2EE Session Reset signal to peer")
+	return transmitEnvelope(ctx, h, targetID, resetEnvelope)
+}
+
+// sendRequestX3DH sends a lightweight signal to the target peer asking them
+// to clear their local session and re-initiate a fresh X3DH handshake.
+// This is used instead of RESET to break the mutual-reset deadlock.
+func sendRequestX3DH(ctx context.Context, h host.Host, targetID peer.ID) {
+	logger.Info().Str("targetID", targetID.String()).Msg("Sending REQUEST_X3DH signal to peer")
+	_ = transmitEnvelope(ctx, h, targetID, "REQUEST_X3DH")
+}
 
 // deriveNextKeys is deprecated, logic moved to corecrypto.RatchetStep
 
-func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target peer.ID, msg string) error {
+func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target peer.ID, msg string) (string, error) {
 	msg = strings.TrimSuffix(msg, "\n")
 	msgID := fmt.Sprintf("%x", sha256.Sum256([]byte(msg+time.Now().String())))[:8]
 	dataToSign := []byte(msg + msgID)
@@ -595,7 +720,7 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 		Signature: sigB64,
 	}
 
-	return sendSecureEnvelope(ctx, h, priv, target, env)
+	return msgID, sendSecureEnvelope(ctx, h, priv, target, env)
 }
 
 func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWireEnvelope string) error {
@@ -797,7 +922,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 						targetID, errDec := peer.Decode(m)
 						if errDec == nil {
 							go func(t peer.ID) {
-								_ = SendMessage(ctx, h, privKey, t, inviteMsg)
+								_, _ = SendMessage(ctx, h, privKey, t, inviteMsg)
 							}(targetID)
 						}
 					}
@@ -918,7 +1043,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 			targetID, errDec := peer.Decode(member)
 			if errDec == nil {
 				go func(t peer.ID) {
-					_ = SendMessage(ctx, h, privKey, t, inviteMsg)
+					_, _ = SendMessage(ctx, h, privKey, t, inviteMsg)
 				}(targetID)
 			}
 
@@ -1136,6 +1261,36 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		return
 	}
 
+	if strings.HasPrefix(msgStr, "/reset-session ") {
+		parts := strings.SplitN(msgStr, " ", 2)
+		if len(parts) == 2 {
+			targetStr := parts[1]
+			if strings.HasPrefix(targetStr, "@") {
+				resolved, err := ResolveAlias(ctx, h, targetStr)
+				if err == nil {
+					targetStr = resolved
+				} else {
+					logger.Displayf("[Error] Failed to resolve alias %s: %v\n", parts[1], err)
+					return
+				}
+			}
+			targetID, err := peer.Decode(targetStr)
+			if err == nil {
+				errReset := SendSessionReset(ctx, h, targetID)
+				if errReset == nil {
+					logger.Displayf("[Success] E2EE Session with %s has been reset.\n", parts[1])
+				} else {
+					logger.Displayf("[Error] Failed to send reset signal to %s: %v\n", parts[1], errReset)
+				}
+			} else {
+				logger.Displayf("[Error] Invalid Peer ID: %s\n", targetStr)
+			}
+		} else {
+			logger.Displayf("[Error] Use: /reset-session <peerID_or_alias>\n")
+		}
+		return
+	}
+
 	if msgStr == "/fetch" {
 		for _, p := range h.Network().Peers() {
 			protos, _ := h.Peerstore().GetProtocols(p)
@@ -1187,7 +1342,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 			targetID, err := peer.Decode(targetStr)
 			if err == nil {
 				logger.Debug().Str("peerID", targetID.String()).Msg("COMMAND: Calling SendMessage")
-				errSend := SendMessage(ctx, h, priv, targetID, parts[2])
+				_, errSend := SendMessage(ctx, h, priv, targetID, parts[2])
 				if errSend == nil {
 					logger.Info().Str("peerID", targetID.String()).Msg("Message sent successfully")
 				} else {
@@ -1224,7 +1379,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 				if err == nil {
 					fileName := filepath.Base(filePath)
 					fileMsg := fmt.Sprintf("FILE:%s:%d:%s", fileName, len(fileData), base64.StdEncoding.EncodeToString(fileData))
-					errSend := SendMessage(ctx, h, priv, targetID, fileMsg)
+					_, errSend := SendMessage(ctx, h, priv, targetID, fileMsg)
 					if errSend == nil {
 						logger.Displayf("[Success] Encrypted file %s sent to %s\n", fileName, FormatPeerID(targetID.String()))
 					} else {
@@ -1240,5 +1395,5 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 	// DESIGN-05 FIX: Input tidak dikenal sebagai command → tampilkan error, jangan broadcast ke semua peer.
 	// Perilaku broadcast lama sangat berbahaya (typo command = kirim ke semua orang).
 	logger.Displayf("[Error] Unknown command: '%s'\n", msgStr)
-	logger.Displayf("Available commands: /msg, /group, /join, /fetch, /register, /upload, /latency\n")
+	logger.Displayf("Available commands: /msg, /group, /join, /fetch, /register, /upload, /latency, /reset-session\n")
 }

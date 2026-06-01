@@ -3,6 +3,11 @@ package network
 import (
 	"context"
 	"fmt"
+	"os"
+	"encoding/json"
+	"runtime"
+	"strings"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -15,10 +20,6 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/nicabreon/meshsage/pkg/logger"
-	"strings"
-	"os"
-	"encoding/json"
-	"time"
 )
 
 // Config holds the configuration for the P2P node
@@ -64,64 +65,83 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 		portStr = parts[4]
 	}
 
+	// isAndroid detects if running on Android (for SELinux-safe configuration)
+	isAndroid := runtime.GOOS == "android"
+
 	opts := []libp2p.Option{
 		// 1. Identity
 		libp2p.Identity(cfg.PrivateKey),
 		// 2. Connection Management & Resource Limits
 		libp2p.ConnectionManager(cm),
 		libp2p.ResourceManager(rm),
-		// 3. Listen Address (Auto-detect & Support both TCP/UDP, IPv4 & IPv6)
+		// 3. Listen Address (QUIC/UDP only — works reliably on Android)
 		libp2p.ListenAddrStrings(
 			fmt.Sprintf("/ip4/0.0.0.0/udp/%s/quic-v1", portStr),
-			fmt.Sprintf("/ip6/::/udp/%s/quic-v1", portStr),
 		),
-
-		// 3. NAT Traversal & Port Forwarding
-		libp2p.NATPortMap(),       // Coba UPnP/NAT-PMP
-		libp2p.EnableNATService(), // Membantu deteksi status NAT
-		libp2p.EnableHolePunching(), // Aktifkan DCUtR (Hole Punching)
-
 		// 4. Transport & Security
-		libp2p.Transport(libp2pquic.NewTransport), // Hanya gunakan QUIC (UDP)
+		libp2p.Transport(libp2pquic.NewTransport), // QUIC (UDP) only
 		libp2p.EnableRelay(),
-		// 5. Address Factory: Paksa iklan alamat publik yang terlihat oleh orang lain
+		// 5. Address Factory: advertise known addresses
 		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-			// Kita ambil semua alamat yang libp2p pikir kita punya
-			return addrs 
+			return addrs
 		}),
-
-	// 6. Proactive NAT & Relay discovery (Dynamic Way)
-	libp2p.EnableNATService(),
-}
-
-// Paksa status publik jika diminta (khusus Dedicated Relay)
-if cfg.ForcePublic {
-	opts = append(opts, libp2p.ForceReachabilityPublic(), libp2p.EnableRelayService())
-}
-
-// Tambahkan AutoRelay dengan sumber dinamis
-if cfg.RelaySource != nil {
-	peerSource := func(ctx context.Context, num int) <-chan peer.AddrInfo {
-		return cfg.RelaySource
 	}
-	opts = append(opts, libp2p.EnableAutoRelayWithPeerSource(peerSource))
 
-	// Kirim relay statis awal ke channel agar langsung terdeteksi
-	go func() {
-		for _, r := range cfg.StaticRelays {
-			select {
-			case cfg.RelaySource <- r:
-			case <-ctx.Done():
-				return
-			}
+	// 6. NAT Traversal configuration (Android-aware)
+	//
+	// NATPortMap()    — UPnP/NAT-PMP via netlink socket — BLOCKED on Android API 36+
+	//                   by SELinux (untrusted_app cannot bind netlink_route_socket).
+	//                   Disabling prevents permanent startup hang on Android emulator/device.
+	//
+	// EnableNATService() — AutoNAT probe via netlink — also BLOCKED on Android API 36+.
+	//                      Disabled on Android for same reason.
+	//
+	// EnableHolePunching() — DCUtR (Direct Connection Upgrade through Relay).
+	//                        Uses existing libp2p relay connections, NO netlink needed.
+	//                        SAFE and IMPORTANT for Android P2P direct connections.
+	//                        Always enabled on all platforms including Android.
+	if !isAndroid {
+		opts = append(opts,
+			libp2p.NATPortMap(),        // UPnP/NAT-PMP (requires netlink — desktop only)
+			libp2p.EnableNATService(),  // AutoNAT probe (requires netlink — desktop only)
+		)
+	}
+	// DCUtR Hole Punching: relay-based, safe on Android — always enabled
+	opts = append(opts, libp2p.EnableHolePunching())
+
+	// Paksa status publik jika diminta (khusus Dedicated Relay)
+	if cfg.ForcePublic {
+		opts = append(opts, libp2p.ForceReachabilityPublic(), libp2p.EnableRelayService())
+	}
+
+	// Tambahkan AutoRelay dengan sumber dinamis
+	if cfg.RelaySource != nil {
+		peerSource := func(ctx context.Context, num int) <-chan peer.AddrInfo {
+			return cfg.RelaySource
 		}
-	}()
-}
+		opts = append(opts, libp2p.EnableAutoRelayWithPeerSource(peerSource))
 
-// 5. Create the libp2p host
-h, err := libp2p.New(opts...)
+		// Kirim relay statis awal ke channel agar langsung terdeteksi
+		go func() {
+			for _, r := range cfg.StaticRelays {
+				select {
+				case cfg.RelaySource <- r:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	// Create the libp2p host
+	h, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
+	}
+
+	// Explicitly add private key to Peerstore to guarantee h.Peerstore().PrivKey(h.ID()) is never nil
+	if cfg.PrivateKey != nil {
+		_ = h.Peerstore().AddPrivKey(h.ID(), cfg.PrivateKey)
 	}
 
 	// Audit: Print our own addresses periodically and on changes
@@ -148,7 +168,9 @@ h, err := libp2p.New(opts...)
 
 	// 6. Persistence Management
 	if cfg.DataDir != "" {
-		LoadPeers(h, cfg.DataDir)
+		// Load peers in the background — never block host creation.
+		// On reinstall-without-uninstall, peers.json may have I/O contention.
+		go LoadPeers(h, cfg.DataDir)
 		go func() {
 			ticker := time.NewTicker(10 * time.Minute)
 			for {

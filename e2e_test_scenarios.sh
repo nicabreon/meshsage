@@ -5,9 +5,11 @@
 
 set -e
 
-echo "=== MEMULAI SETUP PENGETESAN E2E ==="
+# 1. Bersihkan proses p2p-node dan test_meshsage yang masih berjalan dari sesi sebelumnya
+killall p2p-node test_meshsage 2>/dev/null || true
+sleep 1
 
-# 1. Bersihkan dan buat direktori kerja baru
+# 2. Bersihkan dan buat direktori kerja baru
 rm -rf test_e2e_run
 mkdir -p test_e2e_run/relay test_e2e_run/alice test_e2e_run/bob test_e2e_run/charlie
 touch test_e2e_run/relay/input test_e2e_run/alice/input test_e2e_run/bob/input test_e2e_run/charlie/input
@@ -102,19 +104,16 @@ fi
 echo "=================================================="
 echo "SKENARIO 3: Group Chat (Online) - Alice, Bob, Charlie"
 echo "=================================================="
-echo "Semua anggota bergabung ke grup GRP_TEST..."
-echo "/join GRP_TEST $BOB_ID,$CHARLIE_ID" > test_e2e_run/alice/input
-sleep 2
-echo "/join GRP_TEST $ALICE_ID,$CHARLIE_ID" > test_e2e_run/bob/input
-sleep 2
-echo "/join GRP_TEST $ALICE_ID,$BOB_ID" > test_e2e_run/charlie/input
+echo "Alice membuat grup SECURE @sec-group mengundang @bob dan @charlie..."
+echo "/group-create @sec-group SECURE @bob,@charlie" > test_e2e_run/alice/input
+sleep 5
 
 # Tunggu pertukaran Group Sender Keys (Double Ratchet handshake)
 echo "Menunggu pertukaran kunci grup (handshake)..."
 sleep 10
 
 echo "Alice mengirim pesan grup saat semua online..."
-echo "/group GRP_TEST Halo teman-teman! Kita semua online di grup." > test_e2e_run/alice/input
+echo "/group @sec-group Halo teman-teman! Kita semua online di grup." > test_e2e_run/alice/input
 sleep 8
 
 # Verifikasi Bob dan Charlie menerima pesan grup
@@ -137,7 +136,7 @@ kill -SIGINT $CHARLIE_PID
 sleep 2
 
 echo "2. Alice mengirim pesan grup (Bob online, Charlie offline)..."
-echo "/group GRP_TEST Halo grup! Charlie sedang offline saat ini." > test_e2e_run/alice/input
+echo "/group @sec-group Halo grup! Charlie sedang offline saat ini." > test_e2e_run/alice/input
 sleep 8
 
 # Verifikasi Bob menerima pesan secara online
@@ -166,7 +165,7 @@ else
 fi
 
 echo "5. Charlie mengirim pesan grup baru saat Bob offline..."
-echo "/group GRP_TEST Halo Alice! Saya sudah online kembali. Bob kemana?" > test_e2e_run/charlie/input
+echo "/group @sec-group Halo Alice! Saya sudah online kembali. Bob kemana?" > test_e2e_run/charlie/input
 sleep 8
 
 # Verifikasi Alice menerima pesan online dari Charlie

@@ -103,6 +103,15 @@ func handlePreKeyStream(s network.Stream) {
 			return
 		}
 
+		// Clear old public keys for this owner so stale pre-DB-reset keys don't linger.
+		// Safe: relay only stores public keys (private_key=NULL), client private keys are protected
+		// by DeletePublicPreKeysByOwner in the PREKEY_CLEAR cluster event handler.
+		_ = corestore.DeletePreKeysByOwner(batch.OwnerID)
+		BroadcastClusterEvent(context.Background(), ClusterEvent{
+			Type:    "PREKEY_CLEAR",
+			OwnerID: batch.OwnerID,
+		})
+
 		for _, k := range batch.Keys {
 			corestore.SavePreKey(batch.OwnerID, k.KeyID, k.PublicKey, "", k.Signature)
 		}
@@ -122,6 +131,13 @@ func handlePreKeyStream(s network.Stream) {
 			s.Write([]byte("ERROR: Unauthorized upload\n"))
 			return
 		}
+
+		// Clear old public keys for this owner so stale pre-DB-reset keys don't linger.
+		_ = corestore.DeletePreKeysByOwner(batch.OwnerID)
+		BroadcastClusterEvent(context.Background(), ClusterEvent{
+			Type:    "PREKEY_CLEAR",
+			OwnerID: batch.OwnerID,
+		})
 
 		for _, k := range batch.Keys {
 			corestore.SavePreKey(batch.OwnerID, k.KeyID, k.PublicKey, "", k.Signature)
@@ -152,6 +168,13 @@ func handlePreKeyStream(s network.Stream) {
 			s.Write([]byte("ERROR: No keys available\n"))
 			return
 		}
+
+		// Broadcast deletion of consumed pre-key to cluster sync
+		BroadcastClusterEvent(context.Background(), ClusterEvent{
+			Type:    "PREKEY_DELETE",
+			Hash:    keyID,
+			OwnerID: targetID,
+		})
 		
 		resp, _ := json.Marshal(map[string]string{
 			"key_id":     keyID,
@@ -274,7 +297,8 @@ func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKe
 	count := 0
 	fmt.Sscanf(strings.TrimSpace(resp), "%d", &count)
 	
-	if count >= 10 { return nil }
+	localCount := corestore.GetPreKeyCount(h.ID().String())
+	if localCount >= 10 && count >= 10 { return nil }
 	
 	logger.Info().Int("current", count).Str("peerID", relayID.String()).Msg("Pre-keys stock low, refilling")
 	

@@ -194,6 +194,10 @@ func handleAliasStream(s network.Stream) {
 
 // RegisterAlias sends a signed registration request to the closest DHT nodes
 func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID string) error {
+	if len(h.Network().Peers()) == 0 {
+		return fmt.Errorf("cannot register alias: not connected to any peers")
+	}
+
 	coord := GetAliasCoordinate(alias)
 	
 	// 1. Persiapkan Tanda Tangan Digital (Proof of Ownership)

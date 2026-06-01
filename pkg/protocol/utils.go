@@ -19,14 +19,25 @@ func FormatPeerID(id string) string {
 // MessageEvent represents a structured, decrypted chat or log event for client frontends
 type MessageEvent struct {
 	Type      string `json:"type"` // "direct", "group", "file"
+	MsgID     string `json:"msg_id,omitempty"`
 	Timestamp string `json:"timestamp"`
 	Sender    string `json:"sender"`
 	GroupID   string `json:"group_id,omitempty"`
 	Content   string `json:"content"`
 }
 
+// StatusEvent represents a delivery status update for a previously sent message
+type StatusEvent struct {
+	RefID  string `json:"ref_id"`  // ID of the original sent message
+	Status string `json:"status"`  // e.g. "delivered"
+	Sender string `json:"sender"`  // peer who acknowledged
+}
+
 // MessageCallback is a global hook invoked when new direct or group messages are decrypted
 var MessageCallback func(event MessageEvent)
+
+// StatusCallback is a global hook invoked when a delivery status update is received
+var StatusCallback func(event StatusEvent)
 
 // FormatSender returns a human-friendly sender label:
 //   - "@alias" if the peer has a known alias registered locally

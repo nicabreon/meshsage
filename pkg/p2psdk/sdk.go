@@ -97,7 +97,7 @@ func InitNode(port C.int, dataDir *C.char) *C.char {
 	coreproto.SetupMessaging(h)
 	coreproto.SetupMailbox(h, true)
 	coreproto.SetupAliasService(h)
-	_ = corenet.SetupDiscovery(h)
+	_ = corenet.SetupDiscovery(ctx, h)
 
 	nodeInstance = &Node{host: h, ctx: ctx, priv: priv}
 	return nil // Success
@@ -141,7 +141,7 @@ func SendMessage(target *C.char, message *C.char) *C.char {
 	targetID, err := peer.Decode(targetStr)
 	if err != nil { return cString(err.Error()) }
 
-	err = coreproto.SendMessage(nodeInstance.ctx, nodeInstance.host, nodeInstance.priv, targetID, msgStr)
+	_, err = coreproto.SendMessage(nodeInstance.ctx, nodeInstance.host, nodeInstance.priv, targetID, msgStr)
 	if err != nil { return cString(err.Error()) }
 	return nil
 }

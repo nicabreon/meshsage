@@ -25,6 +25,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
 	"github.com/nicabreon/meshsage/pkg/logger"
@@ -54,6 +55,7 @@ type Queue struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
 	events []string
+	closed bool
 }
 
 func NewQueue() *Queue {
@@ -65,15 +67,41 @@ func NewQueue() *Queue {
 func (q *Queue) Push(event string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.closed {
+		return
+	}
 	q.events = append(q.events, event)
 	q.cond.Signal()
 }
 
+// Close wakes up all blocked Pop() callers so they can exit cleanly.
+func (q *Queue) Close() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.closed = true
+	q.cond.Broadcast()
+}
+
+// Pop returns the next event, or empty string after ~500ms timeout or if queue is closed.
+// This prevents the Dart isolate from blocking forever when the app restarts.
 func (q *Queue) Pop() string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for len(q.events) == 0 {
+
+	// Wake up every 500ms via a background ticker so we never block forever
+	timer := time.AfterFunc(500*time.Millisecond, func() {
+		q.cond.Broadcast()
+	})
+	defer timer.Stop()
+
+	for len(q.events) == 0 && !q.closed {
 		q.cond.Wait()
+		// Reset the timer for next wait cycle
+		timer.Reset(500 * time.Millisecond)
+	}
+
+	if len(q.events) == 0 {
+		return "" // queue closed or timeout
 	}
 	event := q.events[0]
 	q.events = q.events[1:]
@@ -107,6 +135,21 @@ func (ew *EventWriter) Write(p []byte) (n int, err error) {
 
 //export StartNode
 func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) *C.char {
+	// Clean up previous host and context if they exist (prevents resource/port collision on restart)
+	if globalHost != nil {
+		logger.Warn().Msg("Starting a new Go node, but a previous node is still running. Stopping it first...")
+		if globalCancel != nil {
+			globalCancel()
+		}
+		_ = globalHost.Close()
+		globalHost = nil
+		// Close the old queue so blocked Pop() callers wake up and exit
+		eventQueue.Close()
+		// Replace with fresh queue for this session
+		eventQueue = NewQueue()
+		time.Sleep(300 * time.Millisecond) // Give the OS time to release ports
+	}
+
 	dbPath := C.GoString(dbPathStr)
 	idPath := C.GoString(idPathStr)
 	isClientOnly := isClientOnlyVal != 0
@@ -170,8 +213,13 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 
 	relaySource := make(chan peer.AddrInfo, 10)
 
-	// Build the Node host
-	host, err := corenet.NewNode(globalCtx, corenet.Config{
+	// Build the Node host.
+	// Use a short timeout so we don't hang forever if the port from the previous
+	// session is still held by Android OS (happens on reinstall-without-uninstall).
+	hostCtx, hostCancel := context.WithTimeout(globalCtx, 10*time.Second)
+	defer hostCancel()
+
+	host, err := corenet.NewNode(hostCtx, corenet.Config{
 		ListenAddr:   fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port),
 		PrivateKey:   priv,
 		DataDir:      filepath.Dir(dbPath),
@@ -180,7 +228,19 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 		ForcePublic:  false,
 	})
 	if err != nil {
-		return C.CString("Failed to build host: " + err.Error())
+		// Port might be busy from old session. Retry with random port (0).
+		logger.Warn().Err(err).Msg("NewNode failed with requested port, retrying with random port...")
+		host, err = corenet.NewNode(globalCtx, corenet.Config{
+			ListenAddr:   "/ip4/0.0.0.0/tcp/0",
+			PrivateKey:   priv,
+			DataDir:      filepath.Dir(dbPath),
+			StaticRelays: staticRelays,
+			RelaySource:  relaySource,
+			ForcePublic:  false,
+		})
+		if err != nil {
+			return C.CString("Failed to build host: " + err.Error())
+		}
 	}
 	globalHost = host
 
@@ -195,7 +255,7 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 	}
 	_ = corenet.SetupBitswap(globalCtx, host, dhtRouting)
 	_ = corenet.SetupPubSub(globalCtx, host)
-	_ = corenet.SetupDiscovery(host)
+	_ = corenet.SetupDiscovery(globalCtx, host)
 
 	coreproto.SetupMessaging(host)
 	coreproto.SetupMailbox(host, isClientOnly)
@@ -208,10 +268,24 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 		data, err := json.Marshal(map[string]interface{}{
 			"type":      "message",
 			"msg_type":  event.Type,
+			"msg_id":    event.MsgID,
 			"timestamp": event.Timestamp,
 			"sender":    event.Sender,
 			"group_id":  event.GroupID,
 			"content":   event.Content,
+		})
+		if err == nil {
+			eventQueue.Push(string(data))
+		}
+	}
+
+	// Hook the status callback to forward delivery receipts to Flutter
+	coreproto.StatusCallback = func(event coreproto.StatusEvent) {
+		data, err := json.Marshal(map[string]interface{}{
+			"type":   "delivery_status",
+			"ref_id": event.RefID,
+			"status": event.Status,
+			"sender": event.Sender,
 		})
 		if err == nil {
 			eventQueue.Push(string(data))
@@ -265,6 +339,17 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 				}
 			}()
 		},
+		DisconnectedF: func(n network.Network, conn network.Conn) {
+			remoteID := conn.RemotePeer()
+			if n.Connectedness(remoteID) != network.Connected {
+				peerEv := map[string]string{
+					"type":    "peer_disconnected",
+					"peer_id": remoteID.String(),
+				}
+				data, _ := json.Marshal(peerEv)
+				eventQueue.Push(string(data))
+			}
+		},
 	})
 
 	// Start reconnection loops in background
@@ -285,8 +370,34 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 				if pinfo.ID == host.ID() {
 					continue
 				}
-				if host.Network().Connectedness(pinfo.ID) != network.Connected {
-					go host.Connect(globalCtx, *pinfo)
+
+				if host.Network().Connectedness(pinfo.ID) == network.Connected {
+					// Verify connection is actually alive by trying to open a stream.
+					// Stale QUIC connections will fail this check.
+					go func(pid peer.ID) {
+						dialCtx, cancel := context.WithTimeout(globalCtx, 3*time.Second)
+						defer cancel()
+						str, errStream := host.NewStream(dialCtx, pid, "/ipfs/ping/1.0.0")
+						if errStream != nil {
+							logger.Warn().Str("peerID", pid.String()).Msg("Stale connection detected. Closing peer connection to trigger reconnect.")
+							host.Network().ClosePeer(pid)
+						} else {
+							str.Close()
+						}
+					}(pinfo.ID)
+				} else {
+					// Clear dial backoff to allow immediate reconnection attempt.
+					if s, ok := host.Network().(*swarm.Swarm); ok {
+						s.Backoff().Clear(pinfo.ID)
+					}
+					logger.Debug().Str("peerID", pinfo.ID.String()).Msg("Attempting to reconnect to seed...")
+					go func(pi peer.AddrInfo) {
+						if errDial := host.Connect(globalCtx, pi); errDial != nil {
+							logger.Debug().Err(errDial).Str("peerID", pi.ID.String()).Msg("Reconnection failed")
+						} else {
+							logger.Info().Str("peerID", pi.ID.String()).Msg("Successfully reconnected to seed node")
+						}
+					}(*pinfo)
 				}
 			}
 
@@ -314,16 +425,26 @@ func SendDirectMessage(targetStr, contentStr *C.char) *C.char {
 	target := C.GoString(targetStr)
 	content := C.GoString(contentStr)
 
+	if strings.HasPrefix(target, "@") {
+		resolved, err := coreproto.ResolveAlias(globalCtx, globalHost, target)
+		if err != nil {
+			return C.CString("Failed to resolve alias " + target + ": " + err.Error())
+		}
+		target = resolved
+	}
+
 	targetID, err := peer.Decode(target)
 	if err != nil {
 		return C.CString("Invalid peer ID: " + err.Error())
 	}
 
-	err = coreproto.SendMessage(globalCtx, globalHost, globalPriv, targetID, content)
+	// Use the msgID returned directly from SendMessage (single source of truth)
+	msgID, err := coreproto.SendMessage(globalCtx, globalHost, globalPriv, targetID, content)
 	if err != nil {
 		return C.CString("Failed to send: " + err.Error())
 	}
-	return nil
+	// Return msgID prefixed with "ok:" so Flutter can distinguish success from error
+	return C.CString("ok:" + msgID)
 }
 
 //export SendGroupChat
@@ -382,11 +503,25 @@ func SetAlias(peerIDStr, aliasStr *C.char) *C.char {
 	peerID := C.GoString(peerIDStr)
 	alias := C.GoString(aliasStr)
 
-	err := coreproto.RegisterAlias(globalCtx, globalHost, peerID, alias)
+	if !strings.HasPrefix(alias, "@") {
+		alias = "@" + alias
+	}
+
+	err := coreproto.RegisterAlias(globalCtx, globalHost, alias, peerID)
 	if err != nil {
 		return C.CString("Failed to set alias: " + err.Error())
 	}
 	return nil
+}
+
+//export GetAliasByPeerID
+func GetAliasByPeerID(peerIDStr *C.char) *C.char {
+	peerID := C.GoString(peerIDStr)
+	alias, err := corestore.FindAliasByPeerID(peerID)
+	if err != nil {
+		return C.CString("")
+	}
+	return C.CString(alias)
 }
 
 //export ResolveAlias
@@ -409,6 +544,7 @@ func GetLocalPeerID() *C.char {
 
 //export PollEvent
 func PollEvent() *C.char {
+	// Pop() now returns "" after 500ms timeout — never blocks forever
 	event := eventQueue.Pop()
 	return C.CString(event)
 }
@@ -506,7 +642,7 @@ func CreateGroupProper(aliasStr, groupTypeStr, membersStr *C.char) *C.char {
 			targetID, errDec := peer.Decode(m)
 			if errDec == nil {
 				go func(t peer.ID) {
-					_ = coreproto.SendMessage(globalCtx, globalHost, privKey, t, inviteMsg)
+					_, _ = coreproto.SendMessage(globalCtx, globalHost, privKey, t, inviteMsg)
 				}(targetID)
 			}
 		}
@@ -613,7 +749,7 @@ func GroupAddMember(aliasOrIDStr, memberStr *C.char) *C.char {
 	}
 
 	go func() {
-		_ = coreproto.SendMessage(globalCtx, globalHost, privKey, targetID, inviteMsg)
+		_, _ = coreproto.SendMessage(globalCtx, globalHost, privKey, targetID, inviteMsg)
 	}()
 
 	// Broadcast GCMD:ADD to existing members
@@ -774,7 +910,7 @@ func GetGroupInfo(aliasOrIDStr *C.char) *C.char {
 		Role   string `json:"role"`
 	}
 
-	var memberList []MemberJSON
+	memberList := []MemberJSON{}
 	for _, m := range members {
 		memberList = append(memberList, MemberJSON{
 			PeerID: m.PeerID,
@@ -826,7 +962,7 @@ func GetJoinedGroups() *C.char {
 		CreatedAt  int64  `json:"created_at"`
 	}
 
-	var groups []GroupJSON
+	groups := []GroupJSON{}
 	for rows.Next() {
 		var gid string
 		if err := rows.Scan(&gid); err == nil {

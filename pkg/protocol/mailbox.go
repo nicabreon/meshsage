@@ -309,20 +309,27 @@ func StoreOfflineMessage(ctx context.Context, h host.Host, targetID peer.ID, sen
 		}
 	}
 
+	// If the local node acts as a relay, and the target is not itself, we can store it locally
+	storeLocally := corenet.ShouldActAsRelay() && targetID != h.ID()
+
+	maxRemoteTargets := 3
+	if storeLocally {
+		maxRemoteTargets = 2
+	}
+
 	targetPeers := make(map[peer.ID]bool)
 	for _, p := range infraPeers {
+		if len(targetPeers) >= maxRemoteTargets { break }
 		if p != targetID { targetPeers[p] = true }
 	}
 	for _, p := range closest {
-		if len(targetPeers) >= 3 { break }
+		if len(targetPeers) >= maxRemoteTargets { break }
 		if p != h.ID() && p != targetID { targetPeers[p] = true }
 	}
 
 	var mu sync.Mutex
 	successCount := 0
 
-	// If the local node acts as a relay, and the target is not itself, we can store it locally
-	storeLocally := corenet.ShouldActAsRelay() && targetID != h.ID()
 	if storeLocally {
 		err := corestore.SaveMailboxMessage(msgHash, coord, senderPubkeyB64, payloadB64)
 		if err == nil {
@@ -369,7 +376,19 @@ func StoreOfflineMessage(ctx context.Context, h host.Host, targetID peer.ID, sen
 	}
 	wg.Wait()
 
-	if successCount == 0 { return fmt.Errorf("failed to store message on any node") }
+	// Enforce minimum success: 2 nodes, or total targeted nodes if less than 2
+	totalTargeted := len(targetPeers)
+	if storeLocally {
+		totalTargeted++
+	}
+	requiredMin := 2
+	if totalTargeted < requiredMin {
+		requiredMin = totalTargeted
+	}
+
+	if successCount < requiredMin {
+		return fmt.Errorf("failed to store message on required number of nodes (stored on %d/%d nodes)", successCount, requiredMin)
+	}
 	logger.Info().Int("nodes", successCount).Msg("Offline message stored successfully")
 	return nil
 }

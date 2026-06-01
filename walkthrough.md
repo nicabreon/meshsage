@@ -194,3 +194,19 @@ bash e2e_test_scenarios.sh
 ```bash
 bash test_groups_e2e.sh
 ```
+
+---
+
+## 5. Final Stability Bugfixes
+
+### A. Dart Null List Type Cast Crash Resolution
+When loading the joined groups list or fetching group details in the Flutter UI, Dart would intermittently crash with:
+`Error loading joined groups: type 'Null' is not a subtype of type 'List<dynamic>' in type cast`
+*   **Root Cause:** The Go shared library returned a marshaled `nil` slice as the JSON string `"null"`. When parsed in Dart via `json.decode()`, this resulted in a `null` object, which failed to cast to a Dart `List`.
+*   **Resolution:** Modified `GetJoinedGroups` and `GetGroupInfo` in `cmd/libmeshsage/main.go` to explicitly initialize slices as empty non-nil slices (`groups := []GroupJSON{}` and `memberList := []MemberJSON{}`). They now serialize to `[]` instead of `null`, preventing the Dart type cast error.
+
+### B. E2E Test Suite Execution Lock Resolution
+When running `e2e_test_scenarios.sh` consecutively, scenario steps would intermittently fail due to locked SQLite databases or port conflicts.
+*   **Root Cause:** Background P2P worker processes from previous runs were not being cleaned up, leaving orphan processes bound to ports and locking databases.
+*   **Resolution:** Added proactive process termination (`killall p2p-node test_meshsage 2>/dev/null || true`) at the start of `e2e_test_scenarios.sh`, ensuring a clean environment for every E2E run.
+
