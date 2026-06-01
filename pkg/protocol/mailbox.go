@@ -431,11 +431,32 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 		}
 
 		foundCount++
-		senderPubkey := parts[2]
+		senderPubkeyB64 := parts[2]
 		payloadB64 := parts[3]
-		
+
 		payload, _ := base64.StdEncoding.DecodeString(payloadB64)
-		senderID, _ := peer.Decode(senderPubkey)
+
+		// Derive senderID from the marshalled libp2p public key stored by the sender.
+		// We cannot use peer.Decode here because the stored value is raw pubkey bytes
+		// (from crypto.MarshalPublicKey), not a multihash peer ID string.
+		var senderID peer.ID
+		pubKeyBytes, errDec := base64.StdEncoding.DecodeString(senderPubkeyB64)
+		if errDec == nil {
+			pubKey, errUnmarshal := crypto.UnmarshalPublicKey(pubKeyBytes)
+			if errUnmarshal == nil {
+				senderID, _ = peer.IDFromPublicKey(pubKey)
+				// Cache the address in peerstore so the reply can reach them
+				h.Peerstore().AddPubKey(senderID, pubKey)
+			}
+		}
+		if senderID == "" {
+			// Fallback: try treating the field as a plain peer ID string (legacy messages)
+			senderID, _ = peer.Decode(senderPubkeyB64)
+		}
+		if senderID == "" {
+			logger.Warn().Str("hash", msgHash).Msg("Mailbox: could not derive senderID, skipping message")
+			continue
+		}
 		ProcessSecureEnvelope(ctx, h, senderID, string(payload))
 	}
 }

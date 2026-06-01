@@ -124,10 +124,18 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 	}
 
 	if strings.HasPrefix(envelope, "REQUEST_X3DH") {
-		// Counterparty has reset their session and is asking us to initiate a fresh X3DH
-		logger.Info().Str("senderID", senderID.String()).Msg("REQUEST_X3DH: Counterparty requested fresh handshake. Clearing local session and will send X3DH on next message.")
+		// Counterparty's pre-key was not found or their session is corrupt.
+		// Clear our local session and automatically re-initiate a fresh X3DH
+		// so the handshake completes without requiring the user to send a message.
+		logger.Info().Str("senderID", senderID.String()).Msg("REQUEST_X3DH: Clearing local session and auto-reinitiating fresh X3DH handshake.")
 		_ = corestore.DeleteSession(senderID.String())
 		_ = corestore.ClearSkippedKeys(senderID.String())
+		// Re-initiate after a brief delay to give the remote node time to upload
+		// fresh pre-keys if they just started up (avoids immediate 'no pre-key' failure).
+		go func(target peer.ID) {
+			time.Sleep(2 * time.Second)
+			sendHandshakeAck(ctx, h, target)
+		}(senderID)
 		return
 	}
 
@@ -816,7 +824,14 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 		logger.Warn().Err(err).Str("target", target.String()).Msg("transmitEnvelope: Dial failed, falling back to mailbox storage")
 	}
 	encodedEnvelope := base64.StdEncoding.EncodeToString([]byte(finalWireEnvelope))
-	return StoreOfflineMessage(ctx, h, target, h.ID().String(), encodedEnvelope)
+	// Pass the actual marshalled public key (not the peer ID string) so the
+	// receiver can correctly reconstruct the sender peer ID when fetching from mailbox.
+	pubKeyBytes, errMarshal := crypto.MarshalPublicKey(h.Peerstore().PubKey(h.ID()))
+	if errMarshal != nil {
+		pubKeyBytes, _ = h.ID().MarshalBinary() // fallback: use raw peer ID bytes
+	}
+	senderPubkeyB64 := base64.StdEncoding.EncodeToString(pubKeyBytes)
+	return StoreOfflineMessage(ctx, h, target, senderPubkeyB64, encodedEnvelope)
 }
 
 func StartChatPrompt(ctx context.Context, h host.Host, priv crypto.PrivKey) {
