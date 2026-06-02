@@ -300,9 +300,22 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 		}
 	}
 
-	// Restore group memberships in the background to prevent startup blocking
+	// Restore group memberships in the background once we connect to at least one peer
 	go func() {
-		_ = coreproto.RestoreGroups(globalCtx, host, priv)
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-globalCtx.Done():
+				return
+			case <-ticker.C:
+				if len(host.Network().Peers()) > 0 {
+					logger.Info().Msg("Connected to at least one peer. Starting background group restoration...")
+					_ = coreproto.RestoreGroups(globalCtx, host, priv)
+					return
+				}
+			}
+		}
 	}()
 
 	// Set connection notifications

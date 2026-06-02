@@ -146,8 +146,23 @@ func main() {
 	coreproto.SetupAliasService(host)
 	coreproto.SetupClusterSync(ctx, host)
 
-	// Restore group memberships from database
-	_ = coreproto.RestoreGroups(ctx, host, priv)
+	// Restore group memberships from database in background once we connect to at least one peer
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if len(host.Network().Peers()) > 0 {
+					logger.Info().Msg("Connected to at least one peer. Starting background group restoration...")
+					_ = coreproto.RestoreGroups(ctx, host, priv)
+					return
+				}
+			}
+		}
+	}()
 
 	if corenet.IsDedicated {
 		coreproto.SetupReplicationHandler(host)
