@@ -255,6 +255,7 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 	// 6. Global Modes
 	corenet.IsDedicated = false
 	corenet.IsClientOnly = isClientOnly
+	corenet.ForceClientOnly = isClientOnly
 
 	// 7. Initialize Protocols
 	dhtRouting, err := corenet.SetupDHT(globalCtx, host)
@@ -300,7 +301,7 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 		}
 	}
 
-	// Restore group memberships in the background once we connect to at least one peer
+	// Background group restoration on startup once connected to at least one peer
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
@@ -1035,6 +1036,15 @@ func GetJoinedGroups() *C.char {
 	}
 	defer rows.Close()
 
+	var groupIDs []string
+	for rows.Next() {
+		var gid string
+		if err := rows.Scan(&gid); err == nil {
+			groupIDs = append(groupIDs, gid)
+		}
+	}
+	rows.Close() // Close rows early to release database connection in connection pool
+
 	type GroupJSON struct {
 		GroupID    string `json:"group_id"`
 		GroupAlias string `json:"group_alias"`
@@ -1044,19 +1054,16 @@ func GetJoinedGroups() *C.char {
 	}
 
 	groups := []GroupJSON{}
-	for rows.Next() {
-		var gid string
-		if err := rows.Scan(&gid); err == nil {
-			meta, err := corestore.LoadGroupMetadata(gid)
-			if err == nil {
-				groups = append(groups, GroupJSON{
-					GroupID:    meta.GroupID,
-					GroupAlias: meta.GroupAlias,
-					CreatorID:  meta.CreatorID,
-					GroupType:  meta.GroupType,
-					CreatedAt:  meta.CreatedAt,
-				})
-			}
+	for _, gid := range groupIDs {
+		meta, err := corestore.LoadGroupMetadata(gid)
+		if err == nil {
+			groups = append(groups, GroupJSON{
+				GroupID:    meta.GroupID,
+				GroupAlias: meta.GroupAlias,
+				CreatorID:  meta.CreatorID,
+				GroupType:  meta.GroupType,
+				CreatedAt:  meta.CreatedAt,
+			})
 		}
 	}
 

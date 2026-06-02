@@ -15,6 +15,9 @@ var (
 	// IsClientOnly is a manual override set by the user
 	IsClientOnly bool = false
 
+	// ForceClientOnly prevents the network monitor from auto-promoting the node to Hybrid
+	ForceClientOnly bool = false
+
 	// IsNetworkWeak is automatically determined by the monitor
 	IsNetworkWeak bool = false
 
@@ -66,7 +69,7 @@ func checkNetworkQuality(ctx context.Context, h host.Host, ps *ping.PingService)
 		if avgLatency > 500*time.Millisecond && !IsClientOnly {
 			IsClientOnly = true
 			logger.Warn().Dur("avg_rtt", avgLatency).Msg("Network quality degraded. Switching to Client-Only mode")
-		} else if avgLatency < 200*time.Millisecond && IsClientOnly && !IsDedicated {
+		} else if avgLatency < 200*time.Millisecond && IsClientOnly && !IsDedicated && !ForceClientOnly {
 			IsClientOnly = false
 			logger.Info().Dur("avg_rtt", avgLatency).Msg("Network quality improved. Enabling Hybrid Mesh features")
 		}

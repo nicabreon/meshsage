@@ -668,10 +668,13 @@ func ProcessGroupMessage(groupID string, msgBytes []byte) {
 
 // RestoreGroups restores all active group memberships from database on startup
 func RestoreGroups(ctx context.Context, h host.Host, priv crypto.PrivKey) error {
+	logger.Info().Msg("[RestoreGroups] Querying distinct group_ids from group_members_v2...")
 	rows, err := corestore.DB.Query(`SELECT DISTINCT group_id FROM group_members_v2 WHERE peer_id = ?`, h.ID().String())
 	if err != nil {
+		logger.Error().Err(err).Msg("[RestoreGroups] Failed to query group_members_v2")
 		return err
 	}
+	logger.Info().Msg("[RestoreGroups] Query successful, parsing rows...")
 	defer rows.Close()
 
 	var groupIDs []string

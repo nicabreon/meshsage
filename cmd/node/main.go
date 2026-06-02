@@ -129,7 +129,8 @@ func main() {
 	// 3. Global State Initialization
 	corenet.IsDedicated = *isDedicated
 	corenet.IsClientOnly = *isClientOnly
-	logger.Info().Bool("dedicated", corenet.IsDedicated).Bool("clientOnly", corenet.IsClientOnly).Msg("Node mode initialized")
+	corenet.ForceClientOnly = *isClientOnly
+	logger.Info().Bool("dedicated", corenet.IsDedicated).Bool("clientOnly", corenet.IsClientOnly).Bool("forceClientOnly", corenet.ForceClientOnly).Msg("Node mode initialized")
 
 	// 4. Protocols
 	dhtRouting, err := corenet.SetupDHT(ctx, host)

@@ -27,6 +27,8 @@ var (
 	rateLimitMutex   sync.Mutex
 	activeSyncs      = make(map[peer.ID]struct{})
 	activeSyncsMutex sync.Mutex
+	activeFetches      = make(map[peer.ID]struct{})
+	activeFetchesMutex sync.Mutex
 )
 
 const (
@@ -439,6 +441,21 @@ func StoreOfflineMessage(ctx context.Context, h host.Host, targetID peer.ID, sen
 }
 
 func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, privKey crypto.PrivKey) {
+	activeFetchesMutex.Lock()
+	if _, exists := activeFetches[relayID]; exists {
+		activeFetchesMutex.Unlock()
+		logger.Debug().Str("peerID", relayID.String()).Msg("Mailbox fetch already in progress, skipping concurrent fetch")
+		return
+	}
+	activeFetches[relayID] = struct{}{}
+	activeFetchesMutex.Unlock()
+
+	defer func() {
+		activeFetchesMutex.Lock()
+		delete(activeFetches, relayID)
+		activeFetchesMutex.Unlock()
+	}()
+
 	coord := GetMailboxCoordinate(h.ID())
 	logger.Debug().Str("coord", coord).Str("peerID", relayID.String()).Msg("Starting mailbox fetch")
 	
