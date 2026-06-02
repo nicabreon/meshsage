@@ -142,7 +142,7 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 		if globalCancel != nil {
 			globalCancel()
 		}
-		
+
 		oldHost := globalHost
 		go func() {
 			logger.Info().Msg("Closing old host in background...")
@@ -150,7 +150,7 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 			logger.Info().Msg("Old host successfully closed in background")
 		}()
 		globalHost = nil
-		
+
 		// Close the old queue so blocked Pop() callers wake up and exit
 		eventQueue.Close()
 		// Replace with fresh queue for this session
@@ -612,13 +612,13 @@ func StopNode() {
 		if globalCancel != nil {
 			globalCancel()
 		}
-		
+
 		oldHost := globalHost
 		go func() {
 			_ = oldHost.Close()
 		}()
 		globalHost = nil
-		
+
 		eventQueue.Close()
 		// Replace with fresh queue for future restarts
 		eventQueue = NewQueue()

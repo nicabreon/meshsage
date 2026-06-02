@@ -23,8 +23,10 @@ import (
 )
 
 var (
-	rateLimitMap   = make(map[string]time.Time)
-	rateLimitMutex sync.Mutex
+	rateLimitMap     = make(map[string]time.Time)
+	rateLimitMutex   sync.Mutex
+	activeSyncs      = make(map[peer.ID]struct{})
+	activeSyncsMutex sync.Mutex
 )
 
 const (
@@ -586,6 +588,21 @@ func VerifySignedEnvelope(envelopeStr string, senderPubKey crypto.PubKey) (strin
 // and runs a notification subscription loop, a periodic 2-second fast polling loop,
 // and a periodic 30-second pre-key refill check loop concurrently.
 func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey crypto.PrivKey) {
+	activeSyncsMutex.Lock()
+	if _, exists := activeSyncs[relayID]; exists {
+		activeSyncsMutex.Unlock()
+		logger.Debug().Str("peerID", relayID.String()).Msg("Mailbox sync already running for relay, skipping duplicate setup")
+		return
+	}
+	activeSyncs[relayID] = struct{}{}
+	activeSyncsMutex.Unlock()
+
+	defer func() {
+		activeSyncsMutex.Lock()
+		delete(activeSyncs, relayID)
+		activeSyncsMutex.Unlock()
+	}()
+
 	// 1. Refill pre-keys
 	go AutoRefillPreKeys(ctx, h, relayID, privKey)
 
