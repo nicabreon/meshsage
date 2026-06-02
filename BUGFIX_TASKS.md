@@ -116,6 +116,18 @@
 
 ---
 
+## 🔴 Future / Pending Features
+
+- [ ] **FEAT-01**: Restricted Connection Rules for Client Nodes
+  - **Goal**: Restrict outgoing/incoming client connections to dedicated relays and direct chat peers by default, preventing open peer-to-peer scanning unless all relays are offline.
+  - **Implementation**:
+    - Build a custom `RestrictedConnectionGater` implementing `connmgr.ConnectionGater` in the Go networking layer.
+    - Check and allow connection ONLY to static seeds, discovered dedicated relays (`/p2p-core/infra/dedicated/1.1.0`), and peers with active direct chat sessions in SQLite.
+    - Implement a dynamic fallback: if zero dedicated relays are reachable, allow standard connections to standard/hybrid peers.
+    - Register the gater in `pkg/network/host.go` during `libp2p.New`.
+
+---
+
 ## Build Status
 
 ```
