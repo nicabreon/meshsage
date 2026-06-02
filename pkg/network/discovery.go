@@ -37,12 +37,16 @@ func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 
 // SetupDiscovery sets up mDNS discovery to automatically find local peers, and DHT routing discovery for global peers
 func SetupDiscovery(ctx context.Context, h host.Host) error {
-	// 1. Setup mDNS Service
-	n := &mdnsNotifee{h: h}
-	s := mdns.NewMdnsService(h, DiscoveryServiceTag, n)
-	if err := s.Start(); err != nil {
-		logger.Error().Err(err).Msg("Failed to start mDNS service")
-	}
+	// 1. Setup mDNS Service in background so it never blocks startup
+	go func() {
+		n := &mdnsNotifee{h: h}
+		s := mdns.NewMdnsService(h, DiscoveryServiceTag, n)
+		if err := s.Start(); err != nil {
+			logger.Error().Err(err).Msg("Failed to start mDNS service")
+		} else {
+			logger.Debug().Msg("mDNS service started successfully in background")
+		}
+	}()
 
 	// 2. Setup DHT Rendezvous Discovery in the background
 	go func() {

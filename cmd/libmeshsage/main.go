@@ -138,17 +138,24 @@ func (ew *EventWriter) Write(p []byte) (n int, err error) {
 func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) *C.char {
 	// Clean up previous host and context if they exist (prevents resource/port collision on restart)
 	if globalHost != nil {
-		logger.Warn().Msg("Starting a new Go node, but a previous node is still running. Stopping it first...")
+		logger.Warn().Msg("Starting a new Go node, but a previous node is still running. Stopping it in background...")
 		if globalCancel != nil {
 			globalCancel()
 		}
-		_ = globalHost.Close()
+		
+		oldHost := globalHost
+		go func() {
+			logger.Info().Msg("Closing old host in background...")
+			_ = oldHost.Close()
+			logger.Info().Msg("Old host successfully closed in background")
+		}()
 		globalHost = nil
+		
 		// Close the old queue so blocked Pop() callers wake up and exit
 		eventQueue.Close()
 		// Replace with fresh queue for this session
 		eventQueue = NewQueue()
-		time.Sleep(300 * time.Millisecond) // Give the OS time to release ports
+		time.Sleep(100 * time.Millisecond) // Give the OS a brief moment to yield
 	}
 
 	dbPath := C.GoString(dbPathStr)
@@ -293,8 +300,10 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 		}
 	}
 
-	// Restore group memberships
-	_ = coreproto.RestoreGroups(globalCtx, host, priv)
+	// Restore group memberships in the background to prevent startup blocking
+	go func() {
+		_ = coreproto.RestoreGroups(globalCtx, host, priv)
+	}()
 
 	// Set connection notifications
 	var recentlyConnected sync.Map
@@ -586,12 +595,17 @@ func FreeString(ptr *C.char) {
 //export StopNode
 func StopNode() {
 	if globalHost != nil {
-		logger.Warn().Msg("Stopping the Go node...")
+		logger.Warn().Msg("Stopping the Go node in background...")
 		if globalCancel != nil {
 			globalCancel()
 		}
-		_ = globalHost.Close()
+		
+		oldHost := globalHost
+		go func() {
+			_ = oldHost.Close()
+		}()
 		globalHost = nil
+		
 		eventQueue.Close()
 		// Replace with fresh queue for future restarts
 		eventQueue = NewQueue()

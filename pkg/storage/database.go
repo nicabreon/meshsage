@@ -17,8 +17,11 @@ var DB *sql.DB
 // InitDatabase initializes the local SQLite database.
 func InitDatabase(dbPath string) error {
 	if DB != nil {
-		_ = DB.Close()
+		oldDB := DB
 		DB = nil
+		go func() {
+			_ = oldDB.Close()
+		}()
 	}
 	var err error
 	// modernc.org/sqlite uses the "sqlite" driver name
@@ -31,9 +34,8 @@ func InitDatabase(dbPath string) error {
 	DB.SetMaxOpenConns(1)
 
 	// Critical: set busy_timeout FIRST before any other PRAGMA.
-	// This prevents SQLITE_BUSY deadlocks when WAL from previous crash is still being
-	// checkpointed by the OS on reinstall-without-uninstall.
-	DB.Exec("PRAGMA busy_timeout=10000;") // 10s — allows WAL recovery time
+	// We use 3 seconds (3000ms) to avoid long hangs on startup if there is lock contention.
+	DB.Exec("PRAGMA busy_timeout=3000;")
 	DB.Exec("PRAGMA journal_mode=WAL;")
 	DB.Exec("PRAGMA synchronous=NORMAL;")
 	DB.Exec("PRAGMA cache_size=-8000;")   // 8MB page cache
