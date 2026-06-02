@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -234,7 +235,26 @@ func handleMailboxStream(h host.Host, s network.Stream) {
 				return
 			}
 
-			// Verify ZKP signature to prevent spam on mailboxes
+			pubKeyBytes, errDecPub := base64.StdEncoding.DecodeString(senderPubkey)
+			if errDecPub != nil {
+				logger.Warn().Err(errDecPub).Msg("REJECTED: Invalid sender public key base64")
+				s.Write([]byte("ERROR_INVALID_SENDER_PUBKEY\n"))
+				return
+			}
+			senderPubKey, errUnmarshal := crypto.UnmarshalPublicKey(pubKeyBytes)
+			if errUnmarshal != nil {
+				logger.Warn().Err(errUnmarshal).Msg("REJECTED: Failed to unmarshal sender public key")
+				s.Write([]byte("ERROR_INVALID_SENDER_PUBKEY\n"))
+				return
+			}
+			senderPeerID, errID := peer.IDFromPublicKey(senderPubKey)
+			if errID != nil {
+				logger.Warn().Err(errID).Msg("REJECTED: Failed to derive sender Peer ID")
+				s.Write([]byte("ERROR_INVALID_SENDER_PUBKEY\n"))
+				return
+			}
+
+			// Verify signature to prevent spam on mailboxes
 			envBytes, errDec := base64.StdEncoding.DecodeString(payload)
 			if errDec != nil {
 				logger.Warn().Err(errDec).Msg("REJECTED: Invalid base64 payload")
@@ -242,10 +262,17 @@ func handleMailboxStream(h host.Host, s network.Stream) {
 				return
 			}
 
-			valid, errZkp := VerifyZKPEnvelope(string(envBytes))
-			if errZkp != nil || !valid {
-				logger.Warn().Err(errZkp).Msg("REJECTED: ZKP verification failed (spammer or invalid membership proof)")
-				s.Write([]byte("ERROR_ZKP_VERIFICATION_FAILED\n"))
+			_, errSig := VerifySignedEnvelope(string(envBytes), senderPubKey)
+			if errSig != nil {
+				logger.Warn().Err(errSig).Msg("REJECTED: Mailbox signature verification failed (invalid signature)")
+				s.Write([]byte("ERROR_SIGNATURE_VERIFICATION_FAILED\n"))
+				return
+			}
+
+			// Anti-Spam Check: Verify sender is registered by checking if they have active pre-keys
+			if corestore.GetPreKeyCount(senderPeerID.String()) == 0 {
+				logger.Warn().Str("sender", senderPeerID.String()).Msg("REJECTED: Sender has no registered pre-keys on this relay")
+				s.Write([]byte("ERROR_SENDER_UNREGISTERED\n"))
 				return
 			}
 
@@ -415,26 +442,41 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	s, err := h.NewStream(dialCtx, relayID, protocol.ID(MailboxProtocolID))
 	cancel()
-	if err != nil { return }
+	if err != nil {
+		logger.Debug().Err(err).Str("peerID", relayID.String()).Msg("Mailbox fetch: failed to open stream")
+		return
+	}
 	defer s.Close()
 
 	_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = s.Write([]byte(fmt.Sprintf("FETCH %s\n", coord)))
-	if err != nil { return }
+	if err != nil {
+		logger.Debug().Err(err).Str("peerID", relayID.String()).Msg("Mailbox fetch: failed to write FETCH request")
+		return
+	}
 	buf := bufio.NewReader(s)
 
 	foundCount := 0
 	for {
 		_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
 		line, err := buf.ReadString('\n')
-		if err != nil { break }
+		if err != nil {
+			logger.Debug().Err(err).Str("peerID", relayID.String()).Msg("Mailbox fetch: read error during stream iteration")
+			break
+		}
 		line = strings.TrimSpace(line)
 		
-		if line == "DONE" { 
-			if foundCount > 0 { logger.Info().Int("count", foundCount).Msg("Fetch complete") }
-			break 
+		if line == "DONE" {
+			logger.Debug().Int("count", foundCount).Str("peerID", relayID.String()).Msg("Fetch complete")
+			if foundCount > 0 {
+				logger.Info().Int("count", foundCount).Msg("Fetch complete")
+			}
+			break
 		}
-		if line == "ERROR" { break }
+		if line == "ERROR" {
+			logger.Debug().Str("peerID", relayID.String()).Msg("Mailbox fetch: relay returned ERROR status")
+			break
+		}
 
 		parts := strings.Split(line, " ")
 		if len(parts) < 4 || parts[0] != "MSG" { continue }
@@ -475,3 +517,127 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 		ProcessSecureEnvelope(ctx, h, senderID, string(payload))
 	}
 }
+
+// SignedMailboxEnvelope represents the signed envelope stored in the Mailbox
+type SignedMailboxEnvelope struct {
+	Payload   string `json:"payload"`   // The original E2EE message envelope
+	Signature string `json:"signature"` // Base64 signature of the payload
+}
+
+// WrapEnvelopeWithSignature signs the payload with the host's private key and marshals it into a SignedMailboxEnvelope JSON.
+func WrapEnvelopeWithSignature(privKey crypto.PrivKey, payload string) (string, error) {
+	sig, err := privKey.Sign([]byte(payload))
+	if err != nil {
+		return "", err
+	}
+	env := SignedMailboxEnvelope{
+		Payload:   payload,
+		Signature: base64.StdEncoding.EncodeToString(sig),
+	}
+	data, err := json.Marshal(env)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// VerifySignedEnvelope verifies the envelope signature using the sender's public key and returns the decrypted payload.
+func VerifySignedEnvelope(envelopeStr string, senderPubKey crypto.PubKey) (string, error) {
+	var env SignedMailboxEnvelope
+	if err := json.Unmarshal([]byte(envelopeStr), &env); err != nil {
+		return "", fmt.Errorf("invalid envelope JSON: %w", err)
+	}
+	sigBytes, err := base64.StdEncoding.DecodeString(env.Signature)
+	if err != nil {
+		return "", fmt.Errorf("invalid signature base64: %w", err)
+	}
+	valid, err := senderPubKey.Verify([]byte(env.Payload), sigBytes)
+	if err != nil || !valid {
+		return "", fmt.Errorf("invalid signature")
+	}
+	return env.Payload, nil
+}
+
+// StartMailboxSync coordinates initial pre-key refill, immediate message fetching,
+// and runs a notification subscription loop, a periodic 2-second fast polling loop,
+// and a periodic 30-second pre-key refill check loop concurrently.
+func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey crypto.PrivKey) {
+	// 1. Refill pre-keys
+	go AutoRefillPreKeys(ctx, h, relayID, privKey)
+
+	// 2. Fetch mailbox messages immediately
+	go FetchMailboxMessages(ctx, h, relayID, privKey)
+
+	// 3. Keep-alive subscription loop (runs in its own goroutine)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			statusChan := make(chan bool, 2)
+			go SubscribeNotifications(ctx, h, relayID, statusChan)
+
+			// Wait for subscription status or context cancel
+			var subscribed bool
+			select {
+			case <-ctx.Done():
+				return
+			case subscribed = <-statusChan:
+			}
+
+			if subscribed {
+				// We are successfully subscribed to push notifications.
+				// Wait until the subscription is lost or context cancel
+				select {
+				case <-ctx.Done():
+					return
+				case <-statusChan:
+					// Lost subscription
+				}
+			}
+
+			// Wait 5 seconds before retrying subscription to avoid tight connection loop
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}()
+
+	// 4. Concurrent 2-second fast polling loop
+	go func() {
+		logger.Info().Str("peerID", relayID.String()).Msg("Starting concurrent 2-second fast polling loop")
+		pollTicker := time.NewTicker(2 * time.Second)
+		defer pollTicker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pollTicker.C:
+				go FetchMailboxMessages(ctx, h, relayID, privKey)
+			}
+		}
+	}()
+
+	// 5. Concurrent 30-second pre-key refill check loop
+	go func() {
+		refillTicker := time.NewTicker(30 * time.Second)
+		defer refillTicker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-refillTicker.C:
+				go AutoRefillPreKeys(ctx, h, relayID, privKey)
+			}
+		}
+	}()
+}
+
+

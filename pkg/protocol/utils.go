@@ -24,6 +24,7 @@ type MessageEvent struct {
 	Sender    string `json:"sender"`
 	GroupID   string `json:"group_id,omitempty"`
 	Content   string `json:"content"`
+	UnixTime  int64  `json:"unix_time,omitempty"`
 }
 
 // StatusEvent represents a delivery status update for a previously sent message

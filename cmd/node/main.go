@@ -15,8 +15,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
-	"github.com/multiformats/go-multiaddr"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	"github.com/multiformats/go-multiaddr"
 
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
 	"github.com/nicabreon/meshsage/pkg/logger"
@@ -204,10 +204,8 @@ func main() {
 				}
 
 				if isInfra {
-					logger.Info().Str("peerID", remoteID.String()).Msg("IDENTIFIED INFRASTRUCTURE: Triggering Pre-Key refill, Mailbox fetch, and Notification subscription")
-					go coreproto.AutoRefillPreKeys(ctx, host, remoteID, priv)
-					go coreproto.FetchMailboxMessages(ctx, host, remoteID, priv)
-					go coreproto.SubscribeNotifications(ctx, host, remoteID, nil)
+					logger.Info().Str("peerID", remoteID.String()).Msg("IDENTIFIED INFRASTRUCTURE: Triggering Mailbox Sync Manager")
+					go coreproto.StartMailboxSync(ctx, host, remoteID, priv)
 				} else {
 					// Peer bukan infra — cek apakah sudah pernah dichat (ada session di DB).
 					// Jika ya, proaktif warm-up session agar pesan pertama langsung terenkripsi

@@ -80,11 +80,11 @@ func handleStream(s network.Stream) {
 
 // ProcessSecureEnvelope menangani dekripsi X3DH dan pemrosesan JSON payload
 func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, envelope string) {
-	// Detect and unwrap ZKP envelope if present
+	// Detect and unwrap SignedMailboxEnvelope if present
 	if strings.HasPrefix(envelope, "{") {
-		var zkpEnv ZKPEnvelope
-		if err := json.Unmarshal([]byte(envelope), &zkpEnv); err == nil && zkpEnv.Payload != "" {
-			envelope = zkpEnv.Payload
+		var signedEnv SignedMailboxEnvelope
+		if err := json.Unmarshal([]byte(envelope), &signedEnv); err == nil && signedEnv.Payload != "" {
+			envelope = signedEnv.Payload
 		}
 	}
 
@@ -420,6 +420,16 @@ func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID,
 }
 
 func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, env MessageEnvelope) {
+	if env.Sender != "" {
+		aliasHash := GetAliasCoordinate(env.Sender)
+		pubKey := h.Peerstore().PubKey(senderID)
+		var pubKeyBytes []byte
+		if pubKey != nil {
+			pubKeyBytes, _ = pubKey.Raw()
+		}
+		_ = corestore.SaveAlias(aliasHash, env.Sender, senderID.String(), pubKeyBytes)
+	}
+
 	switch env.Type {
 	case MsgTypeHandshakeAck:
 		// Silent: X3DH bidirectional handshake completed. No UI display.
@@ -549,6 +559,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 				Timestamp: ts,
 				Sender:    senderID.String(),
 				Content:   env.Content,
+				UnixTime:  env.Timestamp / 1e6,
 			})
 		}
 		// OTOMATIS: Kirim status "delivered" (Centang 2)
@@ -569,6 +580,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 					Timestamp: ts,
 					Sender:    senderID.String(),
 					Content:   env.Content,
+					UnixTime:  env.Timestamp / 1e6,
 				})
 			}
 		}
@@ -837,11 +849,14 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 	sigBytes, _ := priv.Sign(dataToSign)
 	sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
 
+	senderAlias, _ := corestore.FindAliasByPeerID(h.ID().String())
+
 	env := MessageEnvelope{
 		ID:        msgID,
 		Type:      MsgTypeText,
 		Content:   msg,
 		Timestamp: time.Now().UnixNano(),
+		Sender:    senderAlias,
 		Signature: sigB64,
 	}
 
@@ -899,12 +914,12 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 		logger.Warn().Err(err).Str("target", target.String()).Msg("transmitEnvelope: Dial failed, falling back to mailbox storage")
 	}
 
-	// Wrap envelope with ZKP for anonymous spam-proof mailbox storage
-	zkpWrapped, errZkp := WrapEnvelopeWithZKP(h, h.Peerstore().PrivKey(h.ID()), finalWireEnvelope)
-	if errZkp == nil {
-		finalWireEnvelope = zkpWrapped
+	// Wrap envelope with standard signature for spam-proof mailbox storage
+	sigWrapped, errSig := WrapEnvelopeWithSignature(h.Peerstore().PrivKey(h.ID()), finalWireEnvelope)
+	if errSig == nil {
+		finalWireEnvelope = sigWrapped
 	} else {
-		logger.Warn().Err(errZkp).Msg("Failed to wrap envelope with ZKP, sending unwrapped")
+		logger.Warn().Err(errSig).Msg("Failed to wrap envelope with standard signature, sending unwrapped")
 	}
 
 	encodedEnvelope := base64.StdEncoding.EncodeToString([]byte(finalWireEnvelope))

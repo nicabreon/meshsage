@@ -25,8 +25,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
-	"github.com/multiformats/go-multiaddr"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	"github.com/multiformats/go-multiaddr"
 
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
 	"github.com/nicabreon/meshsage/pkg/logger"
@@ -342,10 +342,8 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 					}
 				}
 				if isInfra {
-					logger.Info().Str("peerID", remoteID.String()).Msg("IDENTIFIED INFRASTRUCTURE: Triggering Pre-Key refill, Mailbox fetch, and Notification subscription")
-					go coreproto.AutoRefillPreKeys(globalCtx, host, remoteID, priv)
-					go coreproto.FetchMailboxMessages(globalCtx, host, remoteID, priv)
-					go coreproto.SubscribeNotifications(globalCtx, host, remoteID, nil)
+					logger.Info().Str("peerID", remoteID.String()).Msg("IDENTIFIED INFRASTRUCTURE: Triggering Mailbox Sync Manager")
+					go coreproto.StartMailboxSync(globalCtx, host, remoteID, priv)
 				} else {
 					// Peer bukan infra — cek apakah sudah pernah dichat (ada session di DB).
 					// Jika ya, proaktif warm-up session agar pesan pertama langsung terenkripsi
@@ -576,6 +574,21 @@ func FreeString(ptr *C.char) {
 	}
 }
 
+//export StopNode
+func StopNode() {
+	if globalHost != nil {
+		logger.Warn().Msg("Stopping the Go node...")
+		if globalCancel != nil {
+			globalCancel()
+		}
+		_ = globalHost.Close()
+		globalHost = nil
+		eventQueue.Close()
+		// Replace with fresh queue for future restarts
+		eventQueue = NewQueue()
+	}
+}
+
 //export CreateGroupProper
 func CreateGroupProper(aliasStr, groupTypeStr, membersStr *C.char) *C.char {
 	alias := C.GoString(aliasStr)
@@ -710,13 +723,16 @@ func GroupAddMember(aliasOrIDStr, memberStr *C.char) *C.char {
 	aliasOrID := C.GoString(aliasOrIDStr)
 	member := C.GoString(memberStr)
 
-	if !strings.HasPrefix(aliasOrID, "@") {
-		aliasOrID = "@" + aliasOrID
-	}
-
 	meta, err := corestore.LoadGroupMetadata(aliasOrID)
 	if err != nil {
-		return C.CString("Error: Group metadata not found: " + err.Error())
+		aliasName := aliasOrID
+		if !strings.HasPrefix(aliasName, "@") {
+			aliasName = "@" + aliasName
+		}
+		meta, err = corestore.LoadGroupMetadata(aliasName)
+		if err != nil {
+			return C.CString("Error: Group metadata not found: " + err.Error())
+		}
 	}
 
 	if meta.CreatorID != globalHost.ID().String() {
@@ -786,13 +802,16 @@ func GroupRemoveMember(aliasOrIDStr, memberStr *C.char) *C.char {
 	aliasOrID := C.GoString(aliasOrIDStr)
 	member := C.GoString(memberStr)
 
-	if !strings.HasPrefix(aliasOrID, "@") {
-		aliasOrID = "@" + aliasOrID
-	}
-
 	meta, err := corestore.LoadGroupMetadata(aliasOrID)
 	if err != nil {
-		return C.CString("Error: Group metadata not found: " + err.Error())
+		aliasName := aliasOrID
+		if !strings.HasPrefix(aliasName, "@") {
+			aliasName = "@" + aliasName
+		}
+		meta, err = corestore.LoadGroupMetadata(aliasName)
+		if err != nil {
+			return C.CString("Error: Group metadata not found: " + err.Error())
+		}
 	}
 
 	if meta.CreatorID != globalHost.ID().String() {
@@ -836,13 +855,16 @@ func GroupRemoveMember(aliasOrIDStr, memberStr *C.char) *C.char {
 func GroupExit(aliasOrIDStr *C.char) *C.char {
 	aliasOrID := C.GoString(aliasOrIDStr)
 
-	if !strings.HasPrefix(aliasOrID, "@") {
-		aliasOrID = "@" + aliasOrID
-	}
-
 	meta, err := corestore.LoadGroupMetadata(aliasOrID)
 	if err != nil {
-		return C.CString("Error: Group metadata not found: " + err.Error())
+		aliasName := aliasOrID
+		if !strings.HasPrefix(aliasName, "@") {
+			aliasName = "@" + aliasName
+		}
+		meta, err = corestore.LoadGroupMetadata(aliasName)
+		if err != nil {
+			return C.CString("Error: Group metadata not found: " + err.Error())
+		}
 	}
 
 	if meta.CreatorID == globalHost.ID().String() {
@@ -865,13 +887,16 @@ func GroupExit(aliasOrIDStr *C.char) *C.char {
 func GroupDisband(aliasOrIDStr *C.char) *C.char {
 	aliasOrID := C.GoString(aliasOrIDStr)
 
-	if !strings.HasPrefix(aliasOrID, "@") {
-		aliasOrID = "@" + aliasOrID
-	}
-
 	meta, err := corestore.LoadGroupMetadata(aliasOrID)
 	if err != nil {
-		return C.CString("Error: Group metadata not found: " + err.Error())
+		aliasName := aliasOrID
+		if !strings.HasPrefix(aliasName, "@") {
+			aliasName = "@" + aliasName
+		}
+		meta, err = corestore.LoadGroupMetadata(aliasName)
+		if err != nil {
+			return C.CString("Error: Group metadata not found: " + err.Error())
+		}
 	}
 
 	if meta.CreatorID != globalHost.ID().String() {
@@ -1007,7 +1032,31 @@ func GetJoinedGroups() *C.char {
 	return C.CString(string(bytes))
 }
 
+//export TriggerMailboxFetch
+func TriggerMailboxFetch() *C.char {
+	if globalHost == nil {
+		return C.CString("Error: Node not started")
+	}
+	priv := globalHost.Peerstore().PrivKey(globalHost.ID())
+	fetchedCount := 0
+	for _, p := range globalHost.Network().Peers() {
+		protos, _ := globalHost.Peerstore().GetProtocols(p)
+		isRelay := false
+		for _, proto := range protos {
+			if string(proto) == "/p2p-core/mailbox/1.0.0" {
+				isRelay = true
+				break
+			}
+		}
+		if isRelay {
+			logger.Info().Str("peerID", p.String()).Msg("FFI: Triggering manual mailbox fetch")
+			go coreproto.FetchMailboxMessages(globalCtx, globalHost, p, priv)
+			fetchedCount++
+		}
+	}
+	return C.CString(fmt.Sprintf("Triggered fetch on %d relays", fetchedCount))
+}
+
 func main() {
 	// Mandatory main for C-shared libraries, but unused
 }
-
