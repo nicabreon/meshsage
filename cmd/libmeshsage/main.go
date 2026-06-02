@@ -444,6 +444,15 @@ func SendDirectMessage(targetStr, contentStr *C.char) *C.char {
 	content := C.GoString(contentStr)
 
 	if strings.HasPrefix(target, "@") {
+		// 1. Check local DB first for group metadata
+		if _, errMeta := corestore.LoadGroupMetadata(target); errMeta == nil {
+			return C.CString("Failed to resolve alias: " + target + " is a group alias, cannot send private messages to it")
+		}
+		// 2. Check remote group metadata
+		if meta, errGroup := coreproto.ResolveGroupMetadata(globalCtx, globalHost, target); errGroup == nil && meta.GroupID != "" {
+			return C.CString("Failed to resolve alias: " + target + " is a group alias, cannot send private messages to it")
+		}
+
 		resolved, err := coreproto.ResolveAlias(globalCtx, globalHost, target)
 		if err != nil {
 			return C.CString("Failed to resolve alias " + target + ": " + err.Error())
@@ -644,7 +653,7 @@ func CreateGroupProper(aliasStr, groupTypeStr, membersStr *C.char) *C.char {
 	}
 
 	// Join Group locally
-	errJoin := coreproto.JoinGroupProper(globalCtx, globalHost, privKey, groupID, alias, globalHost.ID().String(), groupType, sigB64, members)
+	errJoin := coreproto.JoinGroupProper(globalCtx, globalHost, privKey, groupID, alias, globalHost.ID().String(), groupType, sigB64, createdAt, members)
 	if errJoin != nil {
 		return C.CString("Error: Failed to join group locally: " + errJoin.Error())
 	}
@@ -704,7 +713,7 @@ func JoinGroupProper(aliasStr *C.char) *C.char {
 	privKey := globalHost.Peerstore().PrivKey(globalHost.ID())
 
 	// Join locally
-	errJoin := coreproto.JoinGroupProper(globalCtx, globalHost, privKey, meta.GroupID, meta.GroupAlias, meta.CreatorID, meta.GroupType, meta.Signature, []string{})
+	errJoin := coreproto.JoinGroupProper(globalCtx, globalHost, privKey, meta.GroupID, meta.GroupAlias, meta.CreatorID, meta.GroupType, meta.Signature, meta.CreatedAt, []string{})
 	if errJoin != nil {
 		return C.CString("Error: Failed to join group: " + errJoin.Error())
 	}

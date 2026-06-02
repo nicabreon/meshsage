@@ -524,7 +524,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 			}
 			
 			errJoin := JoinGroupProper(ctx, h, h.Peerstore().PrivKey(h.ID()),
-				invite.Meta.GroupID, invite.Meta.GroupAlias, invite.Meta.CreatorID, invite.Meta.GroupType, invite.Meta.Signature, invite.Members)
+				invite.Meta.GroupID, invite.Meta.GroupAlias, invite.Meta.CreatorID, invite.Meta.GroupType, invite.Meta.Signature, invite.Meta.CreatedAt, invite.Members)
 			if errJoin != nil {
 				logger.Error().Err(errJoin).Str("group", invite.Meta.GroupAlias).Msg("Failed to join group in GINVITE handler")
 			}
@@ -990,6 +990,14 @@ func resolveTargetPeerID(ctx context.Context, h host.Host, targetStr string) (pe
 		aliasToResolve = "@" + aliasToResolve
 	}
 
+	// Exclude group aliases
+	if _, errMeta := corestore.LoadGroupMetadata(aliasToResolve); errMeta == nil {
+		return "", fmt.Errorf("'%s' is a group alias, cannot send private messages to it", aliasToResolve)
+	}
+	if meta, errGroup := ResolveGroupMetadata(ctx, h, aliasToResolve); errGroup == nil && meta.GroupID != "" {
+		return "", fmt.Errorf("'%s' is a group alias, cannot send private messages to it", aliasToResolve)
+	}
+
 	resolved, err := ResolveAlias(ctx, h, aliasToResolve)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve alias %s: %w", aliasToResolve, err)
@@ -1069,7 +1077,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 			}
 
 			// Join Group locally
-			errJoin := JoinGroupProper(ctx, h, privKey, groupID, alias, h.ID().String(), gtype, sigB64, members)
+			errJoin := JoinGroupProper(ctx, h, privKey, groupID, alias, h.ID().String(), gtype, sigB64, createdAt, members)
 			if errJoin == nil {
 				// Send Invitations to members (GINVITE)
 				localKey, _ := corestore.GetGroupLocalKey(groupID)
@@ -1132,7 +1140,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 			privKey := h.Peerstore().PrivKey(h.ID())
 			
 			// Join locally
-			errJoin := JoinGroupProper(ctx, h, privKey, meta.GroupID, meta.GroupAlias, meta.CreatorID, meta.GroupType, meta.Signature, []string{})
+			errJoin := JoinGroupProper(ctx, h, privKey, meta.GroupID, meta.GroupAlias, meta.CreatorID, meta.GroupType, meta.Signature, meta.CreatedAt, []string{})
 			if errJoin == nil {
 				// Broadcast GCMD:JOIN to the group so online members share GKEYs with us
 				payload := fmt.Sprintf("GCMD:JOIN:%s", h.ID().String())

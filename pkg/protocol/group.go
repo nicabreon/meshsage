@@ -159,11 +159,11 @@ func JoinGroup(ctx context.Context, h host.Host, priv crypto.PrivKey, groupID st
 	// Replaced by JoinGroupProper. We keep this empty or delegate to it with default values for compatibility.
 	alias := "@" + groupID
 	signature := ""
-	return JoinGroupProper(ctx, h, priv, groupID, alias, h.ID().String(), "SECURE", signature, members)
+	return JoinGroupProper(ctx, h, priv, groupID, alias, h.ID().String(), "SECURE", signature, time.Now().Unix(), members)
 }
 
 // JoinGroupProper joins a GossipSub topic, initializes Group Metadata/Members, and sets up keys
-func JoinGroupProper(ctx context.Context, h host.Host, priv crypto.PrivKey, groupID, groupAlias, creatorID, groupType, signature string, members []string) error {
+func JoinGroupProper(ctx context.Context, h host.Host, priv crypto.PrivKey, groupID, groupAlias, creatorID, groupType, signature string, createdAt int64, members []string) error {
 	groupsMutex.Lock()
 	defer groupsMutex.Unlock()
 
@@ -189,12 +189,15 @@ func JoinGroupProper(ctx context.Context, h host.Host, priv crypto.PrivKey, grou
 	}
 
 	// 3. Save group metadata to local SQLite
+	if createdAt == 0 {
+		createdAt = time.Now().Unix()
+	}
 	meta := corestore.GroupMetadata{
 		GroupID:    groupID,
 		GroupAlias: groupAlias,
 		CreatorID:  creatorID,
 		GroupType:  groupType,
-		CreatedAt:  time.Now().Unix(),
+		CreatedAt:  createdAt,
 		Signature:  signature,
 	}
 	_ = corestore.SaveGroupMetadata(meta)
@@ -688,7 +691,7 @@ func RestoreGroups(ctx context.Context, h host.Host, priv crypto.PrivKey) error 
 				for _, m := range membersV2 {
 					members = append(members, m.PeerID)
 				}
-				err = JoinGroupProper(ctx, h, priv, meta.GroupID, meta.GroupAlias, meta.CreatorID, meta.GroupType, meta.Signature, members)
+				err = JoinGroupProper(ctx, h, priv, meta.GroupID, meta.GroupAlias, meta.CreatorID, meta.GroupType, meta.Signature, meta.CreatedAt, members)
 				if err != nil {
 					logger.Error().Err(err).Str("groupID", gid).Msg("Failed to auto-restore group")
 				} else {

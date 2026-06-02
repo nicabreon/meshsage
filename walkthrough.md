@@ -304,5 +304,57 @@ Previously, there was no proactive check or handshake setup when known chat peer
 - Recompiled Android native shared libraries (`libmeshsage.so`) and packaging.
 - Rebuilt and packaged the Flutter release APK (`meshsage.apk`) successfully.
 
+---
+
+## Walkthrough: Fixed Group Invite Signature Verification (Timestamp Drift Fix)
+
+### Problem Solved
+When a client received a group invitation (`GINVITE`), they failed to join with the error:
+`[16:58:07] 2026-06-02T09:58:07Z ERR Received GINVITE with INVALID signature! group=@kesinidulu`
+
+This was caused by a split-second difference (timestamp drift) between the metadata signature creation and when the metadata was actually stored in the database:
+1. During group creation (`CreateGroupProper`), the creator generated `createdAt = time.Now().Unix()` and signed the group metadata using it.
+2. The creator then called `JoinGroupProper`, which saved the metadata to the database, but overrode `CreatedAt` with a newly generated `time.Now().Unix()`.
+3. When adding members, the creator loaded the metadata from the database (with the drifted timestamp) and sent it in the `GINVITE` payload.
+4. The recipient calculated the signature verification payload using the drifted `createdAt` timestamp from the database. Because it differed from the originally signed timestamp, the signature verification failed.
+
+### Changes Made
+1. **Parameter Addition**: Modified `JoinGroupProper` in `group.go` to accept `createdAt int64`. If `createdAt` is `0`, it defaults to `time.Now().Unix()`.
+2. **Propagated Correct Timestamp**:
+   - In `messaging.go`, updated the `GINVITE` incoming handler, the `/group-create` local command handler, and the `/group-join` local command handler to pass the correct `createdAt` timestamp.
+   - In `main.go`, updated `CreateGroupProper` and `JoinGroupProper` FFI functions to pass the signed `createdAt` / `meta.CreatedAt` timestamp to the core Go library.
+
+### Verification Results
+1. **Unit Tests**: All 19 unit tests in `pkg/protocol` compiled and passed successfully:
+   ```text
+   ok  	github.com/nicabreon/meshsage/pkg/protocol	0.902s
+   ```
+2. **Android Builds**:
+   - Recompiled native Android libraries (`libmeshsage.so`) for all architectures (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`).
+   - Rebuilt the Flutter release APK (`meshsage.apk`) successfully and copied it to the workspace directory.
+
+---
+
+## Walkthrough: Offline Invitation Envelope Sorting & Group Alias PM Block
+
+### Problem Solved
+1. **Offline Invitation Decryption Failure:** When a group creator invited an offline member, they sent a `GINVITE` (carried in an `X3DH` envelope) and then immediately sent group messages (carried in `DR` envelopes). When the invitee came online and fetched messages from their mailbox, the mailbox relay returned these envelopes without guaranteeing delivery order. If a `DR` envelope was processed before the `X3DH` handshake envelope, the recipient node could not decrypt it because no secure session existed yet. This triggered a `REQUEST_X3DH` reset back to the creator, which erased the creator's active session, causing permanent decryption failures and infinite handshake loops.
+2. **Private Messages to Group Aliases:** Group aliases are registered on the DHT to point to the creator's Peer ID (so members can resolve group metadata). However, running `/msg @group_alias` in the CLI/TUI or calling the `SendDirectMessage` FFI function with a group alias resolved to the creator's Peer ID and mistakenly delivered private messages to the group creator.
+
+### Changes Made
+
+#### 1. Go Backend: Mailbox Envelope Sorting
+- Modified `FetchMailboxMessages` in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go) to buffer all fetched envelopes into a slice during the read loop.
+- Sorted the slice stable so that payloads starting with `X3DH:` are placed first.
+- Processed the sorted envelopes sequentially using `ProcessSecureEnvelope` so that cryptographic handshakes are fully established before any Double Ratchet (DR) messages are decrypted.
+
+#### 2. Go Backend: Block PM to Group Aliases
+- Modified `resolveTargetPeerID` in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go) to verify if the target alias represents a group by checking local group metadata database (`LoadGroupMetadata`) or querying remote group metadata (`ResolveGroupMetadata`). If it is a group, the resolution is rejected with an error: `'@group_alias' is a group alias, cannot send private messages to it`.
+- Added the same verification steps to the FFI entrypoint `SendDirectMessage` in [main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/libmeshsage/main.go) to return: `Failed to resolve alias: @group_alias is a group alias, cannot send private messages to it`.
+
+### Verification Results
+1. **Unit Tests:** All unit tests in `pkg/protocol/...` passed successfully.
+2. **E2E Swarm Tests:** Ran the full E2E swarm test suite (`./test_groups_e2e.sh`), confirming that secure closed/open group invitations, join operations, key updates, and exits work perfectly.
+3. **Flutter App Recompile:** Rebuilt the native library binaries using `./build_android.sh` and successfully recompiled the Flutter Android APK (`meshsage.apk`).
 
 

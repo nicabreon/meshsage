@@ -64,6 +64,23 @@ CREATE TABLE IF NOT EXISTS group_members_v2 (
     joined_at INTEGER NOT NULL,
     PRIMARY KEY (group_id, peer_id)
 );
+
+-- 3. Store rolling history of locally generated group encryption keys
+CREATE TABLE IF NOT EXISTS group_local_key_history (
+    group_id TEXT,
+    key_data TEXT,
+    created_at INTEGER,
+    PRIMARY KEY (group_id, key_data)
+);
+
+-- 4. Store rolling history of other members' group encryption keys
+CREATE TABLE IF NOT EXISTS group_sender_key_history (
+    group_id TEXT,
+    sender_id TEXT,
+    key_data TEXT,
+    created_at INTEGER,
+    PRIMARY KEY (group_id, sender_id, key_data)
+);
 ```
 
 ---

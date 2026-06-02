@@ -93,7 +93,7 @@ graph TD
    - **X3DH** for ephemeral Diffie-Hellman key exchange.
    - **Double Ratchet** to rotate message keys on every sent and received envelope.
    - **Ed25519 Signatures** for payload authenticity and non-repudiation.
-4. **Local Storage (SQLite)**: Persists session states, messages, skipped keys, pre-keys, alias mappings, and group configurations. Runs in WAL (Write-Ahead Logging) mode to support safe concurrent reads/writes from background threads.
+4. **Local Storage (SQLite)**: Persists session states, messages, skipped keys, pre-keys, alias mappings, and group configurations. Supports automatic schema versioning/migration (`EnsureColumn` and `PRAGMA user_version`) and runs in WAL (Write-Ahead Logging) mode to support safe concurrent reads/writes from background threads.
 5. **libp2p Stack**: Handles multiplexing, encryption (TLS/Noise), NAT traversal, DHT routing (Kademlia), real-time broadcast pub/sub (GossipSub), and direct block transfers (Bitswap).
 
 ---
@@ -104,6 +104,8 @@ The Mailbox Subsystem stores messages when a peer is offline and delivers them w
 - **DHT Coordinate-Based Hashing**: Mailbox coordinate `coord = SHA256(PeerID + "mailbox")`.
 - **Relay Redundancy**: Messages are distributed to up to 3 closest active relay/infrastructure nodes.
 - **Push Notifications**: Live wake-up signals over a dedicated Notification stream.
+- **Standard Cryptographic Signatures**: Authenticates mailbox store requests (anti-spam) using standard libp2p cryptographic signatures on `SignedMailboxEnvelope` payloads.
+- **Mailbox Sync Manager**: Orchestrates concurrent push notification monitoring, 2-second fast polling, and 30-second background prekey stock refill checks.
 - **Metadata Replication**: GossipSub synchronization across relay nodes for cluster state safety.
 
 ```mermaid
@@ -124,9 +126,10 @@ sequenceDiagram
         Alice->>Alice: Compute coordinate:<br/>coord = SHA256(Bob_PeerID + "mailbox")
         Alice->>Alice: Query DHT / Search infra list for up to 3 closest Relay Nodes
         Alice->>Relay: Connect via /p2p-core/mailbox/1.0.0
-        Alice->>Relay: Send: STORE <msgHash> <coord> <Alice_Pubkey> <Encrypted_Payload>
+        Alice->>Relay: Send: STORE <msgHash> <coord> <Alice_Pubkey> <SignedMailboxEnvelope_JSON>
         
         activate Relay
+        Relay->>Relay: Verify envelope signature using Alice_Pubkey
         Relay->>Relay: Save message to local SQLite mailbox table
         Relay-->>Alice: Respond with "OK" (ACK)
         deactivate Relay
@@ -155,7 +158,7 @@ sequenceDiagram
         Relay->>Relay: Query SQLite for messages matching <coord>
         
         loop For each message found
-            Relay->>Bob: Send: MSG <msgHash> <Alice_Pubkey> <Encrypted_Payload>
+            Relay->>Bob: Send: MSG <msgHash> <Alice_Pubkey> <SignedMailboxEnvelope_JSON>
         end
         
         Relay->>Bob: Send: DONE
@@ -168,6 +171,7 @@ sequenceDiagram
             Note over Relay: Other relays delete the purged message from their cache
         end
     end
+
 
     %% Decryption Phase
     Note over Bob: Bob processes incoming envelopes,<br/>ratchets sessions, and decrypts payloads.

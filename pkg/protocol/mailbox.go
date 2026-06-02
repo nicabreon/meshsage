@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -456,7 +457,13 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 	}
 	buf := bufio.NewReader(s)
 
+	type fetchedEnvelope struct {
+		senderID peer.ID
+		payload  string
+	}
+	var fetched []fetchedEnvelope
 	foundCount := 0
+
 	for {
 		_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
 		line, err := buf.ReadString('\n')
@@ -514,7 +521,24 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 			logger.Warn().Str("hash", msgHash).Msg("Mailbox: could not derive senderID, skipping message")
 			continue
 		}
-		ProcessSecureEnvelope(ctx, h, senderID, string(payload))
+		fetched = append(fetched, fetchedEnvelope{
+			senderID: senderID,
+			payload:  string(payload),
+		})
+	}
+
+	// Sort stable so X3DH handshakes are processed before DR messages
+	sort.SliceStable(fetched, func(i, j int) bool {
+		isX3DHi := strings.HasPrefix(fetched[i].payload, "X3DH:")
+		isX3DHj := strings.HasPrefix(fetched[j].payload, "X3DH:")
+		if isX3DHi && !isX3DHj {
+			return true
+		}
+		return false
+	})
+
+	for _, msg := range fetched {
+		ProcessSecureEnvelope(ctx, h, msg.senderID, msg.payload)
 	}
 }
 
