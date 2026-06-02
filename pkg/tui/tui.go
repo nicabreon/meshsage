@@ -24,8 +24,8 @@ var (
 	statusMu      sync.Mutex
 )
 
-type logMsg []byte
-type chatMsg []byte
+type logMsg string
+type chatMsg string
 type statusUpdateMsg string
 
 type logWriter struct {
@@ -34,7 +34,7 @@ type logWriter struct {
 
 func (w *logWriter) Write(p []byte) (n int, err error) {
 	if w.program != nil {
-		w.program.Send(logMsg(p))
+		w.program.Send(logMsg(string(p)))
 	}
 	return len(p), nil
 }
@@ -45,7 +45,7 @@ type chatWriter struct {
 
 func (w *chatWriter) Write(p []byte) (n int, err error) {
 	if w.program != nil {
-		w.program.Send(chatMsg(p))
+		w.program.Send(chatMsg(string(p)))
 	}
 	return len(p), nil
 }

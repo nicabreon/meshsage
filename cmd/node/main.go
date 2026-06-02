@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 
@@ -180,10 +181,17 @@ func main() {
 
 			// Wait a moment for protocol negotiation to finish
 			go func() {
-				time.Sleep(2 * time.Second)
-				protos, err := host.Peerstore().GetProtocols(remoteID)
-				if err != nil {
-					logger.Debug().Err(err).Str("peerID", remoteID.String()).Msg("Failed to get peer protocols")
+				var protos []protocol.ID
+				var err error
+				for i := 0; i < 5; i++ {
+					time.Sleep(2 * time.Second)
+					protos, err = host.Peerstore().GetProtocols(remoteID)
+					if err == nil && len(protos) > 0 {
+						break
+					}
+				}
+				if len(protos) == 0 {
+					logger.Debug().Str("peerID", remoteID.String()).Msg("Failed to negotiate protocols (no protocols found after timeout)")
 					return
 				}
 
@@ -201,7 +209,15 @@ func main() {
 					go coreproto.FetchMailboxMessages(ctx, host, remoteID, priv)
 					go coreproto.SubscribeNotifications(ctx, host, remoteID, nil)
 				} else {
-					logger.Debug().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure)")
+					// Peer bukan infra — cek apakah sudah pernah dichat (ada session di DB).
+					// Jika ya, proaktif warm-up session agar pesan pertama langsung terenkripsi
+					// dengan DR tanpa delay X3DH saat user kirim.
+					if corestore.HasSession(remoteID.String()) {
+						logger.Info().Str("peerID", remoteID.String()).Msg("Known chat peer reconnected — probing session warm-up")
+						go coreproto.ProbeSessionWarmup(ctx, host, priv, remoteID)
+					} else {
+						logger.Debug().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure, no existing session)")
+					}
 				}
 			}()
 		},

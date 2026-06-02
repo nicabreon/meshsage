@@ -234,6 +234,21 @@ func handleMailboxStream(h host.Host, s network.Stream) {
 				return
 			}
 
+			// Verify ZKP signature to prevent spam on mailboxes
+			envBytes, errDec := base64.StdEncoding.DecodeString(payload)
+			if errDec != nil {
+				logger.Warn().Err(errDec).Msg("REJECTED: Invalid base64 payload")
+				s.Write([]byte("ERROR_INVALID_PAYLOAD\n"))
+				return
+			}
+
+			valid, errZkp := VerifyZKPEnvelope(string(envBytes))
+			if errZkp != nil || !valid {
+				logger.Warn().Err(errZkp).Msg("REJECTED: ZKP verification failed (spammer or invalid membership proof)")
+				s.Write([]byte("ERROR_ZKP_VERIFICATION_FAILED\n"))
+				return
+			}
+
 			err := corestore.SaveMailboxMessage(msgHash, coord, senderPubkey, payload)
 			if err != nil {
 				logger.Error().Err(err).Msg("Database error while saving mailbox message")

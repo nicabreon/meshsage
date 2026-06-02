@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
+	"github.com/nicabreon/meshsage/pkg/crypto"
 	_ "modernc.org/sqlite"
 )
 
@@ -174,6 +176,14 @@ func InitDatabase(dbPath string) error {
 		role TEXT CHECK(role IN ('CREATOR', 'MEMBER')) DEFAULT 'MEMBER',
 		joined_at INTEGER NOT NULL,
 		PRIMARY KEY (group_id, peer_id)
+	);
+
+	-- Create zkp_members table for ZKP public keys of active members
+	CREATE TABLE IF NOT EXISTS zkp_members (
+		peer_id TEXT PRIMARY KEY,
+		zkp_x TEXT NOT NULL,
+		zkp_y TEXT NOT NULL,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	_, err = DB.Exec(query)
@@ -280,6 +290,13 @@ func DeletePublicPreKeysByOwner(ownerID string) error {
 func DeletePreKeyByID(keyID string) error {
 	if DB == nil { return fmt.Errorf("database not initialized") }
 	_, err := DB.Exec("DELETE FROM prekeys WHERE key_id = ?", keyID)
+	return err
+}
+
+// DeletePublicPreKeyByID deletes a pre-key by ID only if its private_key column is NULL or empty string.
+func DeletePublicPreKeyByID(keyID string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec("DELETE FROM prekeys WHERE key_id = ? AND (private_key IS NULL OR private_key = '')", keyID)
 	return err
 }
 
@@ -468,6 +485,17 @@ func DeleteSession(peerID string) error {
 	// Also clear skipped keys
 	_ = ClearSkippedKeys(peerID)
 	return nil
+}
+
+// HasSession returns true if a Double Ratchet session exists for the given peerID.
+// Used for proactive session warm-up: when a known peer reconnects, we can
+// immediately probe them to ensure the bidirectional DR session is healthy
+// before the user sends the first message.
+func HasSession(peerID string) bool {
+	if DB == nil { return false }
+	var count int
+	err := DB.QueryRow(`SELECT COUNT(1) FROM sessions WHERE peer_id = ? AND root_key != ''`, peerID).Scan(&count)
+	return err == nil && count > 0
 }
 
 // SaveAlias persists an alias record to the database
@@ -788,6 +816,45 @@ func DeleteGroupMetadata(groupID string) error {
 	_, err2 := DB.Exec(`DELETE FROM group_members_v2 WHERE group_id = ?`, groupID)
 	if err1 != nil { return err1 }
 	return err2
+}
+
+// SaveZKPMember stores a ZKP public key for a member
+func SaveZKPMember(peerID string, xB64 string, yB64 string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec("INSERT OR REPLACE INTO zkp_members (peer_id, zkp_x, zkp_y) VALUES (?, ?, ?)", peerID, xB64, yB64)
+	return err
+}
+
+// GetZKPMembers retrieves all active ZKP member public keys
+func GetZKPMembers() (map[string]crypto.PubKeyPoint, error) {
+	if DB == nil { return nil, fmt.Errorf("database not initialized") }
+	rows, err := DB.Query("SELECT peer_id, zkp_x, zkp_y FROM zkp_members")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	members := make(map[string]crypto.PubKeyPoint)
+	for rows.Next() {
+		var peerID, xB64, yB64 string
+		if err := rows.Scan(&peerID, &xB64, &yB64); err != nil {
+			return nil, err
+		}
+		xBytes, _ := base64.StdEncoding.DecodeString(xB64)
+		yBytes, _ := base64.StdEncoding.DecodeString(yB64)
+		members[peerID] = crypto.PubKeyPoint{
+			X: new(big.Int).SetBytes(xBytes),
+			Y: new(big.Int).SetBytes(yBytes),
+		}
+	}
+	return members, nil
+}
+
+// CleanZKPMembersExceptOwner deletes all ZKP members except the specified owner ID
+func CleanZKPMembersExceptOwner(ownerID string) error {
+	if DB == nil { return fmt.Errorf("database not initialized") }
+	_, err := DB.Exec("DELETE FROM zkp_members WHERE peer_id != ?", ownerID)
+	return err
 }
 
 

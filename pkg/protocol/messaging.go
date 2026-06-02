@@ -35,6 +35,15 @@ const MessagingProtocolID = "/p2p-core/msg/1.0.0"
 var (
 	localHost    host.Host
 	sessionLocks sync.Map // map[peerID string]*sync.Mutex
+
+	// x3dhRequestCooldown mencegah REQUEST_X3DH storm:
+	// ketika banyak pesan gagal didekripsi secara bersamaan (misal saat mailbox fetch
+	// mendapat 9 pesan dan semua gagal karena tidak ada sesi), setiap pesan akan
+	// memanggil sendRequestX3DH. Tanpa cooldown ini, 9 REQUEST_X3DH dikirim
+	// ke sender yang sama dalam milidetik → sender membalas 9 handshake → loop.
+	// Map ini menyimpan waktu terakhir REQUEST_X3DH dikirim per peerID.
+	// Cooldown: 30 detik per peer.
+	x3dhRequestCooldown sync.Map // map[peerID string]time.Time
 )
 
 // getSessionLock mengembalikan mutex khusus untuk peerID tertentu.
@@ -71,8 +80,18 @@ func handleStream(s network.Stream) {
 
 // ProcessSecureEnvelope menangani dekripsi X3DH dan pemrosesan JSON payload
 func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, envelope string) {
+	// Detect and unwrap ZKP envelope if present
+	if strings.HasPrefix(envelope, "{") {
+		var zkpEnv ZKPEnvelope
+		if err := json.Unmarshal([]byte(envelope), &zkpEnv); err == nil && zkpEnv.Payload != "" {
+			envelope = zkpEnv.Payload
+		}
+	}
+
 	var aesKey []byte
 	var encryptedPayloadB64 string
+	var isX3DH bool
+	var keyID string
 
 	if strings.HasPrefix(envelope, "RESET:") {
 		parts := strings.SplitN(envelope, ":", 3)
@@ -253,7 +272,8 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		parts := strings.SplitN(envelope, ":", 5)
 		if len(parts) < 4 { return }
 		
-		keyID := parts[1]
+		isX3DH = true
+		keyID = parts[1]
 		ePubB64 := parts[2]
 		// Dukung format lama (4 parts) dan baru (5 parts dengan ratchetPub)
 		var senderRatchetPubB64 string
@@ -352,6 +372,15 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		// Ask sender to restart with a new X3DH
 		go sendRequestX3DH(ctx, h, senderID)
 		return
+	}
+
+	// If this was an X3DH handshake, delete the consumed pre-key only after successful decryption
+	if isX3DH {
+		if err := corestore.DeletePreKeyByID(keyID); err != nil {
+			logger.Warn().Err(err).Str("keyID", keyID).Msg("Failed to delete consumed pre-key from local DB")
+		} else {
+			logger.Info().Str("keyID", keyID).Msg("Successfully deleted consumed pre-key from local DB after handshake decryption")
+		}
 	}
 
 	// X3DH Handshake ACK: send a silent ack back to the initiator.
@@ -720,8 +749,28 @@ func SendSessionReset(ctx context.Context, h host.Host, targetID peer.ID) error 
 // sendRequestX3DH sends a lightweight signal to the target peer asking them
 // to clear their local session and re-initiate a fresh X3DH handshake.
 // This is used instead of RESET to break the mutual-reset deadlock.
+//
+// Rate-limited: maksimal 1 sinyal per peer per 30 detik. Ini mencegah
+// REQUEST_X3DH storm ketika banyak pesan dari mailbox gagal didekripsi
+// secara bersamaan — semua pesan gagal tersebut akan dicoba kirim REQUEST_X3DH
+// tapi hanya 1 yang benar-benar terkirim, sisanya di-skip.
 func sendRequestX3DH(ctx context.Context, h host.Host, targetID peer.ID) {
-	logger.Info().Str("targetID", targetID.String()).Msg("Sending REQUEST_X3DH signal to peer")
+	const cooldownDuration = 30 * time.Second
+	peerKey := targetID.String()
+
+	now := time.Now()
+	if lastVal, ok := x3dhRequestCooldown.Load(peerKey); ok {
+		if lastTime, ok := lastVal.(time.Time); ok && now.Sub(lastTime) < cooldownDuration {
+			logger.Debug().
+				Str("targetID", peerKey).
+				Dur("remaining", cooldownDuration-now.Sub(lastTime)).
+				Msg("sendRequestX3DH: skipped (cooldown active)")
+			return
+		}
+	}
+	x3dhRequestCooldown.Store(peerKey, now)
+
+	logger.Info().Str("targetID", peerKey).Msg("Sending REQUEST_X3DH signal to peer")
 	_ = transmitEnvelope(ctx, h, targetID, "REQUEST_X3DH")
 }
 
@@ -750,6 +799,32 @@ func sendHandshakeAck(ctx context.Context, h host.Host, targetID peer.ID) {
 		logger.Debug().Err(err).Str("targetID", targetID.String()).Msg("sendHandshakeAck: failed to send ACK (peer may be offline, will recover on next message)")
 	} else {
 		logger.Info().Str("targetID", targetID.String()).Msg("sendHandshakeAck: X3DH ACK sent — bidirectional session is now complete")
+	}
+}
+
+// ProbeSessionWarmup is proactively called when a known chat peer connects.
+// It sends a silent handshake ACK to warm up the Double Ratchet session
+// and verify bidirectional health before the user actually sends a message.
+func ProbeSessionWarmup(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID) {
+	if priv == nil {
+		logger.Warn().Str("targetID", targetID.String()).Msg("ProbeSessionWarmup: local private key not available, skipping probe")
+		return
+	}
+	if !corestore.HasSession(targetID.String()) {
+		logger.Debug().Str("targetID", targetID.String()).Msg("ProbeSessionWarmup: no session exists, skipping probe")
+		return
+	}
+	probeID := fmt.Sprintf("probe-%x", sha256.Sum256([]byte(targetID.String()+time.Now().String())))[:12]
+	probeEnv := MessageEnvelope{
+		ID:        probeID,
+		Type:      MsgTypeHandshakeAck,
+		Timestamp: time.Now().UnixNano(),
+	}
+	logger.Info().Str("targetID", targetID.String()).Msg("ProbeSessionWarmup: sending proactive session warm-up probe")
+	if err := sendSecureEnvelope(ctx, h, priv, targetID, probeEnv); err != nil {
+		logger.Debug().Err(err).Str("targetID", targetID.String()).Msg("ProbeSessionWarmup: failed to send probe (peer might have gone offline)")
+	} else {
+		logger.Info().Str("targetID", targetID.String()).Msg("ProbeSessionWarmup: session warm-up probe successfully sent")
 	}
 }
 
@@ -796,7 +871,7 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 	}
 
 	logger.Debug().Str("target", target.String()).Msg("transmitEnvelope: Attempting dial to target (direct/relay)")
-	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 	s, err := h.NewStream(dialCtx, target, MessagingProtocolID)
 	if err == nil {
@@ -823,6 +898,15 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 	} else {
 		logger.Warn().Err(err).Str("target", target.String()).Msg("transmitEnvelope: Dial failed, falling back to mailbox storage")
 	}
+
+	// Wrap envelope with ZKP for anonymous spam-proof mailbox storage
+	zkpWrapped, errZkp := WrapEnvelopeWithZKP(h, h.Peerstore().PrivKey(h.ID()), finalWireEnvelope)
+	if errZkp == nil {
+		finalWireEnvelope = zkpWrapped
+	} else {
+		logger.Warn().Err(errZkp).Msg("Failed to wrap envelope with ZKP, sending unwrapped")
+	}
+
 	encodedEnvelope := base64.StdEncoding.EncodeToString([]byte(finalWireEnvelope))
 	// Pass the actual marshalled public key (not the peer ID string) so the
 	// receiver can correctly reconstruct the sender peer ID when fetching from mailbox.
@@ -877,6 +961,28 @@ func StartChatPrompt(ctx context.Context, h host.Host, priv crypto.PrivKey) {
 	}()
 }
 
+func resolveTargetPeerID(ctx context.Context, h host.Host, targetStr string) (peer.ID, error) {
+	// First, if it doesn't look like an alias (doesn't start with @), try to decode it directly
+	if !strings.HasPrefix(targetStr, "@") {
+		if targetID, err := peer.Decode(targetStr); err == nil {
+			return targetID, nil
+		}
+	}
+
+	// Otherwise, treat it as an alias (prepend @ if missing)
+	aliasToResolve := targetStr
+	if !strings.HasPrefix(aliasToResolve, "@") {
+		aliasToResolve = "@" + aliasToResolve
+	}
+
+	resolved, err := ResolveAlias(ctx, h, aliasToResolve)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve alias %s: %w", aliasToResolve, err)
+	}
+
+	return peer.Decode(resolved)
+}
+
 func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgStr string) {
 	msgStr = strings.TrimSpace(msgStr)
 	if msgStr == "" { return }
@@ -884,18 +990,15 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 	if strings.HasPrefix(msgStr, "/latency ") {
 		parts := strings.SplitN(msgStr, " ", 2)
 		if len(parts) == 2 {
-			targetStr := parts[1]
-			if strings.HasPrefix(targetStr, "@") {
-				resolved, err := ResolveAlias(ctx, h, targetStr)
-				if err == nil { targetStr = resolved }
-			}
-			targetID, err := peer.Decode(targetStr)
+			targetID, err := resolveTargetPeerID(ctx, h, parts[1])
 			if err == nil {
 				pings := ping.Ping(ctx, h, targetID)
 				for i := 0; i < 3; i++ {
 					res := <-pings
 					if res.Error == nil { logger.Displayf("[Latency] Ping %d: %v\n", i+1, res.RTT) }
 				}
+			} else {
+				logger.Displayf("[Error] Failed to resolve target '%s': %v\n", parts[1], err)
 			}
 		}
 		return
@@ -1321,17 +1424,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 	if strings.HasPrefix(msgStr, "/reset-session ") {
 		parts := strings.SplitN(msgStr, " ", 2)
 		if len(parts) == 2 {
-			targetStr := parts[1]
-			if strings.HasPrefix(targetStr, "@") {
-				resolved, err := ResolveAlias(ctx, h, targetStr)
-				if err == nil {
-					targetStr = resolved
-				} else {
-					logger.Displayf("[Error] Failed to resolve alias %s: %v\n", parts[1], err)
-					return
-				}
-			}
-			targetID, err := peer.Decode(targetStr)
+			targetID, err := resolveTargetPeerID(ctx, h, parts[1])
 			if err == nil {
 				errReset := SendSessionReset(ctx, h, targetID)
 				if errReset == nil {
@@ -1340,7 +1433,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 					logger.Displayf("[Error] Failed to send reset signal to %s: %v\n", parts[1], errReset)
 				}
 			} else {
-				logger.Displayf("[Error] Invalid Peer ID: %s\n", targetStr)
+				logger.Displayf("[Error] Failed to resolve target '%s': %v\n", parts[1], err)
 			}
 		} else {
 			logger.Displayf("[Error] Use: /reset-session <peerID_or_alias>\n")
@@ -1383,20 +1476,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 	if strings.HasPrefix(msgStr, "/send ") || strings.HasPrefix(msgStr, "/msg ") {
 		parts := strings.SplitN(msgStr, " ", 3)
 		if len(parts) == 3 {
-			targetStr := parts[1]
-			if strings.HasPrefix(targetStr, "@") {
-				logger.Debug().Str("alias", targetStr).Msg("COMMAND: Resolving alias")
-				resolved, err := ResolveAlias(ctx, h, targetStr)
-				if err == nil { 
-					targetStr = resolved 
-					logger.Debug().Str("alias", parts[1]).Str("peerID", targetStr).Msg("COMMAND: Alias resolved successfully")
-				} else {
-					logger.Error().Err(err).Str("alias", parts[1]).Msg("COMMAND: Failed to resolve alias")
-					logger.Displayf("[Error] Failed to resolve alias %s: %v\n", targetStr, err)
-					return
-				}
-			}
-			targetID, err := peer.Decode(targetStr)
+			targetID, err := resolveTargetPeerID(ctx, h, parts[1])
 			if err == nil {
 				logger.Debug().Str("peerID", targetID.String()).Msg("COMMAND: Calling SendMessage")
 				_, errSend := SendMessage(ctx, h, priv, targetID, parts[2])
@@ -1407,7 +1487,8 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 					logger.Displayf("[Error] Failed to send message to %s: %v\n", FormatPeerID(targetID.String()), errSend)
 				}
 			} else {
-				logger.Error().Err(err).Str("target", targetStr).Msg("COMMAND: Invalid Peer ID or unresolvable alias")
+				logger.Error().Err(err).Str("target", parts[1]).Msg("COMMAND: Invalid Peer ID or unresolvable alias")
+				logger.Displayf("[Error] Invalid Peer ID or unresolvable alias '%s': %v\n", parts[1], err)
 			}
 		} else {
 			logger.Warn().Str("command", msgStr).Msg("COMMAND: Invalid /msg format. Use: /msg @alias message")
@@ -1419,18 +1500,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		parts := strings.SplitN(msgStr, " ", 3)
 		if len(parts) == 3 {
 			filePath := parts[1]
-			targetStr := parts[2]
-			if strings.HasPrefix(targetStr, "@") {
-				resolved, err := ResolveAlias(ctx, h, targetStr)
-				if err == nil { 
-					targetStr = resolved 
-				} else {
-					logger.Error().Err(err).Str("alias", targetStr).Msg("COMMAND: Failed to resolve alias for upload")
-					logger.Displayf("[Error] Failed to resolve alias %s: %v\n", targetStr, err)
-					return
-				}
-			}
-			targetID, err := peer.Decode(targetStr)
+			targetID, err := resolveTargetPeerID(ctx, h, parts[2])
 			if err == nil {
 				fileData, err := os.ReadFile(filePath)
 				if err == nil {
@@ -1443,7 +1513,11 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 						logger.Error().Err(errSend).Str("peerID", targetID.String()).Msg("Failed to send file")
 						logger.Displayf("[Error] Failed to send file %s to %s: %v\n", fileName, FormatPeerID(targetID.String()), errSend)
 					}
+				} else {
+					logger.Displayf("[Error] Failed to read file %s: %v\n", filePath, err)
 				}
+			} else {
+				logger.Displayf("[Error] Failed to resolve target '%s': %v\n", parts[2], err)
 			}
 		}
 		return

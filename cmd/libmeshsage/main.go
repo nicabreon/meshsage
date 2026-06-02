@@ -24,6 +24,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 
@@ -319,11 +320,20 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 			logger.Info().Str("peerID", remoteID.String()).Msg(">>> NEW PEER CONNECTED")
 
 			go func() {
-				time.Sleep(2 * time.Second)
-				protos, err := host.Peerstore().GetProtocols(remoteID)
-				if err != nil {
+				var protos []protocol.ID
+				var err error
+				for i := 0; i < 5; i++ {
+					time.Sleep(2 * time.Second)
+					protos, err = host.Peerstore().GetProtocols(remoteID)
+					if err == nil && len(protos) > 0 {
+						break
+					}
+				}
+				if len(protos) == 0 {
+					logger.Debug().Str("peerID", remoteID.String()).Msg("Failed to negotiate protocols (no protocols found after timeout)")
 					return
 				}
+
 				isInfra := false
 				for _, p := range protos {
 					if string(p) == "/p2p-core/infra/1.1.0" {
@@ -336,6 +346,16 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 					go coreproto.AutoRefillPreKeys(globalCtx, host, remoteID, priv)
 					go coreproto.FetchMailboxMessages(globalCtx, host, remoteID, priv)
 					go coreproto.SubscribeNotifications(globalCtx, host, remoteID, nil)
+				} else {
+					// Peer bukan infra — cek apakah sudah pernah dichat (ada session di DB).
+					// Jika ya, proaktif warm-up session agar pesan pertama langsung terenkripsi
+					// dengan DR tanpa delay X3DH saat user kirim.
+					if corestore.HasSession(remoteID.String()) {
+						logger.Info().Str("peerID", remoteID.String()).Msg("Known chat peer reconnected — probing session warm-up")
+						go coreproto.ProbeSessionWarmup(globalCtx, host, priv, remoteID)
+					} else {
+						logger.Debug().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure, no existing session)")
+					}
 				}
 			}()
 		},

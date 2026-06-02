@@ -210,3 +210,99 @@ When running `e2e_test_scenarios.sh` consecutively, scenario steps would intermi
 *   **Root Cause:** Background P2P worker processes from previous runs were not being cleaned up, leaving orphan processes bound to ports and locking databases.
 *   **Resolution:** Added proactive process termination (`killall p2p-node test_meshsage 2>/dev/null || true`) at the start of `e2e_test_scenarios.sh`, ensuring a clean environment for every E2E run.
 
+---
+
+## 6. ZKP-Secured Anonymous PubSub Handshake & Messaging
+
+### Problem Addressed
+When sending handshakes and messages offline via Mailbox or routing them through PubSub relays, the sender's identity (Peer ID) can be leaked, and relays are vulnerable to spam injection because they cannot authenticate senders without deanonymizing them.
+
+### Solution Implemented
+We implemented a **Zero-Knowledge Proof (ZKP) / Linkable Ring Signature (LSAG)** protocol over the NIST P-256 elliptic curve:
+
+1. **Deterministic Key Derivation**: Nodes deterministically derive a P-256 ZKP keypair from their existing libp2p private key.
+2. **Membership Registration**: Nodes register their ZKP public key on the relays during prekey refills. These public keys are synchronized across the cluster.
+3. **ZKP Envelope Wrapping**: When storing offline messages in the mailbox, the envelope is wrapped in a ZKP ring signature:
+   `ZKPEnvelope { C0, R, KeyImage, Ring, Payload }`
+   The signature proves membership in the active registered user ring without revealing *which* member signed it.
+4. **Relay Verification**: Mailbox relays verify the ring signature and check that all ring members are registered before storing and replicating the message, completely blocking spam.
+5. **Auto-Unwrapping**: Receivers unmarshal the ZKP JSON envelope automatically on retrieval.
+
+### Verification Results
+All cryptographic and protocol integration unit tests passed successfully:
+```text
+=== RUN   TestZKPKeypairDerivation
+--- PASS: TestZKPKeypairDerivation (0.00s)
+=== RUN   TestRingSignatureLifecycle
+--- PASS: TestRingSignatureLifecycle (0.01s)
+=== RUN   TestRingSignatureLinkability
+--- PASS: TestRingSignatureLinkability (0.00s)
+=== RUN   TestZKPEnvelopeVerification
+--- PASS: TestZKPEnvelopeVerification (0.02s)
+PASS
+```
+
+---
+
+## Walkthrough: TUI Concurrent Buffer Reuse Fix
+
+### Problem Solved
+On the Terminal User Interface (TUI), chat messages and system logs would occasionally get garbled, mixed up, or scrambled (e.g. status reports mixed with fetch counts or peer IDs like `1ount=complete27:47+07:0027RCKqy...`). This occurred during periods of concurrent network/messaging activity (such as after starting up and retrieving multiple messages/status updates).
+
+The cause was a classic **concurrency buffer-reuse race condition**:
+1. The custom `logWriter` and `chatWriter` in [tui.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/tui/tui.go) received log payload slices (`p []byte`) from the logging framework.
+2. These raw byte slices were directly wrapped as custom types (`logMsg(p)` / `chatMsg(p)`) and sent asynchronously to Bubble Tea's main event queue via `w.program.Send(...)`.
+3. Since `program.Send` is non-blocking, the log writer immediately returned and released/reused the underlying byte slice `p` for subsequent log entries before Bubble Tea had a chance to dequeue and process/convert it to string.
+4. When Bubble Tea finally read the bytes to render them, the array had already been overwritten by newer logging events.
+
+### Changes Made
+- Updated type definitions of `logMsg` and `chatMsg` in [tui.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/tui/tui.go) from `[]byte` to `string`.
+- Modified `Write` methods in `logWriter` and `chatWriter` to convert the byte slice to a Go string (`string(p)`) immediately before dispatching it. This forces Go to allocate and copy the data, preserving the message contents from being overwritten by subsequent concurrent log operations.
+
+### Verification Results
+- Built the node binary successfully (`go build -o build/node ./cmd/node`) with no errors.
+- Verified that all unit tests under `pkg/` pass successfully.
+
+---
+
+## Walkthrough: ZKP Startup Clean Fix
+
+### Problem Solved
+When a client fell back to sending messages via mailbox, it wrapped the message in a Zero-Knowledge Proof (ZKP) linkable ring signature. However, the mailbox/relay node would sometimes reject the envelope with:
+`REJECTED: ZKP verification failed (spammer or invalid membership proof) error="ring contains unregistered pub"`
+
+This was caused by the sender's local `zkp_members` database containing old, stale, or residual ZKP public keys (e.g. from previous app runs, old tests, or reinstalled peer IDs) that did not exist on the relay node's database. Because the relay node must verify that every single public key in the ZKP signature ring is active and registered, any unregistered key in the ring would cause the verification to fail.
+
+### Changes Made
+1. **Added `CleanZKPMembersExceptOwner`** in [database.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/storage/database.go) to delete all ZKP public keys in the local database except the node's own key.
+2. **Integrated with Startup Refill** in [prekey.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/prekey.go): During the first pre-key refill on startup (`forceCleanRefill = true`), the client runs `CleanZKPMembersExceptOwner` to clear stale third-party keys. 
+
+As other active nodes check in and broadcast their new keys via Gossip PubSub, they are dynamically re-added to the client's `zkp_members` database, ensuring that only active, verified keys are used to construct the ring signature.
+
+### Verification Results
+- All Go unit tests under `pkg/` compiled and passed.
+- Successfully recompiled Android native shared libraries for all architectures (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`).
+- Successfully rebuilt and repackaged the Flutter release APK (`meshsage.apk`) and installed it on the running emulator (`emulator-5554`) with no errors.
+
+---
+
+## Walkthrough: Proactive Session Warm-up Probe
+
+### Problem Solved
+Previously, there was no proactive check or handshake setup when known chat peers reconnected. If a session did not exist or was outdated, the first message sent by a user would have to perform an inline X3DH handshake (fetching pre-keys from the relay, generating ephemeral keypairs, and deriving secrets). This introduced a 1-2 second delay on the first message. Additionally, without a warm-up probe, decryption issues or session mismatches would only be discovered when the user attempted to send/receive an actual chat message.
+
+### Changes Made
+1. **Added `HasSession`** in [database.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/storage/database.go): A lightweight query that checks if an active Double Ratchet session already exists with the given peer.
+2. **Added `ProbeSessionWarmup`** in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go): If a session exists, sends a silent `MsgTypeHandshakeAck` probe to the peer. This causes the peer to perform a Double Ratchet step, warming up the channel and establishing mutual bidirectional session health.
+3. **Integrated with ConnectedF Handlers**:
+   - Modified `cmd/node/main.go` to invoke `ProbeSessionWarmup` in the background when a non-infrastructure peer connects and a session is found in the local DB.
+   - Modified `cmd/libmeshsage/main.go` (the Android core native library entrypoint) to also trigger this proactive probe on peer connection.
+
+### Verification Results
+- All Go unit tests under `pkg/` compiled and passed.
+- Successfully built `cmd/node/main.go` and `cmd/libmeshsage/main.go`.
+- Recompiled Android native shared libraries (`libmeshsage.so`) and packaging.
+- Rebuilt and packaged the Flutter release APK (`meshsage.apk`) successfully.
+
+
+

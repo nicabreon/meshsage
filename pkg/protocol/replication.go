@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -177,11 +178,18 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 					// Only delete public-key-only entries (relay cache), preserve our own private keys
 					_ = corestore.DeletePublicPreKeysByOwner(event.OwnerID)
 					logger.Info().Str("ownerID", event.OwnerID[:8]).Msg("Synced pre-keys clear from cluster (preserved private keys)")
+					if event.Payload != "" && strings.Contains(event.Payload, ":") {
+						parts := strings.Split(event.Payload, ":")
+						if len(parts) == 2 {
+							_ = corestore.SaveZKPMember(event.OwnerID, parts[0], parts[1])
+							logger.Info().Str("ownerID", event.OwnerID[:8]).Msg("Synced ZKP public key from cluster")
+						}
+					}
 				}
 			case "PREKEY_DELETE":
 				if event.Hash != "" {
-					_ = corestore.DeletePreKeyByID(event.Hash)
-					logger.Info().Str("keyID", event.Hash[:8]).Msg("Synced pre-key delete from cluster")
+					_ = corestore.DeletePublicPreKeyByID(event.Hash)
+					logger.Info().Str("keyID", event.Hash[:8]).Msg("Synced pre-key delete from cluster (preserved private keys)")
 				}
 			}
 		}

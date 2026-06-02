@@ -29,12 +29,16 @@ const PreKeyProtocolID = "/p2p-core/prekey/1.0.0"
 var (
 	fetchHistory      = make(map[string]int)
 	fetchHistoryMutex sync.Mutex
+	startupRefillDone bool
+	startupRefillMu   sync.Mutex
 )
 
 type PreKeyBatch struct {
 	OwnerID   string        `json:"owner_id"`
 	Keys      []OneTimeKey `json:"keys"`
 	Signature string        `json:"signature"`
+	ZkpX      string        `json:"zkp_x,omitempty"`
+	ZkpY      string        `json:"zkp_y,omitempty"`
 }
 
 type OneTimeKey struct {
@@ -107,9 +111,13 @@ func handlePreKeyStream(s network.Stream) {
 		// Safe: relay only stores public keys (private_key=NULL), client private keys are protected
 		// by DeletePublicPreKeysByOwner in the PREKEY_CLEAR cluster event handler.
 		_ = corestore.DeletePreKeysByOwner(batch.OwnerID)
+		if batch.ZkpX != "" && batch.ZkpY != "" {
+			_ = corestore.SaveZKPMember(batch.OwnerID, batch.ZkpX, batch.ZkpY)
+		}
 		BroadcastClusterEvent(context.Background(), ClusterEvent{
 			Type:    "PREKEY_CLEAR",
 			OwnerID: batch.OwnerID,
+			Payload: batch.ZkpX + ":" + batch.ZkpY,
 		})
 
 		for _, k := range batch.Keys {
@@ -134,9 +142,13 @@ func handlePreKeyStream(s network.Stream) {
 
 		// Clear old public keys for this owner so stale pre-DB-reset keys don't linger.
 		_ = corestore.DeletePreKeysByOwner(batch.OwnerID)
+		if batch.ZkpX != "" && batch.ZkpY != "" {
+			_ = corestore.SaveZKPMember(batch.OwnerID, batch.ZkpX, batch.ZkpY)
+		}
 		BroadcastClusterEvent(context.Background(), ClusterEvent{
 			Type:    "PREKEY_CLEAR",
 			OwnerID: batch.OwnerID,
+			Payload: batch.ZkpX + ":" + batch.ZkpY,
 		})
 
 		for _, k := range batch.Keys {
@@ -297,16 +309,38 @@ func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKe
 	count := 0
 	fmt.Sscanf(strings.TrimSpace(resp), "%d", &count)
 	
+	startupRefillMu.Lock()
+	forceCleanRefill := !startupRefillDone
+	startupRefillDone = true
+	startupRefillMu.Unlock()
+
 	localCount := corestore.GetPreKeyCount(h.ID().String())
-	if localCount >= 10 && count >= 10 { return nil }
+	if !forceCleanRefill && localCount >= 10 && count >= 10 { return nil }
 	
-	logger.Info().Int("current", count).Str("peerID", relayID.String()).Msg("Pre-keys stock low, refilling")
+	if forceCleanRefill {
+		logger.Info().Str("peerID", relayID.String()).Msg("Startup: performing clean pre-key refresh (preserving local private keys)")
+		_ = corestore.CleanZKPMembersExceptOwner(h.ID().String())
+	} else {
+		logger.Info().Int("current", count).Str("peerID", relayID.String()).Msg("Pre-keys stock low, refilling")
+	}
 	
-	batch := PreKeyBatch{OwnerID: h.ID().String()}
+	_, zkpX, zkpY, errDerive := corecrypto.DeriveZKPKeypair(privKey)
+	var zkpXB64, zkpYB64 string
+	if errDerive == nil {
+		zkpXB64 = base64.StdEncoding.EncodeToString(zkpX.Bytes())
+		zkpYB64 = base64.StdEncoding.EncodeToString(zkpY.Bytes())
+		_ = corestore.SaveZKPMember(h.ID().String(), zkpXB64, zkpYB64)
+	}
+
+	batch := PreKeyBatch{
+		OwnerID: h.ID().String(),
+		ZkpX:    zkpXB64,
+		ZkpY:    zkpYB64,
+	}
 	var sigBuf bytes.Buffer
 	sigBuf.WriteString(batch.OwnerID)
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 10; i++ {
 		priv, pub, _ := corecrypto.GenerateEphemeralKeypair()
 		pubB64 := base64.StdEncoding.EncodeToString(pub)
 		privB64 := base64.StdEncoding.EncodeToString(priv)
@@ -326,7 +360,7 @@ func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKe
 
 	err = UploadPreKeys(ctx, h, relayID, batch)
 	if err == nil {
-		logger.Info().Str("peerID", relayID.String()).Msg("Refilled 100 pre-keys successfully")
+		logger.Info().Str("peerID", relayID.String()).Msg("Refilled 10 pre-keys successfully")
 	}
 	return err
 }
