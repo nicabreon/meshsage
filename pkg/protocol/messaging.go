@@ -577,8 +577,7 @@ func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID,
 
 	// 6. Handle Content
 	logger.Info().Str("msgID", env.ID).Str("senderID", senderID.String()).Msg("processDecryptedPayload: payload verification succeeded, handling content")
-	handleIncomingPayload(ctx, h, senderID, env, msgHash)
-	return true
+	return handleIncomingPayload(ctx, h, senderID, env, msgHash)
 }
 
 func pushDecryptionErrorToUI(senderID peer.ID, errStr string) {
@@ -603,7 +602,7 @@ func pushDecryptionErrorToUI(senderID peer.ID, errStr string) {
 	}
 }
 
-func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, env MessageEnvelope, msgHash string) {
+func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, env MessageEnvelope, msgHash string) bool {
 	if env.Sender != "" {
 		aliasHash := GetAliasCoordinate(env.Sender)
 		pubKey := h.Peerstore().PubKey(senderID)
@@ -621,7 +620,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		// Receiving this ACK means both sides now have a fully operational
 		// Double Ratchet session in both directions.
 		logger.Info().Str("peerID", senderID.String()).Msg("X3DH handshake ACK received: bidirectional session established")
-		return
+		return true
 
 	case MsgTypeStatus:
 		logger.Displayf("[Status Report] Peer %s marked your message %s as: %s\n", 
@@ -634,9 +633,27 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 				Sender: senderID.String(),
 			})
 		}
-		return
+		return true
 
 	case MsgTypeText:
+		// Check for Group Key Request (GCMD:GREQ:groupID)
+		if strings.HasPrefix(env.Content, "GCMD:GREQ:") {
+			parts := strings.SplitN(env.Content, ":", 3)
+			if len(parts) == 3 {
+				groupID := parts[2]
+				logger.Info().
+					Str("group", groupID).
+					Str("requester", FormatPeerID(senderID.String())).
+					Msg("[GREQ] Received direct key request, sharing local key")
+
+				localKey, err := corestore.GetGroupLocalKey(groupID)
+				if err == nil {
+					go shareKeyWithMember(ctx, h, h.Peerstore().PrivKey(h.ID()), groupID, senderID.String(), localKey)
+				}
+				return true
+			}
+		}
+
 		// Check for Group Key sharing (GKEY:groupID:base64Key1,base64Key2,...)
 		if strings.HasPrefix(env.Content, "GKEY:") {
 			parts := strings.SplitN(env.Content, ":", 3)
@@ -662,7 +679,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 					Msg("Received and saved Group Session Key(s) (via Double Ratchet)")
 				// Flush any buffered messages that were waiting for this key
 				go FlushPendingGroupMessages(groupID, senderID.String())
-				return
+				return true
 			}
 		}
 
@@ -677,14 +694,14 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 			}
 			if err := json.Unmarshal([]byte(inviteStr), &invite); err != nil {
 				logger.Error().Err(err).Msg("Failed to unmarshal GINVITE JSON")
-				return
+				return true
 			}
 			
 			// Verify Creator Signature
 			creatorID, errDec := peer.Decode(invite.Meta.CreatorID)
 			if errDec != nil {
 				logger.Error().Err(errDec).Str("creator", invite.Meta.CreatorID).Msg("Failed to decode creator peer ID")
-				return
+				return true
 			}
 			pubKey := h.Peerstore().PubKey(creatorID)
 			var errExtract error
@@ -692,7 +709,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 				pubKey, errExtract = creatorID.ExtractPublicKey()
 				if errExtract != nil {
 					logger.Error().Err(errExtract).Str("creator", invite.Meta.CreatorID).Msg("Failed to extract creator public key")
-					return
+					return true
 				}
 			}
 			
@@ -701,11 +718,11 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 			valid, errVerify := pubKey.Verify(dataToVerify, sigBytes)
 			if errVerify != nil {
 				logger.Error().Err(errVerify).Msg("Error verifying GINVITE signature")
-				return
+				return true
 			}
 			if !valid {
 				logger.Error().Str("group", invite.Meta.GroupAlias).Msg("Received GINVITE with INVALID signature!")
-				return
+				return true
 			}
 			
 			errJoin := JoinGroupProper(ctx, h, h.Peerstore().PrivKey(h.ID()),
@@ -720,15 +737,14 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 				// Flush any buffered messages waiting for the creator's key
 				go FlushPendingGroupMessages(invite.Meta.GroupID, invite.Meta.CreatorID)
 			}
-			return
+			return true
 		}
 
 		// Check for Group Message prefix (Offline Fan-out)
 		if strings.HasPrefix(env.Content, "GRPM:") {
 			parts := strings.SplitN(env.Content, ":", 3)
 			if len(parts) == 3 {
-				ProcessGroupMessage(parts[1], []byte(parts[2]), msgHash)
-				return
+				return ProcessGroupMessage(parts[1], []byte(parts[2]), msgHash)
 			}
 		}
 
@@ -752,6 +768,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		}
 		// OTOMATIS: Kirim status "delivered" (Centang 2)
 		go SendStatusUpdate(ctx, h, senderID, env.ID, StatusDelivered)
+		return true
 		
 	case MsgTypeFile:
 		// Persist to SQLite
@@ -772,11 +789,13 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 				})
 			}
 		}
+		return true
 	
 	case MsgTypeGroup:
-		ProcessGroupMessage(env.RefID, []byte(env.Content), "")
+		return ProcessGroupMessage(env.RefID, []byte(env.Content), "")
 	default:
 		logger.Warn().Str("type", env.Type).Str("msgID", env.ID).Msg("handleIncomingPayload: received message with unknown or unhandled type")
+		return true
 	}
 }
 

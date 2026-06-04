@@ -15,7 +15,6 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
 	corenet "github.com/nicabreon/meshsage/pkg/network"
@@ -306,38 +305,35 @@ func sendGroupKeyRequest(ctx context.Context, h host.Host, groupID string) {
 		return
 	}
 
-	groupsMutex.Lock()
-	session, exists := activeGroups[groupID]
-	groupsMutex.Unlock()
-
-	if !exists {
-		return
-	}
-
 	privKey := h.Peerstore().PrivKey(h.ID())
 	if privKey == nil {
 		return
 	}
 
-	payload := fmt.Sprintf("GCMD:GREQ:%s", h.ID().String())
-	dataToSign := []byte(payload + h.ID().String())
-	sigBytes, err := privKey.Sign(dataToSign)
-	if err != nil {
+	members, err := corestore.GetGroupMembersV2(groupID)
+	if err != nil || len(members) == 0 {
+		logger.Warn().Str("group", groupID).Msg("[GREQ] Failed to load members or no members found")
 		return
 	}
-	sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
 
-	gMsg := GroupMessage{
-		SenderID:  h.ID().String(),
-		Payload:   payload,
-		Signature: sigB64,
-	}
-	msgBytes, _ := json.Marshal(gMsg)
+	reqMsg := fmt.Sprintf("GCMD:GREQ:%s", groupID)
 
-	if err := session.Topic.Publish(ctx, msgBytes); err != nil {
-		logger.Warn().Err(err).Str("group", groupID).Msg("[GREQ] Failed to broadcast key request")
-	} else {
-		logger.Info().Str("group", groupID).Msg("[GREQ] Broadcast group key request to existing members")
+	for _, m := range members {
+		if m.PeerID == h.ID().String() {
+			continue
+		}
+		targetID, errDec := peer.Decode(m.PeerID)
+		if errDec != nil {
+			continue
+		}
+		logger.Info().
+			Str("group", groupID).
+			Str("target", FormatPeerID(m.PeerID)).
+			Msg("[GREQ] Sending direct key request to member")
+
+		go func(t peer.ID) {
+			_, _ = SendMessage(ctx, h, privKey, t, reqMsg)
+		}(targetID)
 	}
 }
 
@@ -509,6 +505,20 @@ func listenGroupMessages(ctx context.Context, session *GroupSession, groupID str
 	}
 }
 
+func isDirectlyConnected(h host.Host, target peer.ID) bool {
+	conns := h.Network().ConnsToPeer(target)
+	if len(conns) == 0 {
+		return false
+	}
+	for _, conn := range conns {
+		remoteAddr := conn.RemoteMultiaddr()
+		if !strings.Contains(remoteAddr.String(), "/p2p-circuit") {
+			return true
+		}
+	}
+	return false
+}
+
 // SendGroupMessage publishes a message to the group using E2EE (SECURE) or Plaintext (UNSECURE)
 func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message string) error {
 	groupsMutex.Lock()
@@ -568,7 +578,8 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 			if errDec != nil { continue }
 
 			// Skip peers that are already directly connected — GossipSub will deliver.
-			if h.Network().Connectedness(target) == network.Connected {
+			// Only skip if the connection is a direct (non-relay) connection.
+			if isDirectlyConnected(h, target) {
 				logger.Debug().
 					Str("peer", FormatPeerID(m.PeerID)).
 					Str("group", groupID[:8]).
@@ -587,16 +598,16 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 }
 
 // ProcessGroupMessage decodes and displays offline group messages
-func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) {
+func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) bool {
 	var gMsg GroupMessage
 	err := json.Unmarshal(msgBytes, &gMsg)
-	if err != nil { return }
+	if err != nil { return true }
 
 	// Skip duplicate processing
-	if checkAndMarkProcessed(gMsg.Signature) { return }
+	if checkAndMarkProcessed(gMsg.Signature) { return true }
 
 	meta, errLoad := corestore.LoadGroupMetadata(groupID)
-	if errLoad != nil { return }
+	if errLoad != nil { return false }
 
 	var plaintext string
 	if meta.GroupType == "SECURE" {
@@ -609,17 +620,15 @@ func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) {
 			session := activeGroups[groupID]
 			groupsMutex.Unlock()
 
-			if session != nil {
-				bufferPendingMessage(groupID, gMsg.SenderID, pendingGroupMsg{
-					receivedAt: time.Now(),
-					gMsg:       gMsg,
-					ctx:        context.Background(),
-					session:    session,
-					groupID:    groupID,
-				})
-				go sendGroupKeyRequest(context.Background(), session.Host, groupID)
-			}
-			return
+			bufferPendingMessage(groupID, gMsg.SenderID, pendingGroupMsg{
+				receivedAt: time.Now(),
+				gMsg:       gMsg,
+				ctx:        context.Background(),
+				session:    session,
+				groupID:    groupID,
+			})
+			go sendGroupKeyRequest(context.Background(), session.Host, groupID)
+			return false
 		}
 	}
 
@@ -633,18 +642,16 @@ func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) {
 			session := activeGroups[groupID]
 			groupsMutex.Unlock()
 			
-			if session != nil {
-				bufferPendingMessage(groupID, gMsg.SenderID, pendingGroupMsg{
-					receivedAt: time.Now(),
-					gMsg:       gMsg,
-					ctx:        context.Background(),
-					session:    session,
-					groupID:    groupID,
-				})
-				go sendGroupKeyRequest(context.Background(), session.Host, groupID)
-			}
+			bufferPendingMessage(groupID, gMsg.SenderID, pendingGroupMsg{
+				receivedAt: time.Now(),
+				gMsg:       gMsg,
+				ctx:        context.Background(),
+				session:    session,
+				groupID:    groupID,
+			})
+			go sendGroupKeyRequest(context.Background(), session.Host, groupID)
 		}
-		return
+		return false
 	}
 
 	// Verify signature
@@ -657,7 +664,7 @@ func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) {
 			valid, _ := pubKey.Verify(dataToVerify, sigBytes)
 			if !valid {
 				logger.Warn().Msgf("[Group Warning] REJECTED: Invalid signature on offline message from %s", FormatPeerID(gMsg.SenderID))
-				return
+				return true
 			}
 		}
 	}
@@ -687,6 +694,7 @@ func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) {
 			Content:   plaintext,
 		})
 	}
+	return true
 }
 
 // RestoreGroups restores all active group memberships from database on startup
