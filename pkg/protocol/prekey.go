@@ -29,8 +29,6 @@ const PreKeyProtocolID = "/p2p-core/prekey/1.0.0"
 var (
 	fetchHistory      = make(map[string]int)
 	fetchHistoryMutex sync.Mutex
-	startupRefillDone bool
-	startupRefillMu   sync.Mutex
 )
 
 type PreKeyBatch struct {
@@ -308,21 +306,12 @@ func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKe
 	if err != nil { return err }
 	count := 0
 	fmt.Sscanf(strings.TrimSpace(resp), "%d", &count)
-	
-	startupRefillMu.Lock()
-	forceCleanRefill := !startupRefillDone
-	startupRefillDone = true
-	startupRefillMu.Unlock()
 
 	localCount := corestore.GetPreKeyCount(h.ID().String())
-	if !forceCleanRefill && localCount >= 10 && count >= 10 { return nil }
-	
-	if forceCleanRefill {
-		logger.Info().Str("peerID", relayID.String()).Msg("Startup: performing clean pre-key refresh (preserving local private keys)")
-		_ = corestore.CleanZKPMembersExceptOwner(h.ID().String())
-	} else {
-		logger.Info().Int("current", count).Str("peerID", relayID.String()).Msg("Pre-keys stock low, refilling")
-	}
+	// Only refill if relay stock or local stock is low — never wipe existing keys on startup
+	if localCount >= 10 && count >= 10 { return nil }
+
+	logger.Info().Int("relay_count", count).Int("local_count", localCount).Str("peerID", relayID.String()).Msg("Pre-keys stock low, refilling without clearing existing keys")
 	
 	_, zkpX, zkpY, errDerive := corecrypto.DeriveZKPKeypair(privKey)
 	var zkpXB64, zkpYB64 string

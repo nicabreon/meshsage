@@ -46,6 +46,83 @@ var (
 	x3dhRequestCooldown sync.Map // map[peerID string]time.Time
 )
 
+// sentMsg adalah pesan yang sudah dikirim oleh node ini, disimpan untuk kemungkinan retry
+// jika receiver mengalami masalah sesi dan meminta X3DH ulang.
+type sentMsg struct {
+	env       MessageEnvelope
+	sentAt    time.Time
+}
+
+const (
+	maxSentPerPeer  = 20              // max pesan tersimpan per peer
+	sentMsgTTL      = 10 * time.Minute // pesan lebih lama dari ini tidak di-retry
+)
+
+var (
+	sentMsgMu  sync.Mutex
+	sentMsgBuf = make(map[string][]sentMsg) // peerID → []sentMsg
+)
+
+// trackSentMessage menyimpan pesan yang baru dikirim ke buffer per-peer.
+// Dipanggil oleh SendMessage setelah berhasil mengirim.
+func trackSentMessage(peerID string, env MessageEnvelope) {
+	sentMsgMu.Lock()
+	defer sentMsgMu.Unlock()
+
+	list := sentMsgBuf[peerID]
+	now := time.Now()
+	// Buang yang sudah kadaluarsa
+	filtered := list[:0]
+	for _, m := range list {
+		if now.Sub(m.sentAt) < sentMsgTTL {
+			filtered = append(filtered, m)
+		}
+	}
+	// Jaga batas ukuran: hapus yang terlama
+	if len(filtered) >= maxSentPerPeer {
+		filtered = filtered[1:]
+	}
+	filtered = append(filtered, sentMsg{env: env, sentAt: now})
+	sentMsgBuf[peerID] = filtered
+}
+
+// retrySentMessages dipanggil saat REQUEST_X3DH diterima dari peer.
+// Setelah X3DH baru berhasil dibentuk, kirim ulang semua pesan yang
+// sebelumnya sudah dikirim ke peer tersebut dalam TTL window.
+func retrySentMessages(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID) {
+	peerID := targetID.String()
+	sentMsgMu.Lock()
+	list, ok := sentMsgBuf[peerID]
+	if !ok || len(list) == 0 {
+		sentMsgMu.Unlock()
+		return
+	}
+	now := time.Now()
+	toResend := make([]MessageEnvelope, 0, len(list))
+	for _, m := range list {
+		if now.Sub(m.sentAt) < sentMsgTTL {
+			toResend = append(toResend, m.env)
+		}
+	}
+	// Hapus buffer setelah diambil
+	delete(sentMsgBuf, peerID)
+	sentMsgMu.Unlock()
+
+	if len(toResend) == 0 {
+		return
+	}
+	logger.Info().Str("peerID", peerID[:8]).Int("count", len(toResend)).Msg("Retrying sent messages after X3DH re-handshake")
+	for _, env := range toResend {
+		// Jeda kecil agar session state sudah tersimpan ke DB
+		time.Sleep(80 * time.Millisecond)
+		if err := sendSecureEnvelope(ctx, h, priv, targetID, env); err != nil {
+			logger.Warn().Err(err).Str("peerID", peerID[:8]).Str("msgID", env.ID).Msg("Retry sent message failed")
+		} else {
+			logger.Info().Str("peerID", peerID[:8]).Str("msgID", env.ID).Msg("Sent message retried successfully after X3DH")
+		}
+	}
+}
+
 // getSessionLock mengembalikan mutex khusus untuk peerID tertentu.
 func getSessionLock(peerID string) *sync.Mutex {
 	val, _ := sessionLocks.LoadOrStore(peerID, &sync.Mutex{})
@@ -64,29 +141,63 @@ func handleStream(s network.Stream) {
 	buf := bufio.NewReader(s)
 	var length uint32
 	if err := binary.Read(buf, binary.LittleEndian, &length); err != nil {
+		logger.Warn().Err(err).Msg("handleStream: failed to read length prefix")
 		return
 	}
 
 	envelopeBytes := make([]byte, length)
 	if _, err := io.ReadFull(buf, envelopeBytes); err != nil {
+		logger.Warn().Err(err).Msg("handleStream: failed to read envelope payload")
 		return
 	}
 
-	ProcessSecureEnvelope(context.Background(), localHost, senderID, string(envelopeBytes))
+	// Track incoming bytes (4-byte length prefix + envelope payload)
+	AddBytesRecv(4 + len(envelopeBytes))
+
+	ProcessSecureEnvelope(context.Background(), localHost, senderID, string(envelopeBytes), "")
 
 	// Kirim balik "OK\n" sebagai tanda terima (ACK)
 	_, _ = s.Write([]byte("OK\n"))
 }
 
 // ProcessSecureEnvelope menangani dekripsi X3DH dan pemrosesan JSON payload
-func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, envelope string) {
+func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, envelope string, msgHash string) {
+	success := false
+	defer func() {
+		if msgHash != "" {
+			if success {
+				processedMailboxMessages.Store(msgHash, true)
+				_ = corestore.SaveProcessedMailboxMessage(msgHash)
+			} else {
+				processedMailboxMessages.Delete(msgHash)
+				_ = corestore.DeleteProcessedMailboxMessage(msgHash)
+			}
+		}
+	}()
+
 	// Detect and unwrap SignedMailboxEnvelope if present
 	if strings.HasPrefix(envelope, "{") {
 		var signedEnv SignedMailboxEnvelope
-		if err := json.Unmarshal([]byte(envelope), &signedEnv); err == nil && signedEnv.Payload != "" {
+		if err := json.Unmarshal([]byte(envelope), &signedEnv); err != nil {
+			logger.Error().Err(err).Msg("ProcessSecureEnvelope: failed to unmarshal SignedMailboxEnvelope JSON")
+		} else if signedEnv.Payload == "" {
+			logger.Warn().Msg("ProcessSecureEnvelope: SignedMailboxEnvelope has empty payload")
+		} else {
 			envelope = signedEnv.Payload
 		}
 	}
+
+	envType := "UNKNOWN"
+	if strings.HasPrefix(envelope, "RESET:") {
+		envType = "RESET"
+	} else if strings.HasPrefix(envelope, "REQUEST_X3DH") {
+		envType = "REQUEST_X3DH"
+	} else if strings.HasPrefix(envelope, "DR:") {
+		envType = "DR"
+	} else if strings.HasPrefix(envelope, "X3DH:") {
+		envType = "X3DH"
+	}
+	logger.Info().Str("senderID", senderID.String()).Str("type", envType).Msg("ProcessSecureEnvelope: processing incoming envelope")
 
 	var aesKey []byte
 	var encryptedPayloadB64 string
@@ -115,6 +226,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				}
 				// Ask sender to restart X3DH
 				go sendRequestX3DH(ctx, h, senderID)
+				success = true
 				return
 			}
 		}
@@ -139,6 +251,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		}
 		// Ask sender to re-initiate X3DH so both sides are in sync
 		go sendRequestX3DH(ctx, h, senderID)
+		success = true
 		return
 	}
 
@@ -151,17 +264,31 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		_ = corestore.ClearSkippedKeys(senderID.String())
 		// Re-initiate after a brief delay to give the remote node time to upload
 		// fresh pre-keys if they just started up (avoids immediate 'no pre-key' failure).
+		// After X3DH re-handshake completes, retry any recently sent messages
+		// that the receiver couldn't decrypt (their ratchet key was stale).
 		go func(target peer.ID) {
 			time.Sleep(2 * time.Second)
 			sendHandshakeAck(ctx, h, target)
+			// X3DH ACK selesai → session baru sudah tersedia di kedua sisi.
+			// Tunggu sebentar untuk memastikan ACK diterima dan session di-save,
+			// lalu re-send semua pesan yang sebelumnya gagal di-decrypt oleh receiver.
+			privKey := h.Peerstore().PrivKey(h.ID())
+			if privKey != nil {
+				time.Sleep(500 * time.Millisecond)
+				retrySentMessages(ctx, h, privKey, target)
+			}
 		}(senderID)
+		success = true
 		return
 	}
 
 	if strings.HasPrefix(envelope, "DR:") {
 		// 1. Jalur Double Ratchet (Per-message Keys)
 		parts := strings.SplitN(envelope, ":", 2)
-		if len(parts) < 2 { return }
+		if len(parts) < 2 {
+			logger.Error().Msg("ProcessSecureEnvelope: DR envelope format invalid (missing parts)")
+			return
+		}
 		
 		// Format DR:RatchetPub|PN|N|Ciphertext
 		rawPayload, _ := base64.StdEncoding.DecodeString(parts[1])
@@ -177,92 +304,103 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			defer sessionMu.Unlock()
 			
 			// A. Cek Skipped Keys dulu
-			skippedKey, err := corestore.GetSkippedKey(senderID.String(), uint32(counter))
-			if err == nil {
+			skippedKey, skippedErr := corestore.GetSkippedKey(senderID.String(), uint32(counter))
+			if skippedErr == nil {
 				logger.Info().Str("peerID", senderID.String()).Uint32("counter", uint32(counter)).Msg("DR: Using skipped message key")
 				// BUG-02 FIX: Gunakan DecryptMessage (bukan DecryptMessageRaw) karena
 				// EncryptWithRatchet menggunakan EncryptMessage yang menyertakan gzip.
-				plaintext, err := corecrypto.DecryptMessage(skippedKey, headerParts[3])
-				if err != nil {
-					logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR: Skipped key decryption failed. Clearing session and requesting fresh X3DH.")
-					_ = corestore.DeleteSession(senderID.String())
-					_ = corestore.ClearSkippedKeys(senderID.String())
-					go sendRequestX3DH(ctx, h, senderID)
-					return
-				}
-				processDecryptedPayload(ctx, h, senderID, []byte(plaintext))
-				return
-			} else {
-				// B. Jalur Standard Ratchet
-				remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, err := corestore.LoadSession(senderID.String())
-				if err != nil || rootB64 == "" {
-					logger.Error().Str("peerID", senderID.String()).Msg("No session found for E2EE decryption. Sending REQUEST_X3DH to sender.")
-					// Do NOT send RESET here (we have nothing to reset).
-					// Instead, ask the sender to start fresh X3DH.
-					go sendRequestX3DH(ctx, h, senderID)
-					return
-				}
-
-				rootKey, _ := base64.StdEncoding.DecodeString(rootB64)
-				sendChain, _ := base64.StdEncoding.DecodeString(sendB64)
-				recvChain, _ := base64.StdEncoding.DecodeString(recvB64)
-				remoteRatchetPub, _ := base64.StdEncoding.DecodeString(remoteRatchetB64)
-				localRatchetPriv, _ := base64.StdEncoding.DecodeString(localRatchetPrivB64)
-				localRatchetPub, _ := base64.StdEncoding.DecodeString(localRatchetPubB64)
-
-				if len(recvChain) == 0 { recvChain = rootKey }
-
-				session := &corecrypto.SessionState{
-					PeerID: senderID.String(),
-					RootKey: rootKey,
-					SendChainKey: sendChain,
-					RecvChainKey: recvChain,
-					RemoteRatchetPubkey: remoteRatchetPub,
-					LocalRatchetPrivkey: localRatchetPriv,
-					LocalRatchetPubkey: localRatchetPub,
-					N: n,
-					M: m,
-					PN: pn,
-				}
-
-				plaintext, skipped, err := session.DecryptWithRatchet(payloadStr)
-				if err != nil {
-					logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR Decryption failed. Clearing session and requesting fresh X3DH.")
-					_ = corestore.DeleteSession(senderID.String())
-					_ = corestore.ClearSkippedKeys(senderID.String())
-					go sendRequestX3DH(ctx, h, senderID)
-					return
-				}
-
-				// Berhasil dekripsi! Simpan state baru
-				// BUG-1 FIX: If the session.RemoteRatchetPubkey changed during DecryptWithRatchet,
-				// a DH ratchet step occurred. Clear ALL old skipped keys — they belong to the old
-				// epoch and will permanently fail decryption.
-				oldRemoteRatchet, _ := base64.StdEncoding.DecodeString(remoteRatchetB64)
-				if !bytes.Equal(oldRemoteRatchet, session.RemoteRatchetPubkey) {
-					if clearErr := corestore.ClearSkippedKeys(senderID.String()); clearErr != nil {
-						logger.Warn().Err(clearErr).Str("peerID", senderID.String()).Msg("DR: Failed to clear stale skipped keys after DH step")
-					} else {
-						logger.Debug().Str("peerID", senderID.String()).Msg("DR: DH ratchet step detected — cleared stale skipped keys")
+				plaintext, decErr := corecrypto.DecryptMessage(skippedKey, headerParts[3])
+				if decErr == nil {
+					// Skipped key berhasil — pesan sudah didekripsi
+					if processDecryptedPayload(ctx, h, senderID, []byte(plaintext), msgHash) {
+						success = true
 					}
+					return
 				}
-				corestore.SaveSession(senderID.String(), remoteIdentityB64, 
-					base64.StdEncoding.EncodeToString(session.RootKey),
-					base64.StdEncoding.EncodeToString(session.SendChainKey),
-					base64.StdEncoding.EncodeToString(session.RecvChainKey),
-					base64.StdEncoding.EncodeToString(session.RemoteRatchetPubkey),
-					base64.StdEncoding.EncodeToString(session.LocalRatchetPrivkey),
-					base64.StdEncoding.EncodeToString(session.LocalRatchetPubkey),
-					session.N, session.M, session.PN)
-				
-				// Simpan skipped keys
-				for c, k := range skipped {
-					corestore.SaveSkippedKey(senderID.String(), c, k)
-				}
-				
-				processDecryptedPayload(ctx, h, senderID, []byte(plaintext))
+				// Skipped key stale/corrupt dari epoch lama (GetSkippedKey sudah hapus atomik).
+				// JANGAN return — fall through ke jalur ratchet normal di bawah.
+				// Counter yang sama di session baru harus bisa didekripsi via ratchet biasa.
+				logger.Warn().Str("peerID", senderID.String()).Uint32("counter", uint32(counter)).Err(decErr).Msg("DR: Stale skipped key failed, falling through to normal ratchet")
+			}
+
+			// B. Jalur Standard Ratchet
+			// Dicapai saat: (1) tidak ada skipped key, atau (2) skipped key stale/gagal decrypt.
+			remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, err := corestore.LoadSession(senderID.String())
+			if err != nil || rootB64 == "" {
+				logger.Error().Str("peerID", senderID.String()).Msg("No session found for E2EE decryption. Sending REQUEST_X3DH to sender.")
+				// Do NOT send RESET here (we have nothing to reset).
+				// Instead, ask the sender to start fresh X3DH.
+				go sendRequestX3DH(ctx, h, senderID)
+				pushDecryptionErrorToUI(senderID, "No E2EE session found for decryption (requires X3DH handshake)")
 				return
 			}
+
+			rootKey, _ := base64.StdEncoding.DecodeString(rootB64)
+			sendChain, _ := base64.StdEncoding.DecodeString(sendB64)
+			recvChain, _ := base64.StdEncoding.DecodeString(recvB64)
+			remoteRatchetPub, _ := base64.StdEncoding.DecodeString(remoteRatchetB64)
+			localRatchetPriv, _ := base64.StdEncoding.DecodeString(localRatchetPrivB64)
+			localRatchetPub, _ := base64.StdEncoding.DecodeString(localRatchetPubB64)
+
+			if len(recvChain) == 0 { recvChain = rootKey }
+
+			session := &corecrypto.SessionState{
+				PeerID: senderID.String(),
+				RootKey: rootKey,
+				SendChainKey: sendChain,
+				RecvChainKey: recvChain,
+				RemoteRatchetPubkey: remoteRatchetPub,
+				LocalRatchetPrivkey: localRatchetPriv,
+				LocalRatchetPubkey: localRatchetPub,
+				N: n,
+				M: m,
+				PN: pn,
+			}
+
+			plaintext, skipped, err := session.DecryptWithRatchet(payloadStr)
+			if err != nil {
+				logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR Decryption failed. Clearing session and requesting fresh X3DH.")
+				_ = corestore.DeleteSession(senderID.String())
+				_ = corestore.ClearSkippedKeys(senderID.String())
+				go sendRequestX3DH(ctx, h, senderID)
+				pushDecryptionErrorToUI(senderID, "Double Ratchet decryption failed: "+err.Error())
+				return
+			}
+
+			// Berhasil dekripsi! Simpan state baru
+			// BUG-1 FIX: If the session.RemoteRatchetPubkey changed during DecryptWithRatchet,
+			// a DH ratchet step occurred. Clear ALL old skipped keys — they belong to the old
+			// epoch and will permanently fail decryption.
+			oldRemoteRatchet, _ := base64.StdEncoding.DecodeString(remoteRatchetB64)
+			if !bytes.Equal(oldRemoteRatchet, session.RemoteRatchetPubkey) {
+				if clearErr := corestore.ClearSkippedKeys(senderID.String()); clearErr != nil {
+					logger.Warn().Err(clearErr).Str("peerID", senderID.String()).Msg("DR: Failed to clear stale skipped keys after DH step")
+				} else {
+					logger.Debug().Str("peerID", senderID.String()).Msg("DR: DH ratchet step detected — cleared stale skipped keys")
+				}
+			}
+			corestore.SaveSession(senderID.String(), remoteIdentityB64, 
+				base64.StdEncoding.EncodeToString(session.RootKey),
+				base64.StdEncoding.EncodeToString(session.SendChainKey),
+				base64.StdEncoding.EncodeToString(session.RecvChainKey),
+				base64.StdEncoding.EncodeToString(session.RemoteRatchetPubkey),
+				base64.StdEncoding.EncodeToString(session.LocalRatchetPrivkey),
+				base64.StdEncoding.EncodeToString(session.LocalRatchetPubkey),
+				session.N, session.M, session.PN)
+			
+			// Simpan skipped keys
+			for c, k := range skipped {
+				corestore.SaveSkippedKey(senderID.String(), c, k)
+			}
+			
+			logger.Info().Str("senderID", senderID.String()).Msg("ProcessSecureEnvelope: Double Ratchet envelope decrypted successfully")
+			if processDecryptedPayload(ctx, h, senderID, []byte(plaintext), msgHash) {
+				success = true
+			}
+			return
+		} else {
+			logger.Error().Int("parts", len(headerParts)).Msg("ProcessSecureEnvelope: DR payload header format invalid (must have 4 parts)")
+			return
 		}
 
 	} else if strings.HasPrefix(envelope, "X3DH:") {
@@ -270,7 +408,10 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		logger.Info().Str("peerID", senderID.String()).Msg("Receiving new X3DH Handshake")
 		// Format baru: X3DH:keyID:ePub:senderRatchetPub:encryptedPayload
 		parts := strings.SplitN(envelope, ":", 5)
-		if len(parts) < 4 { return }
+		if len(parts) < 4 {
+			logger.Error().Int("parts", len(parts)).Msg("ProcessSecureEnvelope: X3DH envelope format invalid (too few parts)")
+			return
+		}
 		
 		isX3DH = true
 		keyID = parts[1]
@@ -289,18 +430,24 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			logger.Error().Str("keyID", keyID).Str("senderID", senderID.String()).Msg("Receiver's Pre-Key not found (expired or rotated). Requesting fresh X3DH from sender.")
 			// Tell sender to fetch a fresh pre-key and retry with a new X3DH handshake.
 			go sendRequestX3DH(ctx, h, senderID)
+			pushDecryptionErrorToUI(senderID, "Receiver's pre-key not found in local DB (expired or rotated)")
 			return
 		}
 		privKeyBytes, _ := base64.StdEncoding.DecodeString(privKeyB64)
 		ePubBytes, _ := base64.StdEncoding.DecodeString(ePubB64)
-
 		logger.Debug().Msg("Deriving shared secret from receiver's Pre-Key...")
 		aesKey, err = corecrypto.DeriveSharedSecret(privKeyBytes, ePubBytes)
-		if err != nil { return }
-
+		if err != nil {
+			logger.Error().Err(err).Msg("ProcessSecureEnvelope: X3DH DeriveSharedSecret failed")
+			return
+		}
+ 
 		// Inisialisasi ratchet keys di sisi receiver
 		bobPreKeyPub, err := corecrypto.DerivePublicKey(privKeyBytes)
-		if err != nil { return }
+		if err != nil {
+			logger.Error().Err(err).Msg("ProcessSecureEnvelope: X3DH DerivePublicKey failed")
+			return
+		}
 		bobPreKeyPubB64 := base64.StdEncoding.EncodeToString(bobPreKeyPub)
 
 		// Lakukan DH Receive Step awal menggunakan privKeyBytes (Bob_PreKey_Priv) dan senderRatchetPub
@@ -358,6 +505,12 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		// Simpan dengan SendChainKey, RecvChainKey dan ratchet keys terisi lengkap
 		corestore.SaveSession(senderID.String(), bobPreKeyPubB64, rootKeyB64, sendChainB64, recvChainB64, senderRatchetPubB64, localRatchetPrivB64, localRatchetPubB64, 0, 0, 0)
 	} else {
+		snippet := envelope
+		if len(snippet) > 50 {
+			snippet = snippet[:50] + "..."
+		}
+		logger.Warn().Str("senderID", senderID.String()).Str("envelope", snippet).Msg("ProcessSecureEnvelope: unknown or unhandled envelope type")
+		pushDecryptionErrorToUI(senderID, "Unknown envelope prefix (envelope: "+snippet+")")
 		return
 	}
 
@@ -371,6 +524,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		_ = corestore.ClearSkippedKeys(senderID.String())
 		// Ask sender to restart with a new X3DH
 		go sendRequestX3DH(ctx, h, senderID)
+		pushDecryptionErrorToUI(senderID, "X3DH decryption failed: "+err.Error())
 		return
 	}
 
@@ -390,15 +544,21 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 	// without any user-visible message being shown on either side.
 	go sendHandshakeAck(ctx, h, senderID)
 
-	processDecryptedPayload(ctx, h, senderID, plaintextBytes)
+	logger.Info().Str("senderID", senderID.String()).Msg("ProcessSecureEnvelope: X3DH envelope decrypted successfully")
+	if processDecryptedPayload(ctx, h, senderID, plaintextBytes, msgHash) {
+		success = true
+	}
 }
 
-func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID, plaintextBytes []byte) {
+func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID, plaintextBytes []byte, msgHash string) bool {
 	// 4. Unmarshal JSON
 	var env MessageEnvelope
 	if err := json.Unmarshal(plaintextBytes, &env); err != nil {
-		return
+		logger.Error().Err(err).Str("plaintext", string(plaintextBytes)).Msg("processDecryptedPayload: failed to unmarshal decrypted JSON payload")
+		pushDecryptionErrorToUI(senderID, "Failed to parse decrypted message JSON: "+err.Error())
+		return false
 	}
+	logger.Info().Str("msgID", env.ID).Str("type", env.Type).Msg("processDecryptedPayload: successfully unmarshaled decrypted JSON envelope")
 
 	// 5. Verifikasi Signature
 	if env.Signature != "" {
@@ -409,17 +569,41 @@ func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID,
 			valid, _ := pubKey.Verify(dataToVerify, sigBytes)
 			if !valid {
 				logger.Warn().Str("peerID", senderID.String()).Msg("INVALID SIGNATURE detected!")
-				return
+				return false
 			}
 			logger.Debug().Str("peerID", senderID.String()).Msg("Message signature verified")
 		}
 	}
 
 	// 6. Handle Content
-	handleIncomingPayload(ctx, h, senderID, env)
+	logger.Info().Str("msgID", env.ID).Str("senderID", senderID.String()).Msg("processDecryptedPayload: payload verification succeeded, handling content")
+	handleIncomingPayload(ctx, h, senderID, env, msgHash)
+	return true
 }
 
-func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, env MessageEnvelope) {
+func pushDecryptionErrorToUI(senderID peer.ID, errStr string) {
+	if MessageCallback != nil {
+		ts := time.Now().Format("02/01 15:04:05")
+		errID := fmt.Sprintf("err-%x", sha256.Sum256([]byte(errStr+time.Now().String())))[:8]
+		content := "[Error: Failed to decrypt message: " + errStr + "]"
+		
+		// Simpan error ini ke SQLite database lokal agar tersimpan di chat history
+		if localHost != nil {
+			_ = corestore.SaveMessage(senderID.String(), localHost.ID().String(), content, "", "", "")
+		}
+		
+		MessageCallback(MessageEvent{
+			Type:      "direct",
+			MsgID:     errID,
+			Timestamp: ts,
+			Sender:    senderID.String(),
+			Content:   content,
+			UnixTime:  time.Now().UnixNano() / 1e6,
+		})
+	}
+}
+
+func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, env MessageEnvelope, msgHash string) {
 	if env.Sender != "" {
 		aliasHash := GetAliasCoordinate(env.Sender)
 		pubKey := h.Peerstore().PubKey(senderID)
@@ -428,6 +612,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 			pubKeyBytes, _ = pubKey.Raw()
 		}
 		_ = corestore.SaveAlias(aliasHash, env.Sender, senderID.String(), pubKeyBytes)
+		logger.Info().Str("alias", env.Sender).Str("peerID", senderID.String()).Msg("handleIncomingPayload: saved/updated sender alias locally")
 	}
 
 	switch env.Type {
@@ -542,16 +727,19 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		if strings.HasPrefix(env.Content, "GRPM:") {
 			parts := strings.SplitN(env.Content, ":", 3)
 			if len(parts) == 3 {
-				ProcessGroupMessage(parts[1], []byte(parts[2]))
+				ProcessGroupMessage(parts[1], []byte(parts[2]), msgHash)
 				return
 			}
 		}
 
 		// Persist to SQLite only for actual user-visible chat messages
-		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content)
+		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "direct")
+
+		logger.Info().Str("senderID", senderID.String()).Str("msgID", env.ID).Msg("Received standard text message successfully")
 
 		ts := time.Now().Format("02/01 15:04:05")
 		logger.Displayf("\033[92m[%s] [Message from %s]: %s\033[0m\n", ts, FormatSender(senderID.String()), env.Content)
+		TrackMsgRecv() // Track incoming message
 		if MessageCallback != nil {
 			MessageCallback(MessageEvent{
 				Type:      "direct",
@@ -567,7 +755,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		
 	case MsgTypeFile:
 		// Persist to SQLite
-		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content)
+		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "file")
 
 		parts := strings.Split(env.Content, ":")
 		if len(parts) >= 4 {
@@ -586,7 +774,9 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		}
 	
 	case MsgTypeGroup:
-		ProcessGroupMessage(env.RefID, []byte(env.Content))
+		ProcessGroupMessage(env.RefID, []byte(env.Content), "")
+	default:
+		logger.Warn().Str("type", env.Type).Str("msgID", env.ID).Msg("handleIncomingPayload: received message with unknown or unhandled type")
 	}
 }
 
@@ -613,9 +803,7 @@ func SendStatusUpdate(ctx context.Context, h host.Host, targetID peer.ID, refID 
 	return sendSecureEnvelope(ctx, h, privKey, targetID, msgEnv)
 }
 
-func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID, env MessageEnvelope) error {
-	jsonPayload, _ := json.Marshal(env)
-
+func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID, jsonPayload []byte) (string, error) {
 	// BUG-03: Lock per-peer agar tidak ada race condition pada session state
 	sessionMu := getSessionLock(targetID.String())
 	sessionMu.Lock()
@@ -661,7 +849,7 @@ func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 				session.N, session.M, session.PN)
 
 			finalWireEnvelope := fmt.Sprintf("DR:%s", base64.StdEncoding.EncodeToString([]byte(ciphertext)))
-			return transmitEnvelope(ctx, h, targetID, finalWireEnvelope)
+			return finalWireEnvelope, nil
 		}
 	}
 
@@ -681,26 +869,25 @@ func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 			break
 		}
 	}
-	if !preKeyFound { return fmt.Errorf("no pre-key found") }
-
+	if !preKeyFound { return "", fmt.Errorf("no pre-key found") }
 
 	logger.Debug().Msg("X3DH HANDSHAKE: Generating Ephemeral Keypair & Deriving Shared Secret")
 	ePriv, ePub, err := corecrypto.GenerateEphemeralKeypair()
-	if err != nil { return err }
+	if err != nil { return "", err }
 
 	peerPubKeyBytes, _ := base64.StdEncoding.DecodeString(pubKeyB64)
 	aesKey, err := corecrypto.DeriveSharedSecret(ePriv, peerPubKeyBytes)
-	if err != nil { return err }
+	if err != nil { return "", err }
 
 	// Inisialisasi Double Ratchet: Generate ratchet keypair lokal
 	localRatchetPriv, localRatchetPub, err := corecrypto.GenerateEphemeralKeypair()
-	if err != nil { return err }
+	if err != nil { return "", err }
 
 	// Lakukan DH Send Step awal menggunakan localRatchetPriv dan pubKeyB64 (Pre-key Bob)
 	sharedSecret, err := corecrypto.DeriveSharedSecret(localRatchetPriv, peerPubKeyBytes)
-	if err != nil { return err }
+	if err != nil { return "", err }
 	res, err := corecrypto.HKDFExpand(sharedSecret, "p2p-core-dh-ratchet", 64)
-	if err != nil { return err }
+	if err != nil { return "", err }
 
 	initRootKey := res[:32]
 	initSendChainKey := res[32:]
@@ -711,6 +898,7 @@ func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 	senderRatchetPubB64Out := base64.StdEncoding.EncodeToString(localRatchetPub)
 
 	logger.Info().Str("peerID", FormatPeerID(targetID.String())).Str("rootKey", senderRootKeyB64[:6]).Msg("X3DH HANDSHAKE: Saving Initial Session with Ratchet Keys")
+	TrackHandshake() // Track X3DH handshake
 	// BUG-1 FIX: Sender side — clear stale skipped keys before establishing new session.
 	if clearErr := corestore.ClearSkippedKeys(targetID.String()); clearErr != nil {
 		logger.Warn().Err(clearErr).Str("peerID", targetID.String()).Msg("X3DH SEND: Failed to clear stale skipped keys")
@@ -721,16 +909,21 @@ func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 	corestore.SaveSession(targetID.String(), pubKeyB64, senderRootKeyB64, senderSendChainB64, "", pubKeyB64, senderRatchetPrivB64, senderRatchetPubB64Out, 0, 0, 0)
 
 	// Sertakan localRatchetPub di dalam payload agar receiver bisa init RecvChainKey
-	type x3dhPayload struct {
-		Data        []byte `json:"d"`
-		RatchetPub  string `json:"rp"`
-	}
-	encryptedBytes, err := corecrypto.EncryptMessageRaw(aesKey, jsonPayload)
-	if err != nil { return err }
-
 	ePubB64 := base64.StdEncoding.EncodeToString(ePub)
+	encryptedBytes, err := corecrypto.EncryptMessageRaw(aesKey, jsonPayload)
+	if err != nil { return "", err }
+
 	// Format: X3DH:keyID:ePub:senderRatchetPub:encryptedPayload
 	finalWireEnvelope := fmt.Sprintf("X3DH:%s:%s:%s:%s", keyID, ePubB64, senderRatchetPubB64Out, base64.StdEncoding.EncodeToString(encryptedBytes))
+	return finalWireEnvelope, nil
+}
+
+func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID, env MessageEnvelope) error {
+	jsonPayload, _ := json.Marshal(env)
+	finalWireEnvelope, err := prepareSecureEnvelope(ctx, h, priv, targetID, jsonPayload)
+	if err != nil {
+		return err
+	}
 	return transmitEnvelope(ctx, h, targetID, finalWireEnvelope)
 }
 
@@ -860,13 +1053,19 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 		Signature: sigB64,
 	}
 
+	// Simpan pesan ke sent-message buffer per-peer.
+	// Jika receiver mengalami masalah sesi dan mengirim REQUEST_X3DH,
+	// pesan ini akan di-kirim ulang setelah X3DH baru selesai.
+	trackSentMessage(target.String(), env)
+	TrackMsgSent() // Track outgoing message
+
 	return msgID, sendSecureEnvelope(ctx, h, priv, target, env)
 }
 
 func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWireEnvelope string) error {
 	if target == h.ID() {
 		logger.Info().Msg("transmitEnvelope: Self-message detected, processing locally without network dial")
-		go ProcessSecureEnvelope(ctx, h, h.ID(), finalWireEnvelope)
+		go ProcessSecureEnvelope(ctx, h, h.ID(), finalWireEnvelope, "")
 		return nil
 	}
 
@@ -906,6 +1105,8 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 		}
 		s.Close()
 		if errWrite == nil {
+			// Track outgoing bytes (4-byte length prefix + envelope payload)
+			AddBytesSent(4 + len(finalWireEnvelope))
 			return nil
 		}
 		logger.Warn().Err(errWrite).Str("target", target.String()).Msg("transmitEnvelope: Direct write failed, falling back to mailbox")

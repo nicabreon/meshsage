@@ -57,6 +57,9 @@ func InitDatabase(dbPath string) error {
 		sender_id TEXT NOT NULL,
 		recipient_id TEXT NOT NULL,
 		content TEXT NOT NULL,
+		msg_id TEXT,
+		msg_hash TEXT,
+		msg_type TEXT,
 		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	
@@ -186,12 +189,36 @@ func InitDatabase(dbPath string) error {
 		zkp_x TEXT NOT NULL,
 		zkp_y TEXT NOT NULL,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	-- 10. Network stats (cumulative data usage, persisted across sessions)
+	CREATE TABLE IF NOT EXISTS network_stats (
+		id INTEGER PRIMARY KEY CHECK(id = 1),
+		total_sent INTEGER NOT NULL DEFAULT 0,
+		total_recv INTEGER NOT NULL DEFAULT 0,
+		msg_sent INTEGER NOT NULL DEFAULT 0,
+		msg_recv INTEGER NOT NULL DEFAULT 0,
+		handshakes INTEGER NOT NULL DEFAULT 0,
+		file_sent INTEGER NOT NULL DEFAULT 0,
+		file_recv INTEGER NOT NULL DEFAULT 0,
+		last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	
+	-- 11. Persistent mailbox deduplication cache (hashes of successfully decrypted offline messages)
+	CREATE TABLE IF NOT EXISTS processed_mailbox_messages (
+		msg_hash TEXT PRIMARY KEY,
+		processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	_, err = DB.Exec(query)
 	if err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
+
+	// Run migrations to add missing columns to messages table if they do not exist
+	_, _ = DB.Exec("ALTER TABLE messages ADD COLUMN msg_id TEXT;")
+	_, _ = DB.Exec("ALTER TABLE messages ADD COLUMN msg_hash TEXT;")
+	_, _ = DB.Exec("ALTER TABLE messages ADD COLUMN msg_type TEXT;")
 
 	// Database versioning & migration runner
 	var currentVersion int
@@ -333,13 +360,13 @@ func GetPreKeyCount(ownerID string) int {
 }
 
 // SaveMessage stores a message in the local database.
-func SaveMessage(senderID, recipientID, content string) error {
+func SaveMessage(senderID, recipientID, content, msgID, msgHash, msgType string) error {
 	if DB == nil {
 		return fmt.Errorf("database not initialized")
 	}
 
-	query := `INSERT INTO messages (sender_id, recipient_id, content) VALUES (?, ?, ?)`
-	_, err := DB.Exec(query, senderID, recipientID, content)
+	query := `INSERT INTO messages (sender_id, recipient_id, content, msg_id, msg_hash, msg_type) VALUES (?, ?, ?, ?, ?, ?)`
+	_, err := DB.Exec(query, senderID, recipientID, content, msgID, msgHash, msgType)
 	if err != nil {
 		return fmt.Errorf("failed to insert message: %w", err)
 	}
@@ -427,6 +454,44 @@ func EvictOldestMessages(targetUsage int64) error {
 		fmt.Printf("[Storage] Evicted 1 old message to free up space (Current usage: %d bytes)\n", current)
 	}
 	return nil
+}
+
+// SaveProcessedMailboxMessage stores a message hash that has been successfully processed
+func SaveProcessedMailboxMessage(msgHash string) error {
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	_, err := DB.Exec(`INSERT OR IGNORE INTO processed_mailbox_messages (msg_hash) VALUES (?)`, msgHash)
+	return err
+}
+
+// IsMailboxMessageProcessed checks if a message hash has already been successfully processed
+func IsMailboxMessageProcessed(msgHash string) bool {
+	if DB == nil {
+		return false
+	}
+	var exists int
+	err := DB.QueryRow(`SELECT 1 FROM processed_mailbox_messages WHERE msg_hash = ?`, msgHash).Scan(&exists)
+	return err == nil
+}
+
+// DeleteProcessedMailboxMessage removes a message hash (e.g. if decryption failed)
+func DeleteProcessedMailboxMessage(msgHash string) error {
+	if DB == nil {
+		return nil
+	}
+	_, err := DB.Exec(`DELETE FROM processed_mailbox_messages WHERE msg_hash = ?`, msgHash)
+	return err
+}
+
+// GetMessageByHash retrieves a message by its hash
+func GetMessageByHash(msgHash string) (string, string, string, string, string, error) {
+	if DB == nil {
+		return "", "", "", "", "", fmt.Errorf("database not initialized")
+	}
+	var senderID, recipientID, content, msgID, msgType string
+	err := DB.QueryRow(`SELECT sender_id, recipient_id, content, COALESCE(msg_id, ''), COALESCE(msg_type, '') FROM messages WHERE msg_hash = ?`, msgHash).Scan(&senderID, &recipientID, &content, &msgID, &msgType)
+	return senderID, recipientID, content, msgID, msgType, err
 }
 
 // SaveSession persists the Double Ratchet session state for a peer
@@ -854,9 +919,27 @@ func GetZKPMembers() (map[string]crypto.PubKeyPoint, error) {
 
 // CleanZKPMembersExceptOwner deletes all ZKP members except the specified owner ID
 func CleanZKPMembersExceptOwner(ownerID string) error {
-	if DB == nil { return fmt.Errorf("database not initialized") }
-	_, err := DB.Exec("DELETE FROM zkp_members WHERE peer_id != ?", ownerID)
+	_, err := DB.Exec(`DELETE FROM zkp_members WHERE peer_id != ?`, ownerID)
 	return err
 }
 
+// LoadNetworkStats loads cumulative data usage counters from the database.
+// Returns [totalSent, totalRecv, msgSent, msgRecv, handshakes, fileSent, fileRecv].
+func LoadNetworkStats() ([7]int64, error) {
+	var s [7]int64
+	err := DB.QueryRow(`
+		SELECT total_sent, total_recv, msg_sent, msg_recv, handshakes, file_sent, file_recv
+		FROM network_stats WHERE id = 1`).Scan(
+		&s[0], &s[1], &s[2], &s[3], &s[4], &s[5], &s[6])
+	return s, err
+}
 
+// SaveNetworkStats persists cumulative data usage counters to the database.
+func SaveNetworkStats(totalSent, totalRecv, msgSent, msgRecv, handshakes, fileSent, fileRecv int64) error {
+	_, err := DB.Exec(`
+		INSERT OR REPLACE INTO network_stats
+			(id, total_sent, total_recv, msg_sent, msg_recv, handshakes, file_sent, file_recv, last_updated)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		totalSent, totalRecv, msgSent, msgRecv, handshakes, fileSent, fileRecv)
+	return err
+}

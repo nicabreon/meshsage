@@ -438,10 +438,19 @@ func decryptAndDispatchGroupMsg(ctx context.Context, session *GroupSession, grou
 	}
 
 	ts := time.Now().Format("02/01 15:04:05")
+	
+	msgID := ""
+	if gMsg.Signature != "" {
+		msgID = fmt.Sprintf("gr-%x", sha256.Sum256([]byte(gMsg.Signature)))[:8]
+	} else {
+		msgID = fmt.Sprintf("gr-%x", sha256.Sum256([]byte(gMsg.Payload+gMsg.SenderID+ts)))[:8]
+	}
+
 	logger.Displayf("\033[92m[%s] [Group %s] %s: %s\033[0m\n", ts, meta.GroupAlias, FormatSender(gMsg.SenderID), plaintext)
 	if MessageCallback != nil {
 		MessageCallback(MessageEvent{
 			Type:      "group",
+			MsgID:     msgID,
 			Timestamp: ts,
 			Sender:    gMsg.SenderID,
 			GroupID:   groupID,
@@ -578,7 +587,7 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 }
 
 // ProcessGroupMessage decodes and displays offline group messages
-func ProcessGroupMessage(groupID string, msgBytes []byte) {
+func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) {
 	var gMsg GroupMessage
 	err := json.Unmarshal(msgBytes, &gMsg)
 	if err != nil { return }
@@ -654,10 +663,24 @@ func ProcessGroupMessage(groupID string, msgBytes []byte) {
 	}
 
 	ts := time.Now().Format("02/01 15:04:05")
+	
+	msgID := ""
+	if gMsg.Signature != "" {
+		msgID = fmt.Sprintf("gr-%x", sha256.Sum256([]byte(gMsg.Signature)))[:8]
+	} else {
+		msgID = fmt.Sprintf("gr-%x", sha256.Sum256([]byte(gMsg.Payload+gMsg.SenderID+ts)))[:8]
+	}
+
+	// Save to local SQLite messages database (for deduplication cache recovery)
+	if msgHash != "" {
+		_ = corestore.SaveMessage(gMsg.SenderID, groupID, plaintext, msgID, msgHash, "group")
+	}
+
 	logger.Displayf("\033[92m[%s] [Group %s] %s (Offline): %s\033[0m\n", ts, meta.GroupAlias, FormatSender(gMsg.SenderID), plaintext)
 	if MessageCallback != nil {
 		MessageCallback(MessageEvent{
 			Type:      "group",
+			MsgID:     msgID,
 			Timestamp: ts,
 			Sender:    gMsg.SenderID,
 			GroupID:   groupID,

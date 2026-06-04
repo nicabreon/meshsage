@@ -147,6 +147,9 @@ func main() {
 	coreproto.SetupAliasService(host)
 	coreproto.SetupClusterSync(ctx, host)
 
+	// Start the global sequential mailbox sync manager
+	go coreproto.StartGlobalMailboxSyncManager(ctx, host, priv)
+
 	// Restore group memberships from database in background once we connect to at least one peer
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
@@ -223,15 +226,8 @@ func main() {
 					logger.Info().Str("peerID", remoteID.String()).Msg("IDENTIFIED INFRASTRUCTURE: Triggering Mailbox Sync Manager")
 					go coreproto.StartMailboxSync(ctx, host, remoteID, priv)
 				} else {
-					// Peer bukan infra — cek apakah sudah pernah dichat (ada session di DB).
-					// Jika ya, proaktif warm-up session agar pesan pertama langsung terenkripsi
-					// dengan DR tanpa delay X3DH saat user kirim.
-					if corestore.HasSession(remoteID.String()) {
-						logger.Info().Str("peerID", remoteID.String()).Msg("Known chat peer reconnected — probing session warm-up")
-						go coreproto.ProbeSessionWarmup(ctx, host, priv, remoteID)
-					} else {
-						logger.Debug().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure, no existing session)")
-					}
+					// Proactive session warm-up disabled.
+					logger.Debug().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure)")
 				}
 			}()
 		},

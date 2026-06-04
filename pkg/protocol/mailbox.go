@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -216,7 +218,7 @@ func handleMailboxStream(h host.Host, s network.Stream) {
 
 	rateLimitMutex.Lock()
 	lastTime, exists := rateLimitMap[string(senderID)]
-	if !isInfra && exists && time.Since(lastTime) < 50*time.Millisecond {
+	if !isInfra && exists && time.Since(lastTime) < 1*time.Millisecond {
 		rateLimitMutex.Unlock()
 		logger.Warn().Str("peer", FormatPeerID(string(senderID))).Msg("Rate limit triggered for mailbox request")
 		s.Write([]byte("ERROR_RATE_LIMIT_EXCEEDED\n"))
@@ -294,6 +296,43 @@ func handleMailboxStream(h host.Host, s network.Stream) {
 				})
 			}
 		}
+	case "REPLICATE":
+		if len(parts) < 2 { return }
+		manifestCIDStr := parts[1]
+		go func(cidStr string) {
+			logger.Info().Str("cid", cidStr).Msg("Relay received REPLICATE request for media file")
+			mCID, err := cid.Decode(cidStr)
+			if err != nil {
+				logger.Warn().Err(err).Str("cid", cidStr).Msg("Invalid replication CID")
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			mBlock, err := corenet.GlobalBlockService.GetBlock(ctx, mCID)
+			if err != nil {
+				logger.Warn().Err(err).Str("cid", cidStr).Msg("Failed to fetch manifest block for replication")
+				return
+			}
+			var manifest corestore.FileManifest
+			if err := json.Unmarshal(mBlock.RawData(), &manifest); err != nil {
+				logger.Warn().Err(err).Msg("Failed to unmarshal manifest for replication")
+				return
+			}
+			var cids []cid.Cid
+			for _, cStr := range manifest.Chunks {
+				c, _ := cid.Decode(cStr)
+				cids = append(cids, c)
+			}
+			logger.Info().Str("file", manifest.Name).Int("chunks", len(cids)).Msg("Relay fetching chunks for replication...")
+			blockChan := corenet.GlobalBlockService.GetBlocks(ctx, cids)
+			fetchedCount := 0
+			for b := range blockChan {
+				_ = b
+				fetchedCount++
+			}
+			logger.Info().Str("file", manifest.Name).Int("fetched", fetchedCount).Msg("Relay successfully replicated and cached media file blocks!")
+		}(manifestCIDStr)
+		s.Write([]byte("OK\n"))
 	case "FETCH":
 		coord := parts[1]
 		logger.Debug().Str("coord", coord).Msg("Incoming FETCH request")
@@ -479,6 +518,7 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 	type fetchedEnvelope struct {
 		senderID peer.ID
 		payload  string
+		msgHash  string
 	}
 	var fetched []fetchedEnvelope
 	foundCount := 0
@@ -499,25 +539,73 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 			}
 			break
 		}
-		if line == "ERROR" {
-			logger.Debug().Str("peerID", relayID.String()).Msg("Mailbox fetch: relay returned ERROR status")
+		if strings.HasPrefix(line, "ERROR") {
+			logger.Warn().Str("peerID", relayID.String()).Str("status", line).Msg("Mailbox fetch: relay returned error status")
 			break
 		}
 
 		parts := strings.Split(line, " ")
-		if len(parts) < 4 || parts[0] != "MSG" { continue }
-
-		msgHash := parts[1]
-		if _, loaded := processedMailboxMessages.LoadOrStore(msgHash, true); loaded {
-			logger.Debug().Str("hash", msgHash).Msg("Mailbox: Message already processed, skipping duplicate")
+		if len(parts) < 4 || parts[0] != "MSG" {
+			logger.Warn().Str("line", line).Msg("Mailbox fetch: ignored invalid/malformed response line from relay")
 			continue
 		}
 
-		foundCount++
+		msgHash := parts[1]
+		// Check in-memory cache first (already marked true)
+		if statusVal, loaded := processedMailboxMessages.Load(msgHash); loaded && statusVal == true {
+			logger.Info().Str("hash", msgHash).Msg("Mailbox fetch: Message already processed (in-memory), skipping duplicate")
+			continue
+		}
+		// Check persistent database cache
+		if corestore.IsMailboxMessageProcessed(msgHash) {
+			processedMailboxMessages.Store(msgHash, true) // cache it
+			logger.Info().Str("hash", msgHash).Msg("Mailbox fetch: Message already processed (DB), skipping duplicate")
+			
+			// Dispatch the already decrypted message from SQLite in case the UI missed it
+			sender, recipient, content, msgID, msgType, err := corestore.GetMessageByHash(msgHash)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					logger.Debug().Str("hash", msgHash).Msg("Mailbox fetch: message hash not found in messages DB (this is normal for handshakes/status reports)")
+				} else {
+					logger.Warn().Err(err).Str("hash", msgHash).Msg("Mailbox fetch: failed to retrieve message by hash from DB")
+				}
+			} else if msgID != "" {
+				ts := time.Now().Format("02/01 15:04:05")
+				if MessageCallback != nil {
+					var groupID string
+					if msgType == "group" {
+						groupID = recipient
+					}
+					MessageCallback(MessageEvent{
+						Type:      msgType,
+						Timestamp: ts,
+						Sender:    sender,
+						GroupID:   groupID,
+						Content:   content,
+						MsgID:     msgID,
+					})
+				}
+			} else {
+				logger.Warn().Str("hash", msgHash).Msg("Mailbox fetch: message by hash in DB has empty msgID")
+			}
+			continue
+		}
+		// Mark as processing in memory to prevent concurrent fetches
+		status, loaded := processedMailboxMessages.LoadOrStore(msgHash, "processing")
+		if loaded {
+			logger.Info().Str("hash", msgHash).Interface("status", status).Msg("Mailbox fetch: Message already in-flight or processed, skipping duplicate")
+			continue
+		}
+
 		senderPubkeyB64 := parts[2]
 		payloadB64 := parts[3]
 
-		payload, _ := base64.StdEncoding.DecodeString(payloadB64)
+		payload, errDecPayload := base64.StdEncoding.DecodeString(payloadB64)
+		if errDecPayload != nil {
+			logger.Error().Err(errDecPayload).Str("hash", msgHash).Msg("Mailbox fetch: failed to decode payload base64, skipping message")
+			processedMailboxMessages.Delete(msgHash)
+			continue
+		}
 
 		// Derive senderID from the marshalled libp2p public key stored by the sender.
 		// We cannot use peer.Decode here because the stored value is raw pubkey bytes
@@ -530,19 +618,31 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 				senderID, _ = peer.IDFromPublicKey(pubKey)
 				// Cache the address in peerstore so the reply can reach them
 				h.Peerstore().AddPubKey(senderID, pubKey)
+			} else {
+				logger.Error().Err(errUnmarshal).Str("hash", msgHash).Msg("Mailbox fetch: failed to unmarshal public key")
 			}
+		} else {
+			logger.Error().Err(errDec).Str("hash", msgHash).Msg("Mailbox fetch: failed to decode public key base64")
 		}
 		if senderID == "" {
 			// Fallback: try treating the field as a plain peer ID string (legacy messages)
-			senderID, _ = peer.Decode(senderPubkeyB64)
+			var errFallback error
+			senderID, errFallback = peer.Decode(senderPubkeyB64)
+			if errFallback != nil {
+				logger.Error().Err(errFallback).Str("hash", msgHash).Msg("Mailbox fetch: fallback peer.Decode failed")
+			}
 		}
 		if senderID == "" {
-			logger.Warn().Str("hash", msgHash).Msg("Mailbox: could not derive senderID, skipping message")
+			logger.Error().Str("hash", msgHash).Msg("Mailbox fetch: could not derive senderID, skipping message")
+			processedMailboxMessages.Delete(msgHash)
 			continue
 		}
+
+		foundCount++
 		fetched = append(fetched, fetchedEnvelope{
 			senderID: senderID,
 			payload:  string(payload),
+			msgHash:  msgHash,
 		})
 	}
 
@@ -557,7 +657,7 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 	})
 
 	for _, msg := range fetched {
-		ProcessSecureEnvelope(ctx, h, msg.senderID, msg.payload)
+		ProcessSecureEnvelope(ctx, h, msg.senderID, msg.payload, msg.msgHash)
 	}
 }
 
@@ -623,8 +723,15 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 	// 1. Refill pre-keys
 	go AutoRefillPreKeys(ctx, h, relayID, privKey)
 
-	// 2. Fetch mailbox messages immediately
-	go FetchMailboxMessages(ctx, h, relayID, privKey)
+	// 2. Fetch mailbox messages immediately (staggered to avoid rate limiting on startup)
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+			FetchMailboxMessages(ctx, h, relayID, privKey)
+		}
+	}()
 
 	// 3. Keep-alive subscription loop (runs in its own goroutine)
 	go func() {
@@ -666,22 +773,6 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 		}
 	}()
 
-	// 4. Concurrent 2-second fast polling loop
-	go func() {
-		logger.Info().Str("peerID", relayID.String()).Msg("Starting concurrent 2-second fast polling loop")
-		pollTicker := time.NewTicker(2 * time.Second)
-		defer pollTicker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-pollTicker.C:
-				go FetchMailboxMessages(ctx, h, relayID, privKey)
-			}
-		}
-	}()
-
 	// 5. Concurrent 30-second pre-key refill check loop
 	go func() {
 		refillTicker := time.NewTicker(30 * time.Second)
@@ -697,5 +788,113 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 		}
 	}()
 }
+
+func ReplicateFileToRelays(ctx context.Context, h host.Host, manifestCID string) {
+	// Find all connected dedicated relays
+	var relays []peer.ID
+	for _, p := range h.Network().Peers() {
+		protos, err := h.Peerstore().GetProtocols(p)
+		if err != nil {
+			continue
+		}
+		isDedicated := false
+		for _, proto := range protos {
+			if string(proto) == DedicatedProtocolID {
+				isDedicated = true
+				break
+			}
+		}
+		if isDedicated {
+			relays = append(relays, p)
+		}
+	}
+
+	if len(relays) == 0 {
+		logger.Warn().Msg("[Replication] No connected Dedicated Relays found to replicate file")
+		return
+	}
+
+	logger.Info().Str("cid", manifestCID).Int("count", len(relays)).Msg("[Replication] Requesting file replication to dedicated relays...")
+
+	for _, relayID := range relays {
+		go func(rID peer.ID) {
+			sCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+
+			s, err := h.NewStream(sCtx, rID, protocol.ID(MailboxProtocolID))
+			if err != nil {
+				logger.Warn().Str("relay", rID.String()).Err(err).Msg("[Replication] Failed to open mailbox stream to relay")
+				return
+			}
+			defer s.Close()
+
+			cmd := fmt.Sprintf("REPLICATE %s\n", manifestCID)
+			_, err = s.Write([]byte(cmd))
+			if err != nil {
+				logger.Warn().Str("relay", rID.String()).Err(err).Msg("[Replication] Failed to write REPLICATE command to relay")
+				return
+			}
+
+			buf := bufio.NewReader(s)
+			resp, err := buf.ReadString('\n')
+			if err != nil {
+				logger.Warn().Str("relay", rID.String()).Err(err).Msg("[Replication] Failed to read response from relay")
+				return
+			}
+
+			if strings.TrimSpace(resp) == "OK" {
+				logger.Info().Str("relay", rID.String()).Msg("[Replication] Dedicated Relay accepted replication request")
+			} else {
+				logger.Warn().Str("relay", rID.String()).Str("resp", resp).Msg("[Replication] Dedicated Relay returned non-OK status")
+			}
+		}(relayID)
+	}
+}
+
+// StartGlobalMailboxSyncManager runs a single global loop to fetch mailbox messages
+// sequentially from all connected infrastructure/relay nodes every 2 seconds.
+func StartGlobalMailboxSyncManager(ctx context.Context, h host.Host, privKey crypto.PrivKey) {
+	logger.Info().Msg("Starting Global Mailbox Sync Manager (sequential polling)...")
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// 1. Find all connected peers
+			peers := h.Network().Peers()
+			if len(peers) == 0 {
+				continue
+			}
+
+			// 2. Filter to find peers that support the mailbox protocol
+			var relays []peer.ID
+			for _, p := range peers {
+				protos, err := h.Peerstore().GetProtocols(p)
+				if err != nil {
+					continue
+				}
+				isRelay := false
+				for _, proto := range protos {
+					if string(proto) == InfrastructureProtocolID {
+						isRelay = true
+						break
+					}
+				}
+				if isRelay {
+					relays = append(relays, p)
+				}
+			}
+
+			// 3. Fetch from each relay sequentially (synchronously)
+			for _, rID := range relays {
+				FetchMailboxMessages(ctx, h, rID, privKey)
+			}
+		}
+	}
+}
+
 
 

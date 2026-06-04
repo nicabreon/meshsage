@@ -358,3 +358,135 @@ This was caused by a split-second difference (timestamp drift) between the metad
 3. **Flutter App Recompile:** Rebuilt the native library binaries using `./build_android.sh` and successfully recompiled the Flutter Android APK (`meshsage.apk`).
 
 
+---
+
+## Walkthrough: Media File Replication to Dedicated Relays
+
+### Problem Solved
+When a sender behind a symmetric NAT or private network uploaded a file, other nodes in the network could not download the file blocks directly from the sender's local storage block service via Bitswap dial. This resulted in downloads hanging in a permanent loading state.
+
+### Changes Made
+1. **Overlayed Replication Protocol:** Added a `REPLICATE <manifestCID>` command to the existing `/p2p-core/mailbox/1.0.0` protocol, allowing communication over active outbound mailbox streams without requiring additional port/protocol registrations.
+2. **Replication Command Handler on Relays:**
+   - Modified `handleMailboxStream` in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go) to handle `REPLICATE`.
+   - The relay decodes the CID, fetches the file manifest block, parses the JSON to extract the CIDs of all file chunks, and downloads all chunk blocks via Bitswap, caching them in the relay's in-memory datastore.
+3. **Sender Replication Trigger:**
+   - Implemented `ReplicateFileToRelays` in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go) to discover connected Dedicated Relays (marked by `/p2p-core/infra/dedicated/1.1.0`) and request replication.
+   - Updated `UploadFile` in [main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/libmeshsage/main.go) to trigger replication asynchronously immediately after a successful upload.
+
+---
+
+## Walkthrough: Media Previews & Zoomable Image Viewer
+
+### Problem Solved
+1. **Raw JSON in Previews:** In both the Direct Chat and Group Chat tabs, media messages (images, videos, audio) showed raw serialized JSON metadata in the last message preview instead of clean, user-friendly labels.
+2. **Static Image Bubble:** Clicked images in the chat room could not be enlarged or zoomed, making it difficult to view details.
+
+### Changes Made
+1. **Friendly Preview Getter:**
+   - Added a `displayContent` getter to the `ChatMessage` model in [p2p_state.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/p2p_state.dart) that maps media message types to friendly indicators like `📷 Image`, `🎥 Video`, or `🎵 Audio`.
+   - Refactored [direct_chat_tab.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/tabs/direct_chat_tab.dart) and [group_chat_tab.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/tabs/group_chat_tab.dart) to display `displayContent` instead of raw `content`.
+2. **Interactive Image Zoom Viewer:**
+   - Implemented `FullScreenImageViewer` using Flutter's built-in `InteractiveViewer` to allow users to zoom (pinch) and pan images in full screen.
+   - Wrapped the downloaded image in `ImageBubble` inside [chat_room_screen.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/screens/chat_room_screen.dart) with a `GestureDetector` that routes to `FullScreenImageViewer` on tap.
+
+### Verification Results
+1. **Go package tests passed:** All tests under `pkg/protocol` compiled and passed.
+2. **Successful Rebuild:** The native libraries compiled successfully for all architectures using `build_android.sh`.
+3. **Flutter APK Built:** The Flutter release APK (`meshsage.apk`) built and packaged the new assets successfully.
+
+---
+
+## Walkthrough: Android Foreground Service & Local Notifications
+
+### Problem Solved
+1. **Background App Suspension:** When the mobile client was minimized or backgrounded, the OS suspended CPU cycles and network access (Doze Mode), stopping the P2P message sync.
+2. **Missing Notification Support:** There was no notification channel or system banner to alert the user of new incoming messages when the app was minimized or in the foreground.
+
+### Changes Made
+1. **Foreground Service & Wake Lock:**
+   - Declared `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC`, and `WAKE_LOCK` permissions in [AndroidManifest.xml](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/android/app/src/main/AndroidManifest.xml).
+   - Created [P2PBackgroundService.kt](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/android/app/src/main/kotlin/com/nicabreon/meshsage/meshsage_flutter/P2PBackgroundService.kt) to manage a persistent background service running under the compliant `dataSync` category. The service displays an ongoing sync notification.
+   - Updated [MainActivity.kt](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/android/app/src/main/kotlin/com/nicabreon/meshsage/meshsage_flutter/MainActivity.kt) to auto-start the background service on startup.
+2. **Runtime Permission Prompt:**
+   - Modified `MainActivity.kt` to trigger the Android `POST_NOTIFICATIONS` runtime permission request dialog automatically on startup for Android 13+ devices, ensuring standard compliance.
+3. **Local Message Notifications (MethodChannel):**
+   - Configured a MethodChannel (`com.nicabreon.meshsage/notifications`) in `MainActivity.kt` to allow Flutter to trigger system notifications.
+   - In [p2p_state.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/p2p_state.dart), added a trigger that fires whenever a new message is received from a peer (`!isMe`).
+   - The notification title dynamically displays either the sender's alias/display name or the group title formatted as `Group (Sender)`. The notification body displays the message content formatted cleanly via `displayContent` (e.g. `📷 Image` or the text body).
+
+### Verification Results
+1. **Successful Rebuild:** The Flutter app compiled and built successfully with the new Android configurations.
+2. **Permissions Prompt Verified:** Tested on the emulator running Android 16 (API 36); the app successfully prompts for notification access on first launch.
+3. **Background Sync Active:** Verified that minimizing the app displays a persistent notification drawer item showing "Meshsage P2P Active", preventing OS suspension.
+4. **Heads-up Notifications Verified:** Verified that incoming messages trigger a heads-up system banner notification with sound.
+5. **Chat Input Spacing Alignment:** Removed default IconButton padding/constraints and set the spacing between the attachment button and the message input field to 16dp, aligning the button to the left edge of the screen container and optimizing readability.
+
+---
+
+## Walkthrough: Resilient Mailbox Message Deduplication & Handshake Recovery
+
+### Problem Solved
+When a client fetched offline messages from relay mailboxes:
+1. The message hash was stored in `processedMailboxMessages` (marked as `true`) immediately upon fetching the envelope, *before* it was decrypted.
+2. If decryption failed temporarily (for example, due to a missing Double Ratchet session, or because B did not have the X3DH pre-keys yet), the envelope was skipped on future mailbox fetches from other replica relays because the hash was already marked as processed.
+3. This resulted in fetched messages permanently failing to decrypt and failing to show up in the chat window.
+
+### Changes Made
+1. **Deferred Hash Deduplication (Go Backend):**
+   - Modified `FetchMailboxMessages` in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go) to mark fetched message hashes as `"processing"` instead of immediately setting `true`.
+   - Modified `ProcessSecureEnvelope` in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go) to accept the `msgHash` as a parameter.
+   - Introduced a `defer` block in `ProcessSecureEnvelope` that executes at the end of processing: if the envelope is processed/decrypted successfully, the hash is permanently marked as processed (`true`). If decryption fails, the hash is deleted from `processedMailboxMessages`, allowing subsequent mailbox fetches from other relays to attempt decryption again.
+   - Cleaned up the `"processing"` status if message parsing fails early inside `FetchMailboxMessages`.
+
+### Verification Results
+1. **Unit Tests Passed:** All tests in `pkg/protocol/...` passed successfully.
+2. **E2E Swarm Tests Passed:** Ran the full E2E swarm test suite (`e2e_test_scenarios.sh`), confirming that:
+   - Alice -> Bob (Offline) works perfectly.
+   - Bob successfully /fetches the offline message from the Mailbox and decrypts it after recovery.
+3. **Flutter APK Built Successfully:** Compiled the updated native library using `./build_android.sh` and built the release APK successfully.
+
+---
+
+## Walkthrough: Peer Lock Refactoring, Decryption Status Propagation, & Timestamp Alignment
+
+### Problem Solved
+1. **Network-Bound Lock Deadlocks/Delays:** When sending a message (which runs `sendSecureEnvelope` and locks `sessionMu` per peer), the lock was held during the entire network dial, DHT peer lookup, and offline mailbox upload process. If the direct connection failed, this process took up to 35 seconds to fallback to offline storage. During this time, any incoming messages from the same peer (fetched from the mailbox) were blocked trying to acquire the same `sessionMu` lock, preventing decryption and causing a complete block in message arrival.
+2. **Unpropagated Validation Failures:** In `ProcessSecureEnvelope`, `success = true` was set unconditionally after calling `processDecryptedPayload`, even if the decrypted JSON payload failed to parse or failed signature verification. This permanently marked the message hash as processed in `processedMailboxMessages` and SQLite, causing the client to skip fetching/decrypting it on subsequent attempts.
+3. **Timestamp Misalignment:** Go's `MessageCallback` did not include the `unix_time` field in the JSON event sent to the Flutter app. As a result, the Flutter app defaulted the message time to `DateTime.now()` on startup or sync.
+
+### Changes Made
+1. **Refactored Peer Locking in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go):**
+   - Split `sendSecureEnvelope` into `prepareSecureEnvelope` (which holds `sessionMu` to perform ratchets and update session state) and `sendSecureEnvelope` (which calls `transmitEnvelope` outside the lock).
+   - This releases the lock instantly after encryption, preventing network delays/timeouts from blocking incoming messages.
+2. **Propagated Decryption Status in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go):**
+   - Refactored `processDecryptedPayload` to return a `bool` representing success/failure.
+   - Updated `ProcessSecureEnvelope` to set `success = true` only if `processDecryptedPayload` returns `true`.
+3. **Added Unknown Type Logging in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go):**
+   - Added a `default` case warning inside `handleIncomingPayload` to log when envelopes with unhandled/unknown types are received.
+4. **Included `unix_time` in FFI message event callback in [main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/libmeshsage/main.go):**
+   - Added `"unix_time": event.UnixTime` to the event JSON sent from `libmeshsage`'s `MessageCallback` to the Flutter client, ensuring that incoming messages have accurate, persistent timestamps.
+
+### Verification Results
+- All Go unit tests under `pkg/` compiled and passed.
+- Successfully built `cmd/node/main.go` and `cmd/libmeshsage/main.go`.
+- Recompiled Android native shared libraries (`libmeshsage.so`) for all architectures (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`).
+- Verified that the Flutter JNI folder has been correctly updated.
+
+---
+
+## Walkthrough: Fixed Relay Stream Resets (Target Infrastructure Only)
+
+### Problem Solved
+- **Relay Stream Reset Errors:** In the relays' logs (like `p2p-relay-1`, `p2p-relay-2`, `p2p-relay-3`), there were multiple warning/debug logs: `Mailbox fetch: read error during stream iteration error="stream reset (remote)"`.
+- **Root Cause:** In the global sync manager (`StartGlobalMailboxSyncManager`), targets were chosen by checking if they supported `MailboxProtocolID`. Since both relays and normal clients support this protocol (to fetch/store messages), the relays attempted to fetch mailbox messages from normal clients. However, normal clients do not act as relays (`corenet.ShouldActAsRelay() == false`) and reject the incoming fetch request by calling `s.Reset()`, which triggered a "stream reset" error on the relays.
+
+### Changes Made
+- Modified `StartGlobalMailboxSyncManager` in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go) to filter sync targets using `InfrastructureProtocolID` (`/p2p-core/infra/1.1.0`) instead of `MailboxProtocolID`.
+- This ensures that clients and relays only query actual infrastructure/relay nodes that are capable of serving mailbox requests, preventing unnecessary connections and completely eliminating the stream reset errors in the logs.
+
+### Verification Results
+- Verified that Go tests pass successfully.
+- Rebuilt CLI node binaries for local and Linux architectures (`meshsage` and `p2p-node-relay`).
+- Rebuilt Android shared libraries (`libmeshsage.so`) for all architectures.
+

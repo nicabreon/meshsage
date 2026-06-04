@@ -202,6 +202,7 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 	if err := corestore.InitDatabase(dbPath); err != nil {
 		return C.CString("Failed to init SQLite: " + err.Error())
 	}
+	coreproto.InitStats()
 
 	// 5. Setup Host Context & Relays
 	globalCtx, globalCancel = context.WithCancel(context.Background())
@@ -272,6 +273,9 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 	coreproto.SetupAliasService(host)
 	coreproto.SetupClusterSync(globalCtx, host)
 
+	// Start the global sequential mailbox sync manager
+	go coreproto.StartGlobalMailboxSyncManager(globalCtx, host, priv)
+
 	// Hook the structured message callback to send JSON events to the queue
 	coreproto.MessageCallback = func(event coreproto.MessageEvent) {
 		data, err := json.Marshal(map[string]interface{}{
@@ -282,6 +286,7 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 			"sender":    event.Sender,
 			"group_id":  event.GroupID,
 			"content":   event.Content,
+			"unix_time": event.UnixTime,
 		})
 		if err == nil {
 			eventQueue.Push(string(data))
@@ -368,15 +373,8 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 					logger.Info().Str("peerID", remoteID.String()).Msg("IDENTIFIED INFRASTRUCTURE: Triggering Mailbox Sync Manager")
 					go coreproto.StartMailboxSync(globalCtx, host, remoteID, priv)
 				} else {
-					// Peer bukan infra — cek apakah sudah pernah dichat (ada session di DB).
-					// Jika ya, proaktif warm-up session agar pesan pertama langsung terenkripsi
-					// dengan DR tanpa delay X3DH saat user kirim.
-					if corestore.HasSession(remoteID.String()) {
-						logger.Info().Str("peerID", remoteID.String()).Msg("Known chat peer reconnected — probing session warm-up")
-						go coreproto.ProbeSessionWarmup(globalCtx, host, priv, remoteID)
-					} else {
-						logger.Debug().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure, no existing session)")
-					}
+					// Proactive session warm-up disabled.
+					logger.Debug().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure)")
 				}
 			}()
 		},
@@ -608,6 +606,7 @@ func FreeString(ptr *C.char) {
 
 //export StopNode
 func StopNode() {
+	coreproto.SaveStatsNow()
 	if globalHost != nil {
 		logger.Warn().Msg("Stopping the Go node in background...")
 		if globalCancel != nil {
@@ -625,6 +624,12 @@ func StopNode() {
 		eventQueue = NewQueue()
 	}
 }
+
+//export GetNetworkStats
+func GetNetworkStats() *C.char {
+	return C.CString(coreproto.GetNetworkStatsJSON())
+}
+
 
 //export CreateGroupProper
 func CreateGroupProper(aliasStr, groupTypeStr, membersStr *C.char) *C.char {
@@ -1098,6 +1103,83 @@ func TriggerMailboxFetch() *C.char {
 		}
 	}
 	return C.CString(fmt.Sprintf("Triggered fetch on %d relays", fetchedCount))
+}
+
+//export UploadFile
+func UploadFile(filePathStr *C.char) *C.char {
+	if globalHost == nil {
+		return C.CString(`{"error":"Node not started"}`)
+	}
+
+	filePath := C.GoString(filePathStr)
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return C.CString(fmt.Sprintf(`{"error":"Failed to read file: %s"}`, err.Error()))
+	}
+	filename := filepath.Base(filePath)
+
+	manifestCID, key, thumbnail, err := corestore.UploadFile(globalCtx, data, filename)
+	if err != nil {
+		return C.CString(fmt.Sprintf(`{"error":"Failed to upload file: %s"}`, err.Error()))
+	}
+
+	// Trigger replication of media file blocks to connected Dedicated Relays
+	go coreproto.ReplicateFileToRelays(globalCtx, globalHost, manifestCID)
+
+	resp := struct {
+		ManifestCID string `json:"manifest_cid"`
+		Key         string `json:"key"`
+		Thumbnail   string `json:"thumbnail"`
+	}{
+		ManifestCID: manifestCID,
+		Key:         key,
+		Thumbnail:   thumbnail,
+	}
+
+	bytes, _ := json.Marshal(resp)
+	return C.CString(string(bytes))
+}
+
+//export DownloadFile
+func DownloadFile(manifestCIDStr, keyB64Str, savePathStr *C.char) *C.char {
+	if globalHost == nil {
+		return C.CString(`{"error":"Node not started"}`)
+	}
+
+	manifestCID := C.GoString(manifestCIDStr)
+	keyB64 := C.GoString(keyB64Str)
+	savePath := C.GoString(savePathStr)
+
+	// Create a 30-second timeout context for download operation to prevent permanent hangs
+	downloadCtx, cancel := context.WithTimeout(globalCtx, 30*time.Second)
+	defer cancel()
+
+	data, filename, err := corestore.DownloadFile(downloadCtx, manifestCID, keyB64)
+	if err != nil {
+		return C.CString(fmt.Sprintf(`{"error":"Failed to download file: %s"}`, err.Error()))
+	}
+
+	// Create directories if they do not exist
+	dir := filepath.Dir(savePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return C.CString(fmt.Sprintf(`{"error":"Failed to create directory: %s"}`, err.Error()))
+	}
+
+	err = os.WriteFile(savePath, data, 0644)
+	if err != nil {
+		return C.CString(fmt.Sprintf(`{"error":"Failed to write decrypted file: %s"}`, err.Error()))
+	}
+
+	resp := struct {
+		Success  bool   `json:"success"`
+		Filename string `json:"filename"`
+	}{
+		Success:  true,
+		Filename: filename,
+	}
+
+	bytes, _ := json.Marshal(resp)
+	return C.CString(string(bytes))
 }
 
 func main() {
