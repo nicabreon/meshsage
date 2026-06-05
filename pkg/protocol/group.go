@@ -217,6 +217,11 @@ func JoinGroupProper(ctx context.Context, h host.Host, priv crypto.PrivKey, grou
 	}
 	_ = corestore.AddGroupMemberV2(groupID, myID, myRole)
 
+	// Ensure group creator is registered to group_members_v2
+	if creatorID != "" {
+		_ = corestore.AddGroupMemberV2(groupID, creatorID, "CREATOR")
+	}
+
 	// 5. Initialize/Share keys ONLY if it's a SECURE group
 	if groupType == "SECURE" {
 		localKey, err := corestore.GetGroupLocalKey(groupID)
