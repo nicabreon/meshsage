@@ -577,7 +577,9 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 	AddBytesSent(len(msgBytes)) // Track outgoing GossipSub bytes
 	TrackMsgSent()              // Track outgoing group message
 
-	// Fan-out via direct message ONLY to members who are NOT currently connected/active.
+	// Fan-out via GRPM for members who are not verified online via a direct connection.
+	// Only peers with a live direct connection (non-relay, ping OK) rely on GossipSub alone.
+	// All others (offline, relayed/mobile, stale) receive GRPM → mailbox fallback.
 	members, err := corestore.GetGroupMembersV2(groupID)
 	if err == nil {
 		for _, m := range members {
@@ -585,8 +587,6 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 			target, errDec := peer.Decode(m.PeerID)
 			if errDec != nil { continue }
 
-			// We launch a background goroutine for each member to handle network ping
-			// and direct/mailbox messaging asynchronously without blocking the publish caller.
 			go func(t peer.ID, memberIDStr string) {
 				bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
@@ -616,11 +616,35 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 					logger.Warn().
 						Str("peer", FormatPeerID(memberIDStr)).
 						Str("group", groupID[:8]).
-						Msg("[Group Fan-out] Stale direct connection detected! Peer is unresponsive to ping. Proceeding to send GRPM.")
+						Msg("[Group Fan-out] Stale direct connection detected! Proceeding to send GRPM.")
 				}
 
-				// Peer is offline or has a stale connection. Send direct message (falls back to mailbox).
-				_, _ = SendMessage(bgCtx, h, privKey, t, "GRPM:"+groupID+":"+string(msgBytes))
+				// Peer is offline, relayed, or has a stale connection.
+				// Send GRPM via direct stream (falls back to mailbox if unreachable).
+				// NOTE: SendMessage requires E2EE session (X3DH + Double Ratchet). If no session
+				// exists yet (e.g. TUI restarted while member was offline), the first attempt
+				// triggers X3DH in background. Retry once after 3s to catch session completion.
+				grpmPayload := "GRPM:" + groupID + ":" + string(msgBytes)
+				_, errSend := SendMessage(bgCtx, h, privKey, t, grpmPayload)
+				if errSend != nil {
+					logger.Warn().
+						Err(errSend).
+						Str("peer", FormatPeerID(memberIDStr)).
+						Str("group", groupID[:8]).
+						Msg("[Group Fan-out] GRPM send failed (no session?), retrying in 3s")
+					go func() {
+						time.Sleep(3 * time.Second)
+						retryCtx, retryCancel := context.WithTimeout(context.Background(), 10*time.Second)
+						defer retryCancel()
+						if _, errRetry := SendMessage(retryCtx, h, privKey, t, grpmPayload); errRetry != nil {
+							logger.Warn().Err(errRetry).Str("peer", FormatPeerID(memberIDStr)).
+								Str("group", groupID[:8]).Msg("[Group Fan-out] GRPM retry failed")
+						} else {
+							logger.Info().Str("peer", FormatPeerID(memberIDStr)).
+								Str("group", groupID[:8]).Msg("[Group Fan-out] GRPM retry succeeded")
+						}
+					}()
+				}
 			}(target, m.PeerID)
 		}
 	}
