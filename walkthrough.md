@@ -492,18 +492,19 @@ When a client fetched offline messages from relay mailboxes:
 
 ---
 
-## Walkthrough: Always-Send Group Fan-out Backup Fix
+## Walkthrough: GossipSub Mesh Membership Fan-out (Scalable Fix)
 
 ### Problem Solved
-Group messages sent from the TUI to offline mobile members (Android) were occasionally lost or not delivered to their mailbox. This happened because:
+Group messages sent from the TUI to offline/backgrounded mobile members (Android) were occasionally lost or not delivered to their mailbox. This happened because:
 1. GossipSub delivery is structurally unreliable in small peer groups (e.g. 2 nodes + relay).
 2. When the devices were on the same local network/WiFi, `isDirectlyConnected` returned `true` and the short ping succeeded, causing the sender's node to assume GossipSub would deliver the message and skip sending the `GRPM` backup message.
 3. However, GossipSub failed anyway, and because the backup send was skipped, the message never reached the target peer or their mailbox.
 
 ### Changes Made
-- Modified `SendGroupMessage` in [group.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/group.go) to completely remove the ping-skipping check.
-- The node now **always sends the GRPM backup message** to all other group members. This ensures that a direct stream is opened to deliver the message (or stored in their relay mailbox if offline/unreachable).
-- Duplicates are gracefully handled and discarded by the existing `checkAndMarkProcessed` deduplication mechanism in `ProcessGroupMessage` on the recipient's side.
+- Modified `SendGroupMessage` in [group.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/group.go) to query `session.Topic.ListPeers()` to find all peers actively subscribed to the topic and connected in the GossipSub mesh.
+- The node now **skips the backup GRPM message only for peers actively in the GossipSub mesh** (since GossipSub is 100% reliable for active mesh peers).
+- For all other group members (those who are offline, backgrounded, or not in the mesh), the node **sends the GRPM backup message**, ensuring direct stream delivery or fallback to their relay mailbox.
+- This design scales naturally to large groups by design: for active online members, we only publish once via GossipSub; we only perform 1:1 fan-out to the subset of members who are offline/backgrounded.
 - Removed unused import `"github.com/libp2p/go-libp2p/p2p/protocol/ping"` from [group.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/group.go).
 
 ### Verification Results

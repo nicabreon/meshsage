@@ -577,8 +577,15 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 	TrackMsgSent()              // Track outgoing group message
 
 	// Fan-out via GRPM for members who are not verified online via a direct connection.
-	// Only peers with a live direct connection (non-relay, ping OK) rely on GossipSub alone.
-	// All others (offline, relayed/mobile, stale) receive GRPM → mailbox fallback.
+	// Get the list of peers currently active in our GossipSub mesh for this topic.
+	// GossipSub delivery is highly reliable to peers directly in our mesh.
+	meshPeers := session.Topic.ListPeers()
+	meshPeerMap := make(map[peer.ID]bool)
+	for _, p := range meshPeers {
+		meshPeerMap[p] = true
+	}
+
+	// Fan-out via GRPM only for members who are NOT in our GossipSub mesh (offline or backgrounded).
 	members, err := corestore.GetGroupMembersV2(groupID)
 	if err == nil {
 		for _, m := range members {
@@ -589,6 +596,14 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 			go func(t peer.ID, memberIDStr string) {
 				bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
+
+				if meshPeerMap[t] {
+					logger.Debug().
+						Str("peer", FormatPeerID(memberIDStr)).
+						Str("group", groupID[:8]).
+						Msg("[Group Fan-out] Skipping GRPM: peer is active in GossipSub mesh")
+					return
+				}
 
 				// Send GRPM via direct stream (falls back to mailbox if unreachable).
 				// NOTE: SendMessage requires E2EE session (X3DH + Double Ratchet). If no session

@@ -875,9 +875,13 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 	// 2. Jika tidak ada sesi, lakukan alur X3DH
 	var keyID, pubKeyB64 string
 	preKeyFound := false
-	logger.Info().Str("target", targetID.String()).Msg("No session found. Initiating X3DH Handshake flow")
+	connectedPeers := h.Network().Peers()
+	logger.Info().
+		Str("target", targetID.String()).
+		Int("peers", len(connectedPeers)).
+		Msg("No session found. Initiating X3DH Handshake flow")
 
-	for _, relayPeer := range h.Network().Peers() {
+	for _, relayPeer := range connectedPeers {
 		logger.Debug().Str("target", targetID.String()).Str("relay", relayPeer.String()).Msg("X3DH HANDSHAKE: Fetching Pre-Key")
 		id, pub, _, err := FetchPreKey(ctx, h, relayPeer, targetID.String())
 		if err == nil && pub != "" {
@@ -887,8 +891,19 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 			logger.Info().Str("target", targetID.String()).Str("relay", relayPeer.String()).Msg("X3DH SUCCESS: Pre-Key found")
 			break
 		}
+		logger.Debug().
+			Err(err).
+			Str("target", targetID.String()).
+			Str("relay", relayPeer.String()).
+			Msg("X3DH: FetchPreKey failed from this peer (not a relay, or no key available)")
 	}
-	if !preKeyFound { return "", fmt.Errorf("no pre-key found") }
+	if !preKeyFound {
+		logger.Warn().
+			Str("target", targetID.String()).
+			Int("peers_tried", len(connectedPeers)).
+			Msg("X3DH FAILED: no pre-key found for target on any connected peer")
+		return "", fmt.Errorf("no pre-key found")
+	}
 
 	logger.Debug().Msg("X3DH HANDSHAKE: Generating Ephemeral Keypair & Deriving Shared Secret")
 	ePriv, ePub, err := corecrypto.GenerateEphemeralKeypair()
