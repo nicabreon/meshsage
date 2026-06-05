@@ -420,98 +420,231 @@ When a sender behind a symmetric NAT or private network uploaded a file, other n
 2. **Permissions Prompt Verified:** Tested on the emulator running Android 16 (API 36); the app successfully prompts for notification access on first launch.
 3. **Background Sync Active:** Verified that minimizing the app displays a persistent notification drawer item showing "Meshsage P2P Active", preventing OS suspension.
 4. **Heads-up Notifications Verified:** Verified that incoming messages trigger a heads-up system banner notification with sound.
-5. **Chat Input Spacing Alignment:** Removed default IconButton padding/constraints and set the spacing between the attachment button and the message input field to 16dp, aligning the button to the left edge of the screen container and optimizing readability.
+5. **Chat Input Spacing Alignment:** Removed default IconButton padding/constraints and set the spacing between the attachment button and the message input field to 12dp, aligning the button to the left edge of the screen container and optimizing readability.
 
 ---
 
-## Walkthrough: Resilient Mailbox Message Deduplication & Handshake Recovery
+## Walkthrough: Dashboard Layout Expansion & Chat Field Optimization
 
 ### Problem Solved
-When a client fetched offline messages from relay mailboxes:
-1. The message hash was stored in `processedMailboxMessages` (marked as `true`) immediately upon fetching the envelope, *before* it was decrypted.
-2. If decryption failed temporarily (for example, due to a missing Double Ratchet session, or because B did not have the X3DH pre-keys yet), the envelope was skipped on future mailbox fetches from other replica relays because the hash was already marked as processed.
-3. This resulted in fetched messages permanently failing to decrypt and failing to show up in the chat window.
+1. **Dashboard Empty Space & Fixed Height Logs:** On devices with larger vertical height, the "LIVE NETWORK LOGS" console had a fixed height of `240` and the page used a `SingleChildScrollView`. This caused the logs console to float in the middle of the screen, leaving a massive empty gap between the console and the bottom navigation bar.
+2. **Chat Room Placeholder Wrap:** On narrower screens, the text field hint text `"Type an encrypted message..."` was too long, causing it to wrap awkwardly onto two lines and increase the height of the message input box.
 
 ### Changes Made
-1. **Deferred Hash Deduplication (Go Backend):**
-   - Modified `FetchMailboxMessages` in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go) to mark fetched message hashes as `"processing"` instead of immediately setting `true`.
-   - Modified `ProcessSecureEnvelope` in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go) to accept the `msgHash` as a parameter.
-   - Introduced a `defer` block in `ProcessSecureEnvelope` that executes at the end of processing: if the envelope is processed/decrypted successfully, the hash is permanently marked as processed (`true`). If decryption fails, the hash is deleted from `processedMailboxMessages`, allowing subsequent mailbox fetches from other relays to attempt decryption again.
-   - Cleaned up the `"processing"` status if message parsing fails early inside `FetchMailboxMessages`.
+1. **Interactive Expanded Logs Console:**
+   - Removed the `SingleChildScrollView` layout wrapper from [dashboard_tab.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/tabs/dashboard_tab.dart) to enable bounded vertical constraints.
+   - Wrapped the logs console container in an `Expanded` widget, allowing it to stretch and fill all remaining vertical space on the screen dynamically across all devices.
+   - Removed `shrinkWrap: true` from the `ListView.builder` inside the console container for optimal scrolling performance.
+   - Set the bottom padding of the dashboard page container to `0` to keep the logs console tightly aligned and flush with the top of the bottom navigation bar.
+2. **Shortened Chat Placeholder Hint:**
+   - Modified [chat_room_screen.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/screens/chat_room_screen.dart) to change the input text field hint text from `"Type an encrypted message..."` to `"Type message..."`. This prevents wrapping on narrower screens and keeps the input interface compact and clean.
 
 ### Verification Results
-1. **Unit Tests Passed:** All tests in `pkg/protocol/...` passed successfully.
-2. **E2E Swarm Tests Passed:** Ran the full E2E swarm test suite (`e2e_test_scenarios.sh`), confirming that:
-   - Alice -> Bob (Offline) works perfectly.
-   - Bob successfully /fetches the offline message from the Mailbox and decrypts it after recovery.
-3. **Flutter APK Built Successfully:** Compiled the updated native library using `./build_android.sh` and built the release APK successfully.
+1. **Dashboard Layout Verified:**
+   - Captured screen layout from emulator `emulator-5554` showing the logs console successfully filling the remaining screen space and resting flush against the bottom navigation bar:
+     ![Dashboard Layout](/Users/nicabreon/.gemini/antigravity-ide/brain/c843137f-2236-403f-b820-8454a27169bd/new_screenshot.png)
+2. **Chat Input Field Verified:**
+   - Verified that the placeholder hint text `"Type message..."` sits on a single line cleanly:
+     ![Chat Screen Placeholder](/Users/nicabreon/.gemini/antigravity-ide/brain/c843137f-2236-403f-b820-8454a27169bd/new_screenshot_chat.png)
 
 ---
 
-## Walkthrough: Peer Lock Refactoring, Decryption Status Propagation, & Timestamp Alignment
+## Walkthrough: Android Task Affinity Resolution (Duplicate Entries in Overview Screen)
 
 ### Problem Solved
-1. **Network-Bound Lock Deadlocks/Delays:** When sending a message (which runs `sendSecureEnvelope` and locks `sessionMu` per peer), the lock was held during the entire network dial, DHT peer lookup, and offline mailbox upload process. If the direct connection failed, this process took up to 35 seconds to fallback to offline storage. During this time, any incoming messages from the same peer (fetched from the mailbox) were blocked trying to acquire the same `sessionMu` lock, preventing decryption and causing a complete block in message arrival.
-2. **Unpropagated Validation Failures:** In `ProcessSecureEnvelope`, `success = true` was set unconditionally after calling `processDecryptedPayload`, even if the decrypted JSON payload failed to parse or failed signature verification. This permanently marked the message hash as processed in `processedMailboxMessages` and SQLite, causing the client to skip fetching/decrypting it on subsequent attempts.
-3. **Timestamp Misalignment:** Go's `MessageCallback` did not include the `unix_time` field in the JSON event sent to the Flutter app. As a result, the Flutter app defaulted the message time to `DateTime.now()` on startup or sync.
+When checking the Android Recent Apps / Overview screen, the `meshsage` app would sometimes show up as two separate instances (duplicate entries in the recents list). This was caused by the presence of `android:taskAffinity=""` inside the `<activity>` tag of `MainActivity` in `AndroidManifest.xml`.
+An empty `taskAffinity` prevents the system from grouping activity launches from different contexts (such as launching via a notification/service click, development tools/ADB, or direct launcher clicks) into the same task stack, leading Android to create separate tasks and duplicate windows in the recent apps overview.
 
 ### Changes Made
-1. **Refactored Peer Locking in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go):**
-   - Split `sendSecureEnvelope` into `prepareSecureEnvelope` (which holds `sessionMu` to perform ratchets and update session state) and `sendSecureEnvelope` (which calls `transmitEnvelope` outside the lock).
-   - This releases the lock instantly after encryption, preventing network delays/timeouts from blocking incoming messages.
-2. **Propagated Decryption Status in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go):**
-   - Refactored `processDecryptedPayload` to return a `bool` representing success/failure.
-   - Updated `ProcessSecureEnvelope` to set `success = true` only if `processDecryptedPayload` returns `true`.
-3. **Added Unknown Type Logging in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go):**
-   - Added a `default` case warning inside `handleIncomingPayload` to log when envelopes with unhandled/unknown types are received.
-4. **Included `unix_time` in FFI message event callback in [main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/libmeshsage/main.go):**
-   - Added `"unix_time": event.UnixTime` to the event JSON sent from `libmeshsage`'s `MessageCallback` to the Flutter client, ensuring that incoming messages have accurate, persistent timestamps.
+- Removed `android:taskAffinity=""` from the `.MainActivity` definition in [AndroidManifest.xml](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/android/app/src/main/AndroidManifest.xml).
 
 ### Verification Results
-- All Go unit tests under `pkg/` compiled and passed.
-- Successfully built `cmd/node/main.go` and `cmd/libmeshsage/main.go`.
-- Recompiled Android native shared libraries (`libmeshsage.so`) for all architectures (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`).
-- Verified that the Flutter JNI folder has been correctly updated.
+- Successfully rebuilt the release APK and deployed it on the emulator `emulator-5554`.
+- Verified that subsequent launches (via ADB and direct launcher actions) now target a unified single instance of the application, avoiding duplicate task creation in the Recent Apps overview.
 
 ---
 
-## Walkthrough: Fixed Relay Stream Resets (Target Infrastructure Only)
+## Walkthrough: Disabled Session Warm-up & Enhanced Mailbox Diagnostic Logs
 
 ### Problem Solved
-- **Relay Stream Reset Errors:** In the relays' logs (like `p2p-relay-1`, `p2p-relay-2`, `p2p-relay-3`), there were multiple warning/debug logs: `Mailbox fetch: read error during stream iteration error="stream reset (remote)"`.
-- **Root Cause:** In the global sync manager (`StartGlobalMailboxSyncManager`), targets were chosen by checking if they supported `MailboxProtocolID`. Since both relays and normal clients support this protocol (to fetch/store messages), the relays attempted to fetch mailbox messages from normal clients. However, normal clients do not act as relays (`corenet.ShouldActAsRelay() == false`) and reject the incoming fetch request by calling `s.Reset()`, which triggered a "stream reset" error on the relays.
+1. **Unwanted Mailbox Handshake Messages:** The proactive session warm-up feature sent `MsgTypeHandshakeAck` messages to known peers upon connection. If the target peer went offline or the connection was not fully routable, this probe fell back to mailbox storage. When the peer fetched from their mailbox, they fetched the handshake probe (count=1), which was processed silently without showing a user-visible chat message. This caused confusion (fetching a message but showing nothing in the chat room).
+2. **Silent Mailbox Fetch and Processing Skips:** If a mailbox message base64 payload, public key, or sender ID failed to parse, or if an envelope failed to decrypt, it was either skipped silently or debug-logged (which does not appear in standard TUI/Dashboard logs). 
 
 ### Changes Made
-- Modified `StartGlobalMailboxSyncManager` in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go) to filter sync targets using `InfrastructureProtocolID` (`/p2p-core/infra/1.1.0`) instead of `MailboxProtocolID`.
-- This ensures that clients and relays only query actual infrastructure/relay nodes that are capable of serving mailbox requests, preventing unnecessary connections and completely eliminating the stream reset errors in the logs.
+1. **Disabled Warm-up Probes:**
+   - Disabled calling `ProbeSessionWarmup` upon peer connection in both [main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/node/main.go) and [main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/libmeshsage/main.go). It has been replaced with a simple debug trace log.
+2. **Explicit Mailbox Fetch Logs:**
+   - Modified [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go) to use `logger.Error()` or `logger.Warn()` during message base64 decoding, public key unmarshalling, and sender ID derivation.
+   - Changed duplicate check logging to `logger.Info()`.
+   - Adjusted `foundCount++` to only increment for messages successfully parsed and appended to the fetched list.
+3. **Decryption & Payload System Logs:**
+   - Modified `ProcessSecureEnvelope` in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go) to log an Info trace indicating the prefix type (`DR`, `X3DH`, `RESET`, `REQUEST_X3DH`) and sender ID of the envelope being processed.
+   - Added Info logs indicating successful Double Ratchet or X3DH decryption.
+   - Added an Info log in `handleIncomingPayload` indicating when a standard text message is successfully saved to SQLite and sent to the UI callback.
 
 ### Verification Results
-- Verified that Go tests pass successfully.
-- Rebuilt CLI node binaries for local and Linux architectures (`meshsage` and `p2p-node-relay`).
-- Rebuilt Android shared libraries (`libmeshsage.so`) for all architectures.
+- Successfully rebuilt the native libraries using `./build_android.sh` and recompiled the Flutter Android APK.
+- Verified that the application boots and logs successfully on the emulator without any warmup probe logs, and mailbox messages log detailed success and error state information.
 
 ---
 
-## Walkthrough: GossipSub Mesh Membership Fan-out (Scalable Fix)
+## Walkthrough: Relay Rate Limit Reduction to 1ms
 
 ### Problem Solved
-Group messages sent from the TUI to offline/backgrounded mobile members (Android) were occasionally lost or not delivered to their mailbox. This happened because:
-1. GossipSub delivery is structurally unreliable in small peer groups (e.g. 2 nodes + relay).
-2. When the devices were on the same local network/WiFi, `isDirectlyConnected` returned `true` and the short ping succeeded, causing the sender's node to assume GossipSub would deliver the message and skip sending the `GRPM` backup message.
-3. However, GossipSub failed anyway, and because the backup send was skipped, the message never reached the target peer or their mailbox.
+The mailbox relay rate-limited requests from the same Peer ID if they arrived within 50ms of each other, returning `ERROR_RATE_LIMIT_EXCEEDED`. On startup/reconnection, the client concurrently triggered both `AutoRefillPreKeys` and `FetchMailboxMessages` (which are separate requests targeting the mailbox protocol). This caused one of them (usually the fetch) to get rate-limited and fail, delaying mailbox synchronization.
 
 ### Changes Made
-- Modified `SendGroupMessage` in [group.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/group.go) to query `session.Topic.ListPeers()` to find all peers actively subscribed to the topic and connected in the GossipSub mesh.
-- The node now **skips the backup GRPM message only for peers actively in the GossipSub mesh** (since GossipSub is 100% reliable for active mesh peers).
-- For all other group members (those who are offline, backgrounded, or not in the mesh), the node **sends the GRPM backup message**, ensuring direct stream delivery or fallback to their relay mailbox.
-- This design scales naturally to large groups by design: for active online members, we only publish once via GossipSub; we only perform 1:1 fan-out to the subset of members who are offline/backgrounded.
-- Removed unused import `"github.com/libp2p/go-libp2p/p2p/protocol/ping"` from [group.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/group.go).
+- Modified the rate-limit window from `50*time.Millisecond` to `1*time.Millisecond` in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go).
+- Staggered the initial mailbox fetch on startup by 100ms in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go) to avoid overlapping requests.
 
 ### Verification Results
-1. **Compilation & Unit Tests:** Verified that all package tests pass successfully (`go test ./pkg/...`).
-2. **Binary & Android Builds:**
-   - Recompiled the native Go binary for TUI.
-   - Recompiled the native Android shared libraries (`libmeshsage.so`) for all ABIs.
-   - Rebuilt the Flutter release APK (`meshsage.apk`) successfully.
+- Recompiled the Android shared libraries (`./build_android.sh`) and rebuilt/deployed the Flutter APK.
+- Recompiled the local node binary and relay binary successfully.
+- Verified that concurrent startup requests execute cleanly without triggering any rate limit warnings or error responses from the relay.
+
+
+## Walkthrough: Mailbox Deduplication Retrieval & Group Message ID Fixes
+
+### Problem Solved
+1. **Deduplication Recovery Failure due to SQL Scan Error:** When the app restarted, Go skipped duplicate message hashes that were already in the `processed_mailbox_messages` table. To keep the UI updated in case it missed the initial delivery, Go tried to fetch the plaintext from SQLite using `GetMessageByHash`. However, this lookup failed with a Scan error when trying to scan `NULL` database values (which existed on older rows or new ones without all optional fields populated) into Go's standard string variables, silently ignoring the recovery dispatch.
+2. **Missing Group Message IDs in UI Callback:** Group messages (both online and offline) did not have a unique `msgID` set in the `MessageCallback` sent to Flutter. As a result, the Flutter side's deduplication check `_groupChats[groupID]!.any((m) => m.id == msgID)` evaluated to `true` for all subsequent group messages (since they all had empty IDs `""`), discarding every group message after the first one and preventing them from appearing in the chat bubbles.
+3. **Missing Offline Group Message Caching:** Group messages received as offline mailbox messages were never saved to the local SQLite database. On app restart, even if the lookup succeeded, `GetMessageByHash` would return `sql.ErrNoRows` for these group message hashes, making it impossible to restore them if the UI missed them.
+
+### Changes Made
+1. **Hardened DB Scan with `COALESCE`:**
+   - Modified `GetMessageByHash` in [database.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/storage/database.go) to return `recipient_id` (so we know the target group or recipient) and wrapped string outputs in `COALESCE(msg_id, '')` and `COALESCE(msg_type, '')`. This prevents SQLite scan errors when scanning NULL values into Go strings.
+2. **Generated Unique Group Message IDs:**
+   - Updated `ProcessGroupMessage` and `decryptAndDispatchGroupMsg` in [group.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/group.go) to generate a unique `msgID` based on the message signature `gr-<hash of signature>` (or fallback to payload+sender+timestamp if signature is empty).
+   - Passed this unique `msgID` inside the `MessageCallback` struct to the Flutter client, enabling proper message identification and UI rendering.
+3. **Cached Offline Group Messages in SQLite:**
+   - Modified the signature of `ProcessGroupMessage` to accept `msgHash string`.
+   - Updated calls to `ProcessGroupMessage` in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go) to forward `msgHash`.
+   - Inside `ProcessGroupMessage`, if `msgHash` is present, it now calls `corestore.SaveMessage` to save the decrypted plaintext, sender, and group recipient details into the SQLite database.
+4. **Enhanced Mailbox Deduplication Dispatch:**
+   - Updated `mailbox.go` to use the new `GetMessageByHash` signature.
+   - If `msgType == "group"`, it resolves the `recipient` field as the `groupID` and dispatches it correctly to Flutter, restoring the message into the corresponding group chat history.
+   - Added explicit warning logs if DB lookups fail (excluding normal `sql.ErrNoRows` for handshake/status control messages, which are now correctly logged at `Debug` level).
+
+### Verification Results
+1. **Compilation Success:** The Go package tests in `pkg/...` and the FFI bridge target `cmd/libmeshsage` build cleanly.
+2. **Android Libraries Compiled:** Rebuilt native shared libraries successfully via `./build_android.sh` and verified that they are updated in Flutter's `jniLibs` directory.
+3. **No More Ignored Messages:** When duplicate hashes are fetched from the mailbox (e.g. after force close/restarts), Go successfully retrieves them from the local SQLite cache and dispatches them with correct IDs and group associations to Flutter, keeping the UI fully synced.
+4. **Scary Warning Log Suppressed:** Verified that duplicate control message fetches (like handshakes or status receipts) that are not present in the chat message history database are now cleanly logged as debug traces instead of scary `sql: no rows in result set` warnings.
+5. **Release APK Built & Copied:** Successfully ran `flutter build apk --release` and copied the packaged `app-release.apk` to the workspace root directory at [meshsage.apk](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/meshsage.apk).
+
+---
+
+## Walkthrough: Sequential Global Mailbox Sync Manager
+
+### Problem Solved
+Previously, a connection-level sync loop (`StartMailboxSync`) was spawned for *each* infrastructure/relay node as soon as it connected. Each loop ran its own 2-second fast polling ticker to call `FetchMailboxMessages` on its respective relay. With multiple relays connected (e.g. 3 active relays), this resulted in:
+1. Multiple concurrent polling loops running in parallel, placing heavy overhead on the mobile CPU, network bandwidth, and device battery.
+2. Concurrent redundant requests to different relays, causing rate-limiting warnings and unnecessary duplicate message fetches.
+
+### Changes Made
+1. **Removed Per-Relay Fast Polling Loops:**
+   - Modified `StartMailboxSync` in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go) to remove the per-relay 2-second fast polling loop. Kept other connection-specific routines (AutoRefillPreKeys, push notification subscription, and the 30-second pre-key refill check loop).
+2. **Implemented Global Sequential Sync Manager:**
+   - Created `StartGlobalMailboxSyncManager(ctx, h, privKey)` in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go). This runs a single global ticker every 2 seconds.
+   - On each tick, it queries connected peers (`h.Network().Peers()`), filters for those supporting the `/p2p-core/mailbox/1.0.0` protocol, and calls `FetchMailboxMessages` sequentially (synchronously) for each relay, preventing concurrent overlapping queries.
+3. **Initialized Global Sync Manager on Node Boot:**
+   - Updated `StartNode` in [libmeshsage/main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/libmeshsage/main.go) to launch `StartGlobalMailboxSyncManager` as a background goroutine.
+   - Updated `main` in [node/main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/node/main.go) to launch `StartGlobalMailboxSyncManager` as a background goroutine on CLI node boot.
+
+### Verification Results
+1. **Compilation Success:** verified that Go packages, the FFI bridge (`cmd/libmeshsage`), and CLI node (`cmd/node`) compile successfully without errors.
+2. **Android Libraries Rebuilt:** Compiled libraries successfully with `./build_android.sh` and updated JNI libraries.
+3. **APK Compiled & Copied:** Rebuilt the release APK successfully (`flutter build apk --release`) and copied the result to `meshsage.apk` at the root directory of the workspace.
+
+---
+
+## Walkthrough: Reliable Offline Group Messages & Direct Key Requests
+
+### Problem Solved
+1. **GossipSub Failures on Mobile Networks (NAT):** On mobile networks, client nodes are behind symmetric NATs and can only connect to each other through the circuit relay (`/p2p-circuit`). Since GossipSub does not form mesh links over relay connections, group messages and GossipSub-based key requests (`GREQ` broadcasts) were never delivered.
+2. **Premature Mailbox Pruning:** When a client fetched group messages from the mailbox but did not have the sender's key yet, it would fail to decrypt but still report `success` to the mailbox manager. The message was permanently deleted from the relay, and since it was only buffered in RAM, it was lost forever if the app closed.
+3. **Redundant GossipSub Delivery Assumptions:** If two clients were connected to the same relay, their connectedness status was `Connected` (via `/p2p-circuit`). The sender skipped the direct/mailbox fan-out (`GRPM`), assuming GossipSub would handle delivery, but since the relay is not subscribed to the group topic, it did not forward GossipSub messages.
+
+### Changes Made
+1. **Implemented Direct Key Requests:**
+   - Modified `sendGroupKeyRequest` in [group.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/group.go) to load all group members from SQLite and send direct `GCMD:GREQ:<groupID>` messages to them via `SendMessage`.
+   - Added a `GCMD:GREQ:` handler in `handleIncomingPayload` in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go) to automatically reply with a `GKEY` message to the requester.
+2. **Direct Connection Detection:**
+   - Added `isDirectlyConnected(h host.Host, target peer.ID) bool` to check if a peer is connected via a direct socket (non-relay).
+   - Updated `SendGroupMessage` to perform the `GRPM` mailbox fan-out unless the peer is directly connected (forcing mailbox fallback for relayed/mobile clients).
+3. **Mailbox Acknowledgment and Retry:**
+   - Modified `ProcessGroupMessage` and `handleIncomingPayload` to return a `bool` status indicating whether decryption was successful.
+   - Propagated this status to `ProcessSecureEnvelope` to ensure that messages that fail to decrypt remain in the mailbox and are retried in subsequent polls (once the keys arrive).
+
+### Verification Results
+1. **Unit Tests Passed:** Checked that all 19 unit tests in `pkg/protocol/...` passed successfully.
+2. **Successful Rebuild:** Recompiled Android libraries successfully and updated the Flutter JNI folder using `./build_android.sh`.
+3. **Flutter APK Compiled & Deployed:** Rebuilt the release APK and installed it on the running emulator successfully with no errors.
+
+---
+
+## Walkthrough: Group Message Reliability & Stale Connection Verification
+
+### Problem Solved
+When group members went offline or disconnected abruptly, their connections could remain in a "stale" state inside libp2p's connection tracker. As a result, the sender's node incorrectly assumed they were still directly connected, skipping the mailbox backup delivery (`GRPM` fan-out) while the GossipSub message failed to reach them. Additionally, background network operations (like `SendMessage` or key sharing) were using transient caller contexts from Flutter that were cancelled prematurely, and mailbox messages were deleted from relays before the client could confirm complete receipt.
+
+### Changes Made
+1. **Stale Connection Verification via Async Ping:**
+   - Modified `SendGroupMessage` in [group.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/group.go) to perform an async, non-blocking `ping.Ping` with a 300ms timeout on cached direct connections.
+   - If the ping succeeds, the peer is verified active, and we skip the duplicate direct message. If it fails or times out (indicating a stale connection), we proceed with the direct message (`SendMessage` fan-out) to store it in their mailbox.
+2. **Context Lifetime Correction:**
+   - Replaced transient caller contexts with `context.Background()` (with a 10s timeout) inside background goroutines for sending messages, requests, and keys (`shareKeyWithMember`, `sendGroupKeyRequest`, and the fan-out loop in `group.go`).
+3. **Mailbox FETCH ACK Protocol:**
+   - Implemented a two-way confirmation handshake for mailbox fetching in [mailbox.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/mailbox.go).
+   - The client now sends `ACK\n` after successfully receiving the full mailbox feed (`DONE`).
+   - The relay waits for this `ACK\n` (with a 5s timeout) and only clears the messages from the SQLite database upon successful receipt of the ACK.
+
+### Verification Results
+1. **Compilation Success:** verified that all Go packages, the FFI bridge (`cmd/libmeshsage`), and the node client build successfully.
+2. **Unit Tests Passed:** Ran the protocol package unit tests successfully, confirming no regressions.
+
+---
+
+## Walkthrough: Unread Message Badges (WhatsApp Style)
+
+### Problem Solved
+When new direct or group messages arrived while the user was on the dashboard or inside another chat screen, there was no visual indicator showing:
+1. The individual chat room list item having unread messages.
+2. The clearing of these unread counts when entering the specific chat room.
+
+### Changes Made
+1. **Chat Screen ActiveChatID Integration:**
+   - Modified [chat_room_screen.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/screens/chat_room_screen.dart) to set `widget.state.activeChatID = widget.targetID` inside `initState()`.
+   - Cleared `widget.state.activeChatID = null` inside `dispose()`. This ensures the unread count resets when entering the chat room and correctly tracks new unread messages once the room is closed.
+2. **Direct Chat List Item Unread Badges:**
+   - Modified [direct_chat_tab.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/tabs/direct_chat_tab.dart) to query the unread count for each peer (`widget.state.getUnreadDirectCount(pid)`).
+   - Displayed a circular/capsule badge with neon-green background `Color(0xFF00FF87)` and bold black text in the `trailing` column of the `ListTile` if the unread count is greater than zero.
+   - Styled the timestamp text in bold neon green when there are unread messages.
+3. **Group Chat List Item Unread Badges:**
+   - Modified [group_chat_tab.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/tabs/group_chat_tab.dart) to query the unread count for each group (`widget.state.getUnreadGroupCount(gid)`).
+   - Rendered the corresponding neon-green unread count badge and styled the group timestamp text when the unread count is greater than zero.
+
+### Verification Results
+1. **Static Analysis Check:** Ran `flutter analyze` inside `meshsage_flutter` and confirmed there are no compilation errors or warnings.
+
+---
+
+## Walkthrough: Group Creator Registry Fix for Offline Mailbox Delivery
+
+### Problem Solved
+When receiving group invitations (`GINVITE`), the list of initial members sent in the payload did not include the group creator themselves. During `JoinGroupProper` on the receiver side, members were only registered from the `members` list, meaning the remote group creator was never registered in the receiver's local database (`group_members_v2`).
+Consequently, when sending group messages, `SendGroupMessage` would query the local database for members, only find the local node itself, and skip the fan-out loop. This caused group messages to never dial or fall back to mailbox storage for the group creator when they were offline.
+
+### Changes Made
+1. **Explicit Creator Registration:**
+   - Modified `JoinGroupProper` in [group.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/group.go) to explicitly register `creatorID` as `CREATOR` in the `group_members_v2` database table.
+
+### Verification Results
+1. **Tests Passed:** Ran `go test -v ./pkg/protocol/...` and confirmed all 19 integration and unit tests pass.
+2. **Native Android Rebuild:** Recompiled Android libraries for 4 target architectures using `./build_android.sh` and successfully copied the updated `.so` files to `meshsage_flutter/android/app/src/main/jniLibs`.
+3. **Flutter APK Built:** Built the updated release Flutter APK successfully.
+4. **Git Committed:** Committed changes to both `meshsage` and `meshsage_flutter` repositories.
+
+
 
 

@@ -17,9 +17,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
+	"github.com/nicabreon/meshsage/pkg/logger"
 	corenet "github.com/nicabreon/meshsage/pkg/network"
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
-	"github.com/nicabreon/meshsage/pkg/logger"
 )
 
 type GroupMessage struct {
@@ -29,9 +29,9 @@ type GroupMessage struct {
 }
 
 type GroupSession struct {
-	Topic    *pubsub.Topic
-	Sub      *pubsub.Subscription
-	Host     host.Host
+	Topic *pubsub.Topic
+	Sub   *pubsub.Subscription
+	Host  host.Host
 }
 
 var (
@@ -54,7 +54,7 @@ var (
 // ---------------------------------------------------------------------------
 
 const (
-	pendingMsgTTL     = 5 * time.Minute
+	pendingMsgTTL          = 5 * time.Minute
 	pendingMsgMaxPerSender = 20
 )
 
@@ -243,9 +243,9 @@ func JoinGroupProper(ctx context.Context, h host.Host, priv crypto.PrivKey, grou
 	}
 
 	session := &GroupSession{
-		Topic:    topic,
-		Sub:      sub,
-		Host:     h,
+		Topic: topic,
+		Sub:   sub,
+		Host:  h,
 	}
 	activeGroups[groupID] = session
 
@@ -262,10 +262,12 @@ func shareKeyWithMember(ctx context.Context, h host.Host, priv crypto.PrivKey, g
 	defer cancel()
 
 	target, err := peer.Decode(memberID)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 
 	logger.Debug().Msgf("[GROUP HANDSHAKE] Sharing our local key for group %s with member %s via Double Ratchet...", groupID, FormatPeerID(memberID))
-	
+
 	// Load history of local keys
 	var keyB64s []string
 	history, errHist := corestore.GetGroupLocalKeyHistory(groupID)
@@ -281,7 +283,7 @@ func shareKeyWithMember(ctx context.Context, h host.Host, priv crypto.PrivKey, g
 	// Join the base64 keys with commas
 	payload := strings.Join(keyB64s, ",")
 	shareMsg := fmt.Sprintf("GKEY:%s:%s", groupID, payload)
-	
+
 	_, errSend := SendMessage(bgCtx, h, priv, target, shareMsg)
 	if errSend != nil {
 		logger.Error().Err(errSend).Str("group", groupID).Str("member", memberID).Msg("[GROUP HANDSHAKE] Failed to share group key")
@@ -415,12 +417,14 @@ func decryptGroupMsg(meta corestore.GroupMetadata, gMsg GroupMessage) (string, e
 // Used by both the live listener and the pending-message flusher.
 func decryptAndDispatchGroupMsg(ctx context.Context, session *GroupSession, groupID string, gMsg GroupMessage) {
 	meta, errLoad := corestore.LoadGroupMetadata(groupID)
-	if errLoad != nil { return }
+	if errLoad != nil {
+		return
+	}
 
 	plaintext, err := decryptGroupMsg(meta, gMsg)
 	if err != nil {
 		logger.Error().Msgf("[Group %s] Failed to decrypt message from %s: %s", meta.GroupAlias, FormatPeerID(gMsg.SenderID), err.Error())
-		
+
 		// Actively request keys via GREQ on decryption failure so we can recover
 		if meta.GroupType == "SECURE" {
 			go sendGroupKeyRequest(ctx, session.Host, groupID)
@@ -444,7 +448,7 @@ func decryptAndDispatchGroupMsg(ctx context.Context, session *GroupSession, grou
 	}
 
 	ts := time.Now().Format("02/01 15:04:05")
-	
+
 	msgID := ""
 	if gMsg.Signature != "" {
 		msgID = fmt.Sprintf("gr-%x", sha256.Sum256([]byte(gMsg.Signature)))[:8]
@@ -477,13 +481,19 @@ func listenGroupMessages(ctx context.Context, session *GroupSession, groupID str
 		// Parse the outer envelope
 		var gMsg GroupMessage
 		err = json.Unmarshal(msg.Data, &gMsg)
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 
 		// Don't process our own messages
-		if gMsg.SenderID == session.Host.ID().String() { continue }
+		if gMsg.SenderID == session.Host.ID().String() {
+			continue
+		}
 
 		// Skip duplicate processing
-		if checkAndMarkProcessed(gMsg.Signature) { continue }
+		if checkAndMarkProcessed(gMsg.Signature) {
+			continue
+		}
 
 		// Check if it is a control command (GCMD:action:target)
 		if strings.HasPrefix(gMsg.Payload, "GCMD:") {
@@ -492,7 +502,9 @@ func listenGroupMessages(ctx context.Context, session *GroupSession, groupID str
 		}
 
 		meta, errLoad := corestore.LoadGroupMetadata(groupID)
-		if errLoad != nil { continue }
+		if errLoad != nil {
+			continue
+		}
 
 		if meta.GroupType == "SECURE" {
 			// Check if we have the sender's key
@@ -542,15 +554,25 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 	}
 
 	meta, errLoad := corestore.LoadGroupMetadata(groupID)
-	if errLoad != nil { return errLoad }
+	if errLoad != nil {
+		return errLoad
+	}
 
+	logger.Info().
+		Str("group", meta.GroupAlias).
+		Str("type", meta.GroupType).
+		Msg("Sending group message")
 	var payload string
 	if meta.GroupType == "SECURE" {
 		localKey, err := corestore.GetGroupLocalKey(groupID)
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 
 		encrypted, err := corecrypto.EncryptMessage(localKey, message)
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 		payload = encrypted
 
 		// Rotate local key for our next outgoing message
@@ -577,7 +599,9 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 
 	// Publish to GossipSub
 	err := session.Topic.Publish(ctx, msgBytes)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	AddBytesSent(len(msgBytes)) // Track outgoing GossipSub bytes
 	TrackMsgSent()              // Track outgoing group message
 
@@ -590,13 +614,21 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 		meshPeerMap[p] = true
 	}
 
+	logger.Info().
+		Int("activeMeshPeers", len(meshPeers)).
+		Msg("GossipSub mesh membership evaluated")
+
 	// Fan-out via GRPM only for members who are NOT in our GossipSub mesh (offline or backgrounded).
 	members, err := corestore.GetGroupMembersV2(groupID)
 	if err == nil {
 		for _, m := range members {
-			if m.PeerID == h.ID().String() { continue }
+			if m.PeerID == h.ID().String() {
+				continue
+			}
 			target, errDec := peer.Decode(m.PeerID)
-			if errDec != nil { continue }
+			if errDec != nil {
+				continue
+			}
 
 			go func(t peer.ID, memberIDStr string) {
 				bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -646,13 +678,19 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) bool {
 	var gMsg GroupMessage
 	err := json.Unmarshal(msgBytes, &gMsg)
-	if err != nil { return true }
+	if err != nil {
+		return true
+	}
 
 	// Skip duplicate processing
-	if checkAndMarkProcessed(gMsg.Signature) { return true }
+	if checkAndMarkProcessed(gMsg.Signature) {
+		return true
+	}
 
 	meta, errLoad := corestore.LoadGroupMetadata(groupID)
-	if errLoad != nil { return false }
+	if errLoad != nil {
+		return false
+	}
 
 	var plaintext string
 	if meta.GroupType == "SECURE" {
@@ -681,12 +719,12 @@ func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) bool {
 	plaintext, errDec = decryptGroupMsg(meta, gMsg)
 	if errDec != nil {
 		logger.Error().Msgf("[Group %s] Failed to decrypt offline message from %s: %s", meta.GroupAlias, FormatPeerID(gMsg.SenderID), errDec.Error())
-		
+
 		if meta.GroupType == "SECURE" {
 			groupsMutex.Lock()
 			session := activeGroups[groupID]
 			groupsMutex.Unlock()
-			
+
 			bufferPendingMessage(groupID, gMsg.SenderID, pendingGroupMsg{
 				receivedAt: time.Now(),
 				gMsg:       gMsg,
@@ -715,7 +753,7 @@ func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) bool {
 	}
 
 	ts := time.Now().Format("02/01 15:04:05")
-	
+
 	msgID := ""
 	if gMsg.Signature != "" {
 		msgID = fmt.Sprintf("gr-%x", sha256.Sum256([]byte(gMsg.Signature)))[:8]
@@ -786,9 +824,13 @@ func RestoreGroups(ctx context.Context, h host.Host, priv crypto.PrivKey) error 
 // ProcessGroupControlMessage validates and executes signed commands for group administration
 func ProcessGroupControlMessage(ctx context.Context, h host.Host, groupID string, gMsg GroupMessage) {
 	sID, err := peer.Decode(gMsg.SenderID)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	pubKey, err := sID.ExtractPublicKey()
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 
 	// Verify command signature
 	dataToVerify := []byte(gMsg.Payload + gMsg.SenderID)
@@ -800,7 +842,9 @@ func ProcessGroupControlMessage(ctx context.Context, h host.Host, groupID string
 	}
 
 	parts := strings.Split(gMsg.Payload, ":")
-	if len(parts) < 3 { return }
+	if len(parts) < 3 {
+		return
+	}
 	action := parts[1]
 	target := parts[2]
 
