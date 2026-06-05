@@ -16,7 +16,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
 	corenet "github.com/nicabreon/meshsage/pkg/network"
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
@@ -591,35 +590,6 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 				bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 
-				if isDirectlyConnected(h, t) {
-					// Verify that the direct connection is active and responsive (not stale).
-					pingCtx, pingCancel := context.WithTimeout(bgCtx, 300*time.Millisecond)
-					pings := ping.Ping(pingCtx, h, t)
-					pingSuccess := false
-					select {
-					case res, ok := <-pings:
-						if ok && res.Error == nil {
-							pingSuccess = true
-						}
-					case <-pingCtx.Done():
-					}
-					pingCancel()
-
-					if pingSuccess {
-						// Peer is verified active. GossipSub is highly likely to succeed.
-						logger.Debug().
-							Str("peer", FormatPeerID(memberIDStr)).
-							Str("group", groupID[:8]).
-							Msg("[Group Fan-out] Skipping GRPM: verified peer is online (GossipSub delivery)")
-						return
-					}
-					logger.Warn().
-						Str("peer", FormatPeerID(memberIDStr)).
-						Str("group", groupID[:8]).
-						Msg("[Group Fan-out] Stale direct connection detected! Proceeding to send GRPM.")
-				}
-
-				// Peer is offline, relayed, or has a stale connection.
 				// Send GRPM via direct stream (falls back to mailbox if unreachable).
 				// NOTE: SendMessage requires E2EE session (X3DH + Double Ratchet). If no session
 				// exists yet (e.g. TUI restarted while member was offline), the first attempt
