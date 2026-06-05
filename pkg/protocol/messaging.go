@@ -1076,7 +1076,6 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 	// Jika receiver mengalami masalah sesi dan mengirim REQUEST_X3DH,
 	// pesan ini akan di-kirim ulang setelah X3DH baru selesai.
 	trackSentMessage(target.String(), env)
-	TrackMsgSent() // Track outgoing message
 
 	return msgID, sendSecureEnvelope(ctx, h, priv, target, env)
 }
@@ -1724,6 +1723,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 				logger.Debug().Str("peerID", targetID.String()).Msg("COMMAND: Calling SendMessage")
 				_, errSend := SendMessage(ctx, h, priv, targetID, parts[2])
 				if errSend == nil {
+					TrackMsgSent()
 					logger.Info().Str("peerID", targetID.String()).Msg("Message sent successfully")
 				} else {
 					logger.Error().Err(errSend).Str("peerID", targetID.String()).Msg("Failed to send message")
@@ -1751,6 +1751,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 					fileMsg := fmt.Sprintf("FILE:%s:%d:%s", fileName, len(fileData), base64.StdEncoding.EncodeToString(fileData))
 					_, errSend := SendMessage(ctx, h, priv, targetID, fileMsg)
 					if errSend == nil {
+						TrackMsgSent()
 						logger.Displayf("[Success] Encrypted file %s sent to %s\n", fileName, FormatPeerID(targetID.String()))
 					} else {
 						logger.Error().Err(errSend).Str("peerID", targetID.String()).Msg("Failed to send file")

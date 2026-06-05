@@ -202,6 +202,7 @@ func handleMailboxStream(h host.Host, s network.Stream) {
 	buf := bufio.NewReader(s)
 	line, err := buf.ReadString('\n')
 	if err != nil { return }
+	AddBytesRecv(len(line))
 
 	line = strings.TrimSpace(line)
 	parts := strings.SplitN(line, " ", 5)
@@ -335,7 +336,8 @@ func handleMailboxStream(h host.Host, s network.Stream) {
 		s.Write([]byte("OK\n"))
 	case "FETCH":
 		coord := parts[1]
-		logger.Debug().Str("coord", coord).Msg("Incoming FETCH request")
+		useACK := len(parts) >= 3 && parts[2] == "ACK"
+		logger.Debug().Str("coord", coord).Bool("useACK", useACK).Msg("Incoming FETCH request")
 		messages, err := corestore.GetMailboxMessages(coord)
 		if err != nil {
 			s.Write([]byte("ERROR\n"))
@@ -345,11 +347,37 @@ func handleMailboxStream(h host.Host, s network.Stream) {
 		for _, msg := range messages {
 			response := fmt.Sprintf("MSG %s %s %s\n", msg.MsgHash, msg.SenderPubkey, msg.Payload)
 			s.Write([]byte(response))
-			BroadcastClusterEvent(context.Background(), ClusterEvent{Type: "MAILBOX_PURGE", Hash: msg.MsgHash})
+			AddBytesSent(len(response))
 		}
-		s.Write([]byte("DONE\n"))
-		corestore.ClearMailboxMessages(coord)
-		logger.Debug().Int("count", len(messages)).Str("coord", coord).Msg("Mailbox cleared after fetch")
+		doneMsg := "DONE\n"
+		s.Write([]byte(doneMsg))
+		AddBytesSent(len(doneMsg))
+
+		if !useACK {
+			// Legacy client compatibility: immediately purge message database
+			for _, msg := range messages {
+				BroadcastClusterEvent(context.Background(), ClusterEvent{Type: "MAILBOX_PURGE", Hash: msg.MsgHash})
+			}
+			corestore.ClearMailboxMessages(coord)
+			logger.Debug().Int("count", len(messages)).Str("coord", coord).Msg("Mailbox cleared immediately (legacy client)")
+		} else {
+			// Wait for ACK from the client to confirm successful receipt before clearing
+			_ = s.SetReadDeadline(time.Now().Add(5 * time.Second))
+			reader := bufio.NewReader(s)
+			ack, errRead := reader.ReadString('\n')
+			if errRead == nil {
+				AddBytesRecv(len(ack))
+			}
+			if errRead == nil && strings.TrimSpace(ack) == "ACK" {
+				for _, msg := range messages {
+					BroadcastClusterEvent(context.Background(), ClusterEvent{Type: "MAILBOX_PURGE", Hash: msg.MsgHash})
+				}
+				corestore.ClearMailboxMessages(coord)
+				logger.Debug().Int("count", len(messages)).Str("coord", coord).Msg("Mailbox cleared after fetch confirmed with ACK")
+			} else {
+				logger.Warn().Err(errRead).Str("coord", coord).Str("ack", ack).Msg("Mailbox fetch: client failed to send ACK or timeout occurred. Messages retained on relay.")
+			}
+		}
 	}
 }
 
@@ -448,10 +476,12 @@ func StoreOfflineMessage(ctx context.Context, h host.Host, targetID peer.ID, sen
 			cmd := fmt.Sprintf("STORE %s %s %s %s\n", msgHash, coord, senderPubkeyB64, payloadB64)
 			_, err = s.Write([]byte(cmd))
 			if err != nil { return }
+			AddBytesSent(len(cmd))
 
 			_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
 			respBuf := bufio.NewReader(s)
 			resp, _ := respBuf.ReadString('\n')
+			AddBytesRecv(len(resp))
 
 			if strings.TrimSpace(resp) == "OK" {
 				mu.Lock()
@@ -508,11 +538,13 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 	defer s.Close()
 
 	_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err = s.Write([]byte(fmt.Sprintf("FETCH %s\n", coord)))
+	cmd := fmt.Sprintf("FETCH %s ACK\n", coord)
+	_, err = s.Write([]byte(cmd))
 	if err != nil {
 		logger.Debug().Err(err).Str("peerID", relayID.String()).Msg("Mailbox fetch: failed to write FETCH request")
 		return
 	}
+	AddBytesSent(len(cmd))
 	buf := bufio.NewReader(s)
 
 	type fetchedEnvelope struct {
@@ -526,6 +558,9 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 	for {
 		_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
 		line, err := buf.ReadString('\n')
+		if err == nil {
+			AddBytesRecv(len(line))
+		}
 		if err != nil {
 			logger.Debug().Err(err).Str("peerID", relayID.String()).Msg("Mailbox fetch: read error during stream iteration")
 			break
@@ -537,6 +572,11 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 			if foundCount > 0 {
 				logger.Info().Int("count", foundCount).Msg("Fetch complete")
 			}
+			// Send ACK to relay to confirm we received the messages
+			_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			ackMsg := "ACK\n"
+			_, _ = s.Write([]byte(ackMsg))
+			AddBytesSent(len(ackMsg))
 			break
 		}
 		if strings.HasPrefix(line, "ERROR") {
@@ -852,10 +892,12 @@ func ReplicateFileToRelays(ctx context.Context, h host.Host, manifestCID string)
 }
 
 // StartGlobalMailboxSyncManager runs a single global loop to fetch mailbox messages
-// sequentially from all connected infrastructure/relay nodes every 2 seconds.
+// sequentially from all connected infrastructure/relay nodes every 30 seconds as a fallback.
+// Real-time delivery is handled by push notifications (SubscribeNotifications).
+// The 30-second interval drastically reduces idle data usage compared to the prior 2-second polling.
 func StartGlobalMailboxSyncManager(ctx context.Context, h host.Host, privKey crypto.PrivKey) {
-	logger.Info().Msg("Starting Global Mailbox Sync Manager (sequential polling)...")
-	ticker := time.NewTicker(2 * time.Second)
+	logger.Info().Msg("Starting Global Mailbox Sync Manager (30s fallback polling)...")
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {

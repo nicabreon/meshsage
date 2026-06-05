@@ -491,6 +491,7 @@ func SendDirectMessage(targetStr, contentStr *C.char) *C.char {
 	if err != nil {
 		return C.CString("Failed to send: " + err.Error())
 	}
+	coreproto.TrackMsgSent() // Track outgoing logical message
 	// Return msgID prefixed with "ok:" so Flutter can distinguish success from error
 	return C.CString("ok:" + msgID)
 }
@@ -504,6 +505,7 @@ func SendGroupChat(groupIDStr, contentStr *C.char) *C.char {
 	if err != nil {
 		return C.CString("Failed to send group message: " + err.Error())
 	}
+	// Note: SendGroupMessage already calls TrackMsgSent when publishing to GossipSub.
 	return nil
 }
 
@@ -1122,6 +1124,7 @@ func UploadFile(filePathStr *C.char) *C.char {
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error":"Failed to upload file: %s"}`, err.Error()))
 	}
+	coreproto.AddFileSent(int64(len(data))) // Track file sent bytes
 
 	// Trigger replication of media file blocks to connected Dedicated Relays
 	go coreproto.ReplicateFileToRelays(globalCtx, globalHost, manifestCID)
@@ -1158,6 +1161,7 @@ func DownloadFile(manifestCIDStr, keyB64Str, savePathStr *C.char) *C.char {
 	if err != nil {
 		return C.CString(fmt.Sprintf(`{"error":"Failed to download file: %s"}`, err.Error()))
 	}
+	coreproto.AddFileRecv(int64(len(data))) // Track file received bytes
 
 	// Create directories if they do not exist
 	dir := filepath.Dir(savePath)

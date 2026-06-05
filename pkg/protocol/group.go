@@ -16,6 +16,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
 	corenet "github.com/nicabreon/meshsage/pkg/network"
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
@@ -253,6 +254,9 @@ func JoinGroupProper(ctx context.Context, h host.Host, priv crypto.PrivKey, grou
 }
 
 func shareKeyWithMember(ctx context.Context, h host.Host, priv crypto.PrivKey, groupID, memberID string, key []byte) {
+	bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	target, err := peer.Decode(memberID)
 	if err != nil { return }
 
@@ -274,7 +278,7 @@ func shareKeyWithMember(ctx context.Context, h host.Host, priv crypto.PrivKey, g
 	payload := strings.Join(keyB64s, ",")
 	shareMsg := fmt.Sprintf("GKEY:%s:%s", groupID, payload)
 	
-	_, errSend := SendMessage(ctx, h, priv, target, shareMsg)
+	_, errSend := SendMessage(bgCtx, h, priv, target, shareMsg)
 	if errSend != nil {
 		logger.Error().Err(errSend).Str("group", groupID).Str("member", memberID).Msg("[GROUP HANDSHAKE] Failed to share group key")
 	} else {
@@ -332,7 +336,9 @@ func sendGroupKeyRequest(ctx context.Context, h host.Host, groupID string) {
 			Msg("[GREQ] Sending direct key request to member")
 
 		go func(t peer.ID) {
-			_, _ = SendMessage(ctx, h, privKey, t, reqMsg)
+			bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, _ = SendMessage(bgCtx, h, privKey, t, reqMsg)
 		}(targetID)
 	}
 }
@@ -443,6 +449,7 @@ func decryptAndDispatchGroupMsg(ctx context.Context, session *GroupSession, grou
 	}
 
 	logger.Displayf("\033[92m[%s] [Group %s] %s: %s\033[0m\n", ts, meta.GroupAlias, FormatSender(gMsg.SenderID), plaintext)
+	TrackMsgRecv() // Track incoming message
 	if MessageCallback != nil {
 		MessageCallback(MessageEvent{
 			Type:      "group",
@@ -461,6 +468,7 @@ func listenGroupMessages(ctx context.Context, session *GroupSession, groupID str
 		if err != nil {
 			return
 		}
+		AddBytesRecv(len(msg.Data)) // Track incoming GossipSub bytes
 
 		// Parse the outer envelope
 		var gMsg GroupMessage
@@ -566,10 +574,10 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 	// Publish to GossipSub
 	err := session.Topic.Publish(ctx, msgBytes)
 	if err != nil { return err }
+	AddBytesSent(len(msgBytes)) // Track outgoing GossipSub bytes
+	TrackMsgSent()              // Track outgoing group message
 
-	// Fan-out via direct message ONLY to members who are NOT currently connected.
-	// Online peers already receive the message via GossipSub — sending GRPM to
-	// them too causes duplicate delivery and command spam in the terminal.
+	// Fan-out via direct message ONLY to members who are NOT currently connected/active.
 	members, err := corestore.GetGroupMembersV2(groupID)
 	if err == nil {
 		for _, m := range members {
@@ -577,20 +585,43 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 			target, errDec := peer.Decode(m.PeerID)
 			if errDec != nil { continue }
 
-			// Skip peers that are already directly connected — GossipSub will deliver.
-			// Only skip if the connection is a direct (non-relay) connection.
-			if isDirectlyConnected(h, target) {
-				logger.Debug().
-					Str("peer", FormatPeerID(m.PeerID)).
-					Str("group", groupID[:8]).
-					Msg("[Group Fan-out] Skipping GRPM: peer is online (GossipSub delivery)")
-				continue
-			}
+			// We launch a background goroutine for each member to handle network ping
+			// and direct/mailbox messaging asynchronously without blocking the publish caller.
+			go func(t peer.ID, memberIDStr string) {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
 
-			// Peer is offline — send via mailbox/direct message
-			go func(t peer.ID) {
-				_, _ = SendMessage(ctx, h, privKey, t, "GRPM:"+groupID+":"+string(msgBytes))
-			}(target)
+				if isDirectlyConnected(h, t) {
+					// Verify that the direct connection is active and responsive (not stale).
+					pingCtx, pingCancel := context.WithTimeout(bgCtx, 300*time.Millisecond)
+					pings := ping.Ping(pingCtx, h, t)
+					pingSuccess := false
+					select {
+					case res, ok := <-pings:
+						if ok && res.Error == nil {
+							pingSuccess = true
+						}
+					case <-pingCtx.Done():
+					}
+					pingCancel()
+
+					if pingSuccess {
+						// Peer is verified active. GossipSub is highly likely to succeed.
+						logger.Debug().
+							Str("peer", FormatPeerID(memberIDStr)).
+							Str("group", groupID[:8]).
+							Msg("[Group Fan-out] Skipping GRPM: verified peer is online (GossipSub delivery)")
+						return
+					}
+					logger.Warn().
+						Str("peer", FormatPeerID(memberIDStr)).
+						Str("group", groupID[:8]).
+						Msg("[Group Fan-out] Stale direct connection detected! Peer is unresponsive to ping. Proceeding to send GRPM.")
+				}
+
+				// Peer is offline or has a stale connection. Send direct message (falls back to mailbox).
+				_, _ = SendMessage(bgCtx, h, privKey, t, "GRPM:"+groupID+":"+string(msgBytes))
+			}(target, m.PeerID)
 		}
 	}
 
@@ -684,6 +715,7 @@ func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) bool {
 	}
 
 	logger.Displayf("\033[92m[%s] [Group %s] %s (Offline): %s\033[0m\n", ts, meta.GroupAlias, FormatSender(gMsg.SenderID), plaintext)
+	TrackMsgRecv() // Track incoming message
 	if MessageCallback != nil {
 		MessageCallback(MessageEvent{
 			Type:      "group",
