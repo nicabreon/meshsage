@@ -635,7 +635,7 @@ func SendGroupMessage(ctx context.Context, h host.Host, groupID string, message 
 				defer cancel()
 
 				if meshPeerMap[t] {
-					logger.Debug().
+					logger.Info().
 						Str("peer", FormatPeerID(memberIDStr)).
 						Str("group", groupID[:8]).
 						Msg("[Group Fan-out] Skipping GRPM: peer is active in GossipSub mesh")

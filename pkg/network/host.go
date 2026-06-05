@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"encoding/json"
 	"runtime"
@@ -19,6 +20,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	libp2pwebrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
 	"github.com/nicabreon/meshsage/pkg/logger"
 )
 
@@ -74,12 +76,22 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 		// 2. Connection Management & Resource Limits
 		libp2p.ConnectionManager(cm),
 		libp2p.ResourceManager(rm),
-		// 3. Listen Address (QUIC/UDP only — works reliably on Android)
+		// 3. Listen Addresses — dual transport: QUIC + WebRTC Direct
+		//    QUIC: configured port (UDP)
+		//    WebRTC Direct: port 0 (kernel assigns random UDP port)
+		//    Note: QUIC and WebRTC cannot share the same UDP socket,
+		//    so WebRTC uses a separate port.
 		libp2p.ListenAddrStrings(
 			fmt.Sprintf("/ip4/0.0.0.0/udp/%s/quic-v1", portStr),
+			"/ip4/0.0.0.0/udp/0/webrtc-direct",
 		),
-		// 4. Transport & Security
-		libp2p.Transport(libp2pquic.NewTransport), // QUIC (UDP) only
+		// 4. Transports
+		//    QUIC: mature, low-latency UDP transport
+		//    WebRTC Direct: ICE-based, no external STUN configured — uses host
+		//    candidates only. Falls back to libp2p circuit relay (not STUN/TURN).
+		//    pion/webrtc is pure Go (no CGo) — safe for Android NDK cross-compile.
+		libp2p.Transport(libp2pquic.NewTransport),
+		libp2p.Transport(libp2pwebrtc.New),
 		libp2p.EnableRelay(),
 		// 5. Address Factory: advertise known addresses
 		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
@@ -109,9 +121,12 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	// DCUtR Hole Punching: relay-based, safe on Android — always enabled
 	opts = append(opts, libp2p.EnableHolePunching())
 
-	// Paksa status publik jika diminta (khusus Dedicated Relay)
+	// Paksa status publik/privat berdasarkan jenis node dan ketersediaan IP publik asli
 	if cfg.ForcePublic {
 		opts = append(opts, libp2p.ForceReachabilityPublic(), libp2p.EnableRelayService())
+	} else if !hasPublicIP() {
+		// Paksa client menjadi ReachabilityPrivate agar AutoRelay langsung melakukan reservasi ke Relay Server
+		opts = append(opts, libp2p.ForceReachabilityPrivate())
 	}
 
 	// Tambahkan AutoRelay dengan sumber dinamis
@@ -245,3 +260,50 @@ func LoadPeers(h host.Host, dataDir string) {
 		logger.Info().Int("count", count).Msg("Loaded peer addresses from persistent storage")
 	}
 }
+
+// hasPublicIP mengecek apakah ada interface lokal yang memiliki alamat IP publik global.
+func hasPublicIP() bool {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipNet.IP
+		if ip.IsLoopback() || ip.IsUnspecified() {
+			continue
+		}
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			continue
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			// Check private ranges (RFC 1918)
+			if ip4[0] == 10 {
+				continue
+			}
+			if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+				continue
+			}
+			if ip4[0] == 192 && ip4[1] == 168 {
+				continue
+			}
+			// Carrier-grade NAT (RFC 6598)
+			if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+				continue
+			}
+			return true // Found public IPv4
+		} else {
+			// IPv6
+			// Skip unique local unicast (fc00::/7)
+			if len(ip) >= 16 && (ip[0]&0xfe) == 0xfc {
+				continue
+			}
+			return true // Found public IPv6
+		}
+	}
+	return false
+}
+

@@ -1186,6 +1186,74 @@ func DownloadFile(manifestCIDStr, keyB64Str, savePathStr *C.char) *C.char {
 	return C.CString(string(bytes))
 }
 
+//export GetPeerConnInfo
+func GetPeerConnInfo(peerIDStr *C.char) *C.char {
+	type PeerConnInfoResult struct {
+		Type     string `json:"type"` // "direct_quic", "direct_webrtc", "relay", "offline"
+		RelayVia string `json:"relay_via,omitempty"`
+	}
+
+	peerIDRaw := C.GoString(peerIDStr)
+	if globalHost == nil || peerIDRaw == "" {
+		b, _ := json.Marshal(PeerConnInfoResult{Type: "offline"})
+		return C.CString(string(b))
+	}
+
+	peerID, err := peer.Decode(peerIDRaw)
+	if err != nil {
+		b, _ := json.Marshal(PeerConnInfoResult{Type: "offline"})
+		return C.CString(string(b))
+	}
+
+	conns := globalHost.Network().ConnsToPeer(peerID)
+	if len(conns) == 0 {
+		b, _ := json.Marshal(PeerConnInfoResult{Type: "offline"})
+		return C.CString(string(b))
+	}
+
+	// Priority: direct_webrtc = direct_quic > relay
+	// Scan all conns; any direct connection wins immediately.
+	result := PeerConnInfoResult{Type: "relay"}
+	for _, conn := range conns {
+		addrStr := conn.RemoteMultiaddr().String()
+
+		if strings.Contains(addrStr, "p2p-circuit") {
+			// Circuit relay connection - extract relay peer ID
+			// Format: /ip4/.../p2p/<relayID>/p2p-circuit/p2p/<targetID>
+			parts := strings.Split(addrStr, "/")
+			for i, part := range parts {
+				if part == "p2p-circuit" && i >= 2 {
+					for j := i - 1; j >= 0; j-- {
+						if parts[j] == "p2p" && j+1 < i {
+							result.RelayVia = parts[j+1]
+							break
+						}
+					}
+					break
+				}
+			}
+			result.Type = "relay"
+			// Don't break - keep scanning for a direct connection
+
+		} else if strings.Contains(addrStr, "webrtc-direct") {
+			// WebRTC Direct - ICE host candidates only (no STUN)
+			result.Type = "direct_webrtc"
+			result.RelayVia = ""
+			break // direct wins
+
+		} else {
+			// QUIC or other direct transport
+			result.Type = "direct_quic"
+			result.RelayVia = ""
+			break // direct wins
+		}
+	}
+
+	b, _ := json.Marshal(result)
+	return C.CString(string(b))
+}
+
+
 func main() {
 	// Mandatory main for C-shared libraries, but unused
 }
