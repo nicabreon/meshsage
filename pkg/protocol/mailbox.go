@@ -386,6 +386,32 @@ func GetMailboxCoordinate(targetID peer.ID) string {
 	return fmt.Sprintf("%x", hash)
 }
 
+type CachedMailboxPeers struct {
+	Peers      []peer.ID
+	LastUpdate time.Time
+}
+
+var MailboxPeersCache sync.Map // map[peer.ID]CachedMailboxPeers
+
+func PrefetchMailboxCoords(targetID peer.ID) {
+	if corenet.GlobalDHT == nil { return }
+	go func() {
+		coord := GetMailboxCoordinate(targetID)
+		dhtCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		peers, err := corenet.GlobalDHT.GetClosestPeers(dhtCtx, coord)
+		if err == nil {
+			MailboxPeersCache.Store(targetID, CachedMailboxPeers{
+				Peers:      peers,
+				LastUpdate: time.Now(),
+			})
+			logger.Debug().Str("target", targetID.String()).Int("closest", len(peers)).Msg("Mailbox DHT cache pre-fetched in background")
+		} else {
+			logger.Debug().Err(err).Str("target", targetID.String()).Msg("Mailbox DHT cache pre-fetch failed")
+		}
+	}()
+}
+
 func StoreOfflineMessage(ctx context.Context, h host.Host, targetID peer.ID, senderPubkeyB64, payloadB64 string) error {
 	coord := GetMailboxCoordinate(targetID)
 	msgHash := fmt.Sprintf("%x", sha256.Sum256([]byte(payloadB64+senderPubkeyB64+fmt.Sprintf("%d", time.Now().UnixNano()))))
@@ -411,11 +437,38 @@ func StoreOfflineMessage(ctx context.Context, h host.Host, targetID peer.ID, sen
 		}
 	}
 
-	// Query closest peers once from DHT
+	// Look up closest peers in memory cache
 	var closest []peer.ID
-	dhtCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	closest, _ = corenet.GlobalDHT.GetClosestPeers(dhtCtx, coord)
-	cancel()
+	cacheVal, found := MailboxPeersCache.Load(targetID)
+	needRefresh := true
+
+	if found {
+		cached := cacheVal.(CachedMailboxPeers)
+		closest = cached.Peers
+		if time.Now().Sub(cached.LastUpdate) < 30*time.Second {
+			needRefresh = false
+		}
+	}
+
+	if needRefresh && corenet.GlobalDHT != nil {
+		go func(tID peer.ID, cd string) {
+			dhtCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			peers, err := corenet.GlobalDHT.GetClosestPeers(dhtCtx, cd)
+			if err == nil {
+				MailboxPeersCache.Store(tID, CachedMailboxPeers{
+					Peers:      peers,
+					LastUpdate: time.Now(),
+				})
+				logger.Debug().Str("target", tID.String()).Int("closest", len(peers)).Msg("Mailbox DHT cache updated in background")
+			}
+		}(targetID, coord)
+	}
+
+	// Fallback to connected hybrid peers if we have no cached closest peers (preflight/warmup path)
+	if len(closest) == 0 {
+		closest = hybridPeers
+	}
 
 	if len(infraPeers) == 0 {
 		for _, p := range closest {
@@ -742,23 +795,23 @@ func VerifySignedEnvelope(envelopeStr string, senderPubKey crypto.PubKey) (strin
 }
 
 // StartMailboxSync coordinates initial pre-key refill, immediate message fetching,
-// and runs a notification subscription loop, a periodic 2-second fast polling loop,
-// and a periodic 30-second pre-key refill check loop concurrently.
+// and runs a notification subscription loop and a periodic 30-second pre-key refill
+// check loop concurrently.
+//
+// Guard lifecycle: activeSyncs entry is held inside the subscription goroutine itself,
+// NOT in the calling function. This prevents duplicate sync loops when the relay
+// reconnects while a loop is already running.
 func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey crypto.PrivKey) {
+	// Quick non-blocking guard check before spawning goroutines.
 	activeSyncsMutex.Lock()
 	if _, exists := activeSyncs[relayID]; exists {
 		activeSyncsMutex.Unlock()
 		logger.Debug().Str("peerID", relayID.String()).Msg("Mailbox sync already running for relay, skipping duplicate setup")
 		return
 	}
+	// Mark as running immediately — the goroutine below will unmark on exit.
 	activeSyncs[relayID] = struct{}{}
 	activeSyncsMutex.Unlock()
-
-	defer func() {
-		activeSyncsMutex.Lock()
-		delete(activeSyncs, relayID)
-		activeSyncsMutex.Unlock()
-	}()
 
 	// 1. Refill pre-keys
 	go AutoRefillPreKeys(ctx, h, relayID, privKey)
@@ -773,8 +826,18 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 		}
 	}()
 
-	// 3. Keep-alive subscription loop (runs in its own goroutine)
+	// 3. Keep-alive subscription loop.
+	// IMPORTANT: This goroutine owns the activeSyncs guard for relayID.
+	// The guard is released only when this goroutine exits (ctx cancelled),
+	// preventing duplicate loops if the relay reconnects while this loop runs.
 	go func() {
+		defer func() {
+			activeSyncsMutex.Lock()
+			delete(activeSyncs, relayID)
+			activeSyncsMutex.Unlock()
+			logger.Debug().Str("peerID", relayID.String()).Msg("Mailbox sync loop exited, guard released")
+		}()
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -794,17 +857,16 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 			}
 
 			if subscribed {
-				// We are successfully subscribed to push notifications.
-				// Wait until the subscription is lost or context cancel
+				// Successfully subscribed — wait until lost or ctx cancelled.
 				select {
 				case <-ctx.Done():
 					return
 				case <-statusChan:
-					// Lost subscription
+					// Lost subscription, will retry after backoff below.
 				}
 			}
 
-			// Wait 5 seconds before retrying subscription to avoid tight connection loop
+			// Back-off before retrying to avoid hammering the relay.
 			select {
 			case <-ctx.Done():
 				return
@@ -813,7 +875,7 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 		}
 	}()
 
-	// 5. Concurrent 30-second pre-key refill check loop
+	// 4. Concurrent 30-second pre-key refill check loop.
 	go func() {
 		refillTicker := time.NewTicker(30 * time.Second)
 		defer refillTicker.Stop()

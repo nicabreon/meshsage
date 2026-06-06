@@ -23,9 +23,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
-	corenet "github.com/nicabreon/meshsage/pkg/network"
-	corestore "github.com/nicabreon/meshsage/pkg/storage"
 	"github.com/nicabreon/meshsage/pkg/logger"
+	corestore "github.com/nicabreon/meshsage/pkg/storage"
 )
 
 const MessagingProtocolID = "/p2p-core/msg/1.0.0"
@@ -49,13 +48,13 @@ var (
 // sentMsg adalah pesan yang sudah dikirim oleh node ini, disimpan untuk kemungkinan retry
 // jika receiver mengalami masalah sesi dan meminta X3DH ulang.
 type sentMsg struct {
-	env       MessageEnvelope
-	sentAt    time.Time
+	env    MessageEnvelope
+	sentAt time.Time
 }
 
 const (
-	maxSentPerPeer  = 20              // max pesan tersimpan per peer
-	sentMsgTTL      = 10 * time.Minute // pesan lebih lama dari ini tidak di-retry
+	maxSentPerPeer = 20               // max pesan tersimpan per peer
+	sentMsgTTL     = 10 * time.Minute // pesan lebih lama dari ini tidak di-retry
 )
 
 var (
@@ -212,7 +211,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		}
 		timestampStr := parts[1]
 		sigB64 := parts[2]
-		
+
 		// Try ExtractPublicKey first (works for Ed25519 inline peer IDs)
 		// Fall back to peerstore if not available (e.g. RSA, secp256k1)
 		pubKey, err := senderID.ExtractPublicKey()
@@ -230,20 +229,20 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				return
 			}
 		}
-		
+
 		dataToVerify := []byte(fmt.Sprintf("RESET:%s:%s:%s", timestampStr, senderID.String(), h.ID().String()))
 		sigBytes, err := base64.StdEncoding.DecodeString(sigB64)
 		if err != nil {
 			logger.Error().Err(err).Msg("RESET: failed to decode signature")
 			return
 		}
-		
+
 		valid, err := pubKey.Verify(dataToVerify, sigBytes)
 		if err != nil || !valid {
 			logger.Warn().Str("senderID", senderID.String()).Msg("RESET: invalid signature detected")
 			return
 		}
-		
+
 		// Signature is valid! Delete the session state for the sender
 		logger.Info().Str("senderID", senderID.String()).Msg("RESET: Session reset request verified. Deleting session state.")
 		if err := corestore.DeleteSession(senderID.String()); err != nil {
@@ -289,12 +288,12 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			logger.Error().Msg("ProcessSecureEnvelope: DR envelope format invalid (missing parts)")
 			return
 		}
-		
+
 		// Format DR:RatchetPub|PN|N|Ciphertext
 		rawPayload, _ := base64.StdEncoding.DecodeString(parts[1])
 		payloadStr := string(rawPayload)
 		headerParts := strings.SplitN(payloadStr, "|", 4)
-		
+
 		if len(headerParts) == 4 {
 			counter, _ := strconv.ParseUint(headerParts[2], 10, 32)
 
@@ -302,7 +301,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			sessionMu := getSessionLock(senderID.String())
 			sessionMu.Lock()
 			defer sessionMu.Unlock()
-			
+
 			// A. Cek Skipped Keys dulu
 			skippedKey, skippedErr := corestore.GetSkippedKey(senderID.String(), uint32(counter))
 			if skippedErr == nil {
@@ -342,19 +341,21 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			localRatchetPriv, _ := base64.StdEncoding.DecodeString(localRatchetPrivB64)
 			localRatchetPub, _ := base64.StdEncoding.DecodeString(localRatchetPubB64)
 
-			if len(recvChain) == 0 { recvChain = rootKey }
+			if len(recvChain) == 0 {
+				recvChain = rootKey
+			}
 
 			session := &corecrypto.SessionState{
-				PeerID: senderID.String(),
-				RootKey: rootKey,
-				SendChainKey: sendChain,
-				RecvChainKey: recvChain,
+				PeerID:              senderID.String(),
+				RootKey:             rootKey,
+				SendChainKey:        sendChain,
+				RecvChainKey:        recvChain,
 				RemoteRatchetPubkey: remoteRatchetPub,
 				LocalRatchetPrivkey: localRatchetPriv,
-				LocalRatchetPubkey: localRatchetPub,
-				N: n,
-				M: m,
-				PN: pn,
+				LocalRatchetPubkey:  localRatchetPub,
+				N:                   n,
+				M:                   m,
+				PN:                  pn,
 			}
 
 			plaintext, skipped, err := session.DecryptWithRatchet(payloadStr)
@@ -379,7 +380,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 					logger.Debug().Str("peerID", senderID.String()).Msg("DR: DH ratchet step detected — cleared stale skipped keys")
 				}
 			}
-			corestore.SaveSession(senderID.String(), remoteIdentityB64, 
+			corestore.SaveSession(senderID.String(), remoteIdentityB64,
 				base64.StdEncoding.EncodeToString(session.RootKey),
 				base64.StdEncoding.EncodeToString(session.SendChainKey),
 				base64.StdEncoding.EncodeToString(session.RecvChainKey),
@@ -387,12 +388,12 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				base64.StdEncoding.EncodeToString(session.LocalRatchetPrivkey),
 				base64.StdEncoding.EncodeToString(session.LocalRatchetPubkey),
 				session.N, session.M, session.PN)
-			
+
 			// Simpan skipped keys
 			for c, k := range skipped {
 				corestore.SaveSkippedKey(senderID.String(), c, k)
 			}
-			
+
 			logger.Info().Str("senderID", senderID.String()).Msg("ProcessSecureEnvelope: Double Ratchet envelope decrypted successfully")
 			if processDecryptedPayload(ctx, h, senderID, []byte(plaintext), msgHash) {
 				success = true
@@ -412,7 +413,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			logger.Error().Int("parts", len(parts)).Msg("ProcessSecureEnvelope: X3DH envelope format invalid (too few parts)")
 			return
 		}
-		
+
 		isX3DH = true
 		keyID = parts[1]
 		ePubB64 := parts[2]
@@ -441,7 +442,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			logger.Error().Err(err).Msg("ProcessSecureEnvelope: X3DH DeriveSharedSecret failed")
 			return
 		}
- 
+
 		// Inisialisasi ratchet keys di sisi receiver
 		bobPreKeyPub, err := corecrypto.DerivePublicKey(privKeyBytes)
 		if err != nil {
@@ -470,7 +471,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		// Generate local ratchet keypair baru untuk Bob
 		localRatchetPriv, localRatchetPub, _ := corecrypto.GenerateEphemeralKeypair()
 		localRatchetPrivB64 := base64.StdEncoding.EncodeToString(localRatchetPriv)
-		localRatchetPubB64  := base64.StdEncoding.EncodeToString(localRatchetPub)
+		localRatchetPubB64 := base64.StdEncoding.EncodeToString(localRatchetPub)
 
 		// Lakukan DH Send Step awal
 		sendRootKey := recvRootKey
@@ -585,12 +586,12 @@ func pushDecryptionErrorToUI(senderID peer.ID, errStr string) {
 		ts := time.Now().Format("02/01 15:04:05")
 		errID := fmt.Sprintf("err-%x", sha256.Sum256([]byte(errStr+time.Now().String())))[:8]
 		content := "[Error: Failed to decrypt message: " + errStr + "]"
-		
+
 		// Simpan error ini ke SQLite database lokal agar tersimpan di chat history
 		if localHost != nil {
 			_ = corestore.SaveMessage(senderID.String(), localHost.ID().String(), content, "", "", "")
 		}
-		
+
 		MessageCallback(MessageEvent{
 			Type:      "direct",
 			MsgID:     errID,
@@ -623,7 +624,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		return true
 
 	case MsgTypeStatus:
-		logger.Displayf("[Status Report] Peer %s marked your message %s as: %s\n", 
+		logger.Displayf("[Status Report] Peer %s marked your message %s as: %s\n",
 			FormatPeerID(senderID.String()), env.RefID, env.Status)
 		// Forward to Flutter via StatusCallback
 		if StatusCallback != nil {
@@ -661,7 +662,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 				groupID := parts[1]
 				keysStr := parts[2]
 				keyB64s := strings.Split(keysStr, ",")
-				
+
 				// Process from oldest to newest so the newest becomes the active key
 				savedCount := 0
 				for i := len(keyB64s) - 1; i >= 0; i-- {
@@ -671,7 +672,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 						savedCount++
 					}
 				}
-				
+
 				logger.Info().
 					Str("group", groupID).
 					Str("peerID", senderID.String()).
@@ -696,7 +697,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 				logger.Error().Err(err).Msg("Failed to unmarshal GINVITE JSON")
 				return true
 			}
-			
+
 			// Verify Creator Signature
 			creatorID, errDec := peer.Decode(invite.Meta.CreatorID)
 			if errDec != nil {
@@ -712,7 +713,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 					return true
 				}
 			}
-			
+
 			dataToVerify := []byte(invite.Meta.GroupID + invite.Meta.GroupAlias + invite.Meta.CreatorID + fmt.Sprintf("%d", invite.Meta.CreatedAt))
 			sigBytes, _ := base64.StdEncoding.DecodeString(invite.Meta.Signature)
 			valid, errVerify := pubKey.Verify(dataToVerify, sigBytes)
@@ -724,13 +725,13 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 				logger.Error().Str("group", invite.Meta.GroupAlias).Msg("Received GINVITE with INVALID signature!")
 				return true
 			}
-			
+
 			errJoin := JoinGroupProper(ctx, h, h.Peerstore().PrivKey(h.ID()),
 				invite.Meta.GroupID, invite.Meta.GroupAlias, invite.Meta.CreatorID, invite.Meta.GroupType, invite.Meta.Signature, invite.Meta.CreatedAt, invite.Members)
 			if errJoin != nil {
 				logger.Error().Err(errJoin).Str("group", invite.Meta.GroupAlias).Msg("Failed to join group in GINVITE handler")
 			}
-			
+
 			if invite.GKey != "" {
 				keyBytes, _ := base64.StdEncoding.DecodeString(invite.GKey)
 				_ = corestore.SaveGroupSenderKey(invite.Meta.GroupID, invite.Meta.CreatorID, keyBytes)
@@ -769,7 +770,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		// OTOMATIS: Kirim status "delivered" (Centang 2)
 		go SendStatusUpdate(ctx, h, senderID, env.ID, StatusDelivered)
 		return true
-		
+
 	case MsgTypeFile:
 		// Persist to SQLite
 		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "file")
@@ -790,7 +791,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 			}
 		}
 		return true
-	
+
 	case MsgTypeGroup:
 		return ProcessGroupMessage(env.RefID, []byte(env.Content), "")
 	default:
@@ -801,13 +802,13 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 
 func SendStatusUpdate(ctx context.Context, h host.Host, targetID peer.ID, refID string, status string) error {
 	msgID := fmt.Sprintf("st-%x", sha256.Sum256([]byte(refID+status)))[:8]
-	
+
 	// DIGITAL SIGNATURE: Tanda tangani (Content + ID) agar konsisten
 	privKey := h.Peerstore().PrivKey(h.ID())
 	dataToSign := []byte(status + msgID) // Di sini status bertindak sebagai Content
 	sigBytes, _ := privKey.Sign(dataToSign)
 	sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
-	
+
 	msgEnv := MessageEnvelope{
 		ID:        msgID,
 		Type:      MsgTypeStatus,
@@ -817,12 +818,17 @@ func SendStatusUpdate(ctx context.Context, h host.Host, targetID peer.ID, refID 
 		Timestamp: time.Now().UnixNano(),
 		Signature: sigB64,
 	}
-	
+
 	// Gunakan sendSecureEnvelope agar ia sadar sesi (Double Ratchet)
 	return sendSecureEnvelope(ctx, h, privKey, targetID, msgEnv)
 }
 
 func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID, jsonPayload []byte) (string, error) {
+	startPrep := time.Now()
+	defer func() {
+		logger.Info().Str("target", targetID.String()).Dur("elapsed", time.Since(startPrep)).Msg("LOG_STEP: prepareSecureEnvelope completed")
+	}()
+
 	// BUG-03: Lock per-peer agar tidak ada race condition pada session state
 	sessionMu := getSessionLock(targetID.String())
 	sessionMu.Lock()
@@ -839,26 +845,28 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 		localRatchetPriv, _ := base64.StdEncoding.DecodeString(localRatchetPrivB64)
 		localRatchetPub, _ := base64.StdEncoding.DecodeString(localRatchetPubB64)
 
-		if len(sendChain) == 0 { sendChain = rootKey }
+		if len(sendChain) == 0 {
+			sendChain = rootKey
+		}
 
 		session := &corecrypto.SessionState{
-			PeerID: targetID.String(),
-			RemoteIdentityKey: []byte(remoteIdentityB64),
-			RootKey: rootKey,
-			SendChainKey: sendChain,
-			RecvChainKey: recvChain,
+			PeerID:              targetID.String(),
+			RemoteIdentityKey:   []byte(remoteIdentityB64),
+			RootKey:             rootKey,
+			SendChainKey:        sendChain,
+			RecvChainKey:        recvChain,
 			RemoteRatchetPubkey: remoteRatchetPub,
 			LocalRatchetPrivkey: localRatchetPriv,
-			LocalRatchetPubkey: localRatchetPub,
-			N: n,
-			M: m,
-			PN: pn,
+			LocalRatchetPubkey:  localRatchetPub,
+			N:                   n,
+			M:                   m,
+			PN:                  pn,
 		}
 
 		ciphertext, err := session.EncryptWithRatchet(string(jsonPayload))
 		if err == nil {
 			// Save updated state
-			corestore.SaveSession(targetID.String(), remoteIdentityB64, 
+			corestore.SaveSession(targetID.String(), remoteIdentityB64,
 				base64.StdEncoding.EncodeToString(session.RootKey),
 				base64.StdEncoding.EncodeToString(session.SendChainKey),
 				base64.StdEncoding.EncodeToString(session.RecvChainKey),
@@ -882,8 +890,26 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 		Msg("No session found. Initiating X3DH Handshake flow")
 
 	for _, relayPeer := range connectedPeers {
-		logger.Debug().Str("target", targetID.String()).Str("relay", relayPeer.String()).Msg("X3DH HANDSHAKE: Fetching Pre-Key")
+		// Optimization: Check if peer supports the pre-key protocol before attempting to dial
+		protos, err := h.Peerstore().GetProtocols(relayPeer)
+		if err != nil {
+			continue
+		}
+		supportsPreKey := false
+		for _, proto := range protos {
+			if string(proto) == PreKeyProtocolID {
+				supportsPreKey = true
+				break
+			}
+		}
+		if !supportsPreKey {
+			continue
+		}
+
+		logger.Info().Str("target", targetID.String()).Str("relay", relayPeer.String()).Msg("LOG_STEP: X3DH HANDSHAKE: Fetching Pre-Key starting...")
+		startFetch := time.Now()
 		id, pub, _, err := FetchPreKey(ctx, h, relayPeer, targetID.String())
+		logger.Info().Str("target", targetID.String()).Str("relay", relayPeer.String()).Dur("elapsed", time.Since(startFetch)).Err(err).Msg("LOG_STEP: X3DH HANDSHAKE: FetchPreKey finished")
 		if err == nil && pub != "" {
 			keyID = id
 			pubKeyB64 = pub
@@ -907,21 +933,31 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 
 	logger.Debug().Msg("X3DH HANDSHAKE: Generating Ephemeral Keypair & Deriving Shared Secret")
 	ePriv, ePub, err := corecrypto.GenerateEphemeralKeypair()
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 
 	peerPubKeyBytes, _ := base64.StdEncoding.DecodeString(pubKeyB64)
 	aesKey, err := corecrypto.DeriveSharedSecret(ePriv, peerPubKeyBytes)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 
 	// Inisialisasi Double Ratchet: Generate ratchet keypair lokal
 	localRatchetPriv, localRatchetPub, err := corecrypto.GenerateEphemeralKeypair()
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 
 	// Lakukan DH Send Step awal menggunakan localRatchetPriv dan pubKeyB64 (Pre-key Bob)
 	sharedSecret, err := corecrypto.DeriveSharedSecret(localRatchetPriv, peerPubKeyBytes)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	res, err := corecrypto.HKDFExpand(sharedSecret, "p2p-core-dh-ratchet", 64)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 
 	initRootKey := res[:32]
 	initSendChainKey := res[32:]
@@ -945,7 +981,9 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 	// Sertakan localRatchetPub di dalam payload agar receiver bisa init RecvChainKey
 	ePubB64 := base64.StdEncoding.EncodeToString(ePub)
 	encryptedBytes, err := corecrypto.EncryptMessageRaw(aesKey, jsonPayload)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 
 	// Format: X3DH:keyID:ePub:senderRatchetPub:encryptedPayload
 	finalWireEnvelope := fmt.Sprintf("X3DH:%s:%s:%s:%s", keyID, ePubB64, senderRatchetPubB64Out, base64.StdEncoding.EncodeToString(encryptedBytes))
@@ -977,10 +1015,10 @@ func SendSessionReset(ctx context.Context, h host.Host, targetID peer.ID) error 
 	}
 	sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
 	resetEnvelope := fmt.Sprintf("RESET:%d:%s", timestamp, sigB64)
-	
+
 	// Delete local session first to clean up local state
 	_ = corestore.DeleteSession(targetID.String())
-	
+
 	logger.Info().Str("targetID", targetID.String()).Msg("Sending E2EE Session Reset signal to peer")
 	return transmitEnvelope(ctx, h, targetID, resetEnvelope)
 }
@@ -1016,9 +1054,9 @@ func sendRequestX3DH(ctx context.Context, h host.Host, targetID peer.ID) {
 // sendHandshakeAck is called by the X3DH receiver (B) after successfully decrypting
 // the initiator's (A's) first X3DH message. It sends a silent MsgTypeHandshakeAck
 // envelope back to A via Double Ratchet, which:
-//   1. Forces B to use its newly established send-chain (proving B's session is live).
-//   2. Causes A to perform a DH ratchet step on receipt, completing the full
-//      bidirectional Double Ratchet session without any user-visible interaction.
+//  1. Forces B to use its newly established send-chain (proving B's session is live).
+//  2. Causes A to perform a DH ratchet step on receipt, completing the full
+//     bidirectional Double Ratchet session without any user-visible interaction.
 //
 // If the ACK cannot be delivered (peer offline), it falls back to mailbox storage
 // like any other message — the session will self-heal via the normal X3DH auto-recovery.
@@ -1096,56 +1134,65 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 }
 
 func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWireEnvelope string) error {
+	startTransmit := time.Now()
+	defer func() {
+		logger.Info().Str("target", target.String()).Dur("elapsed", time.Since(startTransmit)).Msg("LOG_STEP: transmitEnvelope completed")
+	}()
+
 	if target == h.ID() {
 		logger.Info().Msg("transmitEnvelope: Self-message detected, processing locally without network dial")
 		go ProcessSecureEnvelope(ctx, h, h.ID(), finalWireEnvelope, "")
 		return nil
 	}
 
-	// Query the DHT to find the target peer's actual addresses (including relay addresses)
-	// if we don't have them cached in peerstore. This is standard libp2p peer routing.
-	if len(h.Peerstore().Addrs(target)) == 0 && corenet.GlobalDHT != nil {
-		logger.Debug().Str("target", target.String()).Msg("No addresses for target, querying DHT FindPeer...")
-		findCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		pinfo, err := corenet.GlobalDHT.FindPeer(findCtx, target)
-		cancel()
-		if err == nil {
-			h.Peerstore().AddAddrs(target, pinfo.Addrs, 5*time.Minute)
-			logger.Debug().Str("target", target.String()).Int("addrs", len(pinfo.Addrs)).Msg("Found target addresses via DHT")
-		} else {
-			logger.Warn().Err(err).Str("target", target.String()).Msg("DHT FindPeer failed")
-		}
-	}
+	// Cek apakah ada koneksi aktif ke peer tersebut (direct maupun via relay)
+	isConnected := len(h.Network().ConnsToPeer(target)) > 0
 
-	logger.Debug().Str("target", target.String()).Msg("transmitEnvelope: Attempting dial to target (direct/relay)")
-	dialCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-	s, err := h.NewStream(dialCtx, target, MessagingProtocolID)
-	if err == nil {
-		logger.Debug().Str("target", target.String()).Msg("transmitEnvelope: Direct dial succeeded, writing envelope")
-		errWrite := binary.Write(s, binary.LittleEndian, uint32(len(finalWireEnvelope)))
-		if errWrite == nil {
-			_, errWrite = s.Write([]byte(finalWireEnvelope))
-		}
-		if errWrite == nil {
-			// Read ACK
-			respReader := bufio.NewReader(s)
-			s.SetReadDeadline(time.Now().Add(1 * time.Second))
-			resp, errRead := respReader.ReadString('\n')
-			if errRead != nil || strings.TrimSpace(resp) != "OK" {
-				errWrite = fmt.Errorf("did not receive ACK from target: %v", errRead)
+	var s network.Stream
+	var err error
+
+	if isConnected {
+		logger.Info().Str("target", target.String()).Msg("LOG_STEP: transmitEnvelope: Active connection found, attempting direct stream dial...")
+		startDial := time.Now()
+		dialCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		s, err = h.NewStream(dialCtx, target, MessagingProtocolID)
+		cancel()
+		logger.Info().Str("target", target.String()).Dur("elapsed", time.Since(startDial)).Err(err).Msg("LOG_STEP: transmitEnvelope: NewStream dial finished")
+
+		if err == nil {
+			logger.Debug().Str("target", target.String()).Msg("transmitEnvelope: Direct stream succeeded, writing envelope")
+			s.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			startWrite := time.Now()
+			errWrite := binary.Write(s, binary.LittleEndian, uint32(len(finalWireEnvelope)))
+			if errWrite == nil {
+				_, errWrite = s.Write([]byte(finalWireEnvelope))
 			}
+			logger.Info().Str("target", target.String()).Dur("elapsed", time.Since(startWrite)).Err(errWrite).Msg("LOG_STEP: transmitEnvelope: stream Write finished")
+
+			if errWrite == nil {
+				// Read ACK
+				respReader := bufio.NewReader(s)
+				s.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				startAck := time.Now()
+				resp, errRead := respReader.ReadString('\n')
+				logger.Info().Str("target", target.String()).Dur("elapsed", time.Since(startAck)).Err(errRead).Msg("LOG_STEP: transmitEnvelope: stream Read ACK finished")
+				if errRead != nil || strings.TrimSpace(resp) != "OK" {
+					errWrite = fmt.Errorf("did not receive ACK from target: %v", errRead)
+				}
+			}
+			s.Close()
+			if errWrite == nil {
+				// Track outgoing bytes (4-byte length prefix + envelope payload)
+				AddBytesSent(4 + len(finalWireEnvelope))
+				return nil
+			}
+			logger.Warn().Err(errWrite).Str("target", target.String()).Msg("transmitEnvelope: Direct write failed, falling back to mailbox")
+			err = errWrite
+		} else {
+			logger.Warn().Err(err).Str("target", target.String()).Msg("transmitEnvelope: Dial stream failed, falling back to mailbox")
 		}
-		s.Close()
-		if errWrite == nil {
-			// Track outgoing bytes (4-byte length prefix + envelope payload)
-			AddBytesSent(4 + len(finalWireEnvelope))
-			return nil
-		}
-		logger.Warn().Err(errWrite).Str("target", target.String()).Msg("transmitEnvelope: Direct write failed, falling back to mailbox")
-		err = errWrite
 	} else {
-		logger.Warn().Err(err).Str("target", target.String()).Msg("transmitEnvelope: Dial failed, falling back to mailbox storage")
+		logger.Info().Str("target", target.String()).Msg("transmitEnvelope: No active connection found, skipping dial and sending via offline mailbox")
 	}
 
 	// Wrap envelope with standard signature for spam-proof mailbox storage
@@ -1164,7 +1211,18 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 		pubKeyBytes, _ = h.ID().MarshalBinary() // fallback: use raw peer ID bytes
 	}
 	senderPubkeyB64 := base64.StdEncoding.EncodeToString(pubKeyBytes)
-	return StoreOfflineMessage(ctx, h, target, senderPubkeyB64, encodedEnvelope)
+	// Run mailbox storage in the background to avoid blocking the FFI / UI thread
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := StoreOfflineMessage(bgCtx, h, target, senderPubkeyB64, encodedEnvelope)
+		if err != nil {
+			logger.Warn().Err(err).Str("target", target.String()).Msg("Background StoreOfflineMessage failed")
+		} else {
+			logger.Info().Str("target", target.String()).Msg("Background StoreOfflineMessage succeeded")
+		}
+	}()
+	return nil
 }
 
 func StartChatPrompt(ctx context.Context, h host.Host, priv crypto.PrivKey) {
@@ -1173,7 +1231,9 @@ func StartChatPrompt(ctx context.Context, h host.Host, priv crypto.PrivKey) {
 		reader := bufio.NewReader(os.Stdin)
 		for {
 			msg, err := reader.ReadString('\n')
-			if err != nil { return }
+			if err != nil {
+				return
+			}
 			msg = strings.TrimSpace(msg)
 			if msg != "" {
 				ProcessCommand(ctx, h, priv, msg)
@@ -1195,7 +1255,7 @@ func StartChatPrompt(ctx context.Context, h host.Host, priv crypto.PrivKey) {
 				if err == nil && len(content) > 0 {
 					// Clear the file immediately before processing to avoid race conditions with subsequent writes
 					os.WriteFile(inputPath, []byte(""), 0644)
-					
+
 					lines := strings.Split(string(content), "\n")
 					for _, line := range lines {
 						cmd := strings.TrimSpace(line)
@@ -1242,7 +1302,9 @@ func resolveTargetPeerID(ctx context.Context, h host.Host, targetStr string) (pe
 
 func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgStr string) {
 	msgStr = strings.TrimSpace(msgStr)
-	if msgStr == "" { return }
+	if msgStr == "" {
+		return
+	}
 
 	if strings.HasPrefix(msgStr, "/latency ") {
 		parts := strings.SplitN(msgStr, " ", 2)
@@ -1252,7 +1314,9 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 				pings := ping.Ping(ctx, h, targetID)
 				for i := 0; i < 3; i++ {
 					res := <-pings
-					if res.Error == nil { logger.Displayf("[Latency] Ping %d: %v\n", i+1, res.RTT) }
+					if res.Error == nil {
+						logger.Displayf("[Latency] Ping %d: %v\n", i+1, res.RTT)
+					}
 				}
 			} else {
 				logger.Displayf("[Error] Failed to resolve target '%s': %v\n", parts[1], err)
@@ -1265,22 +1329,28 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		parts := strings.SplitN(msgStr, " ", 4)
 		if len(parts) >= 3 {
 			alias := parts[1]
-			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+			if !strings.HasPrefix(alias, "@") {
+				alias = "@" + alias
+			}
 			gtype := strings.ToUpper(parts[2])
 			if gtype != "SECURE" && gtype != "UNSECURE" {
 				logger.Displayf("[Error] Invalid group type: %s. Must be SECURE or UNSECURE.\n", parts[2])
 				return
 			}
-			
+
 			var members []string
 			if len(parts) == 4 {
 				memberListRaw := strings.Split(parts[3], ",")
 				for _, m := range memberListRaw {
 					m = strings.TrimSpace(m)
-					if m == "" { continue }
+					if m == "" {
+						continue
+					}
 					if strings.HasPrefix(m, "@") {
 						resolved, err := ResolveAlias(ctx, h, m)
-						if err == nil { m = resolved } else {
+						if err == nil {
+							m = resolved
+						} else {
 							logger.Displayf("[Error] Failed to resolve member alias %s: %v\n", m, err)
 							return
 						}
@@ -1291,7 +1361,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 
 			// Generate Group ID
 			groupID := fmt.Sprintf("group_%x", sha256.Sum256([]byte(h.ID().String()+fmt.Sprintf("%d", time.Now().UnixNano()))))[:32]
-			
+
 			// Sign Metadata
 			privKey := h.Peerstore().PrivKey(h.ID())
 			createdAt := time.Now().Unix()
@@ -1357,8 +1427,10 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		parts := strings.SplitN(msgStr, " ", 2)
 		if len(parts) == 2 {
 			alias := parts[1]
-			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
-			
+			if !strings.HasPrefix(alias, "@") {
+				alias = "@" + alias
+			}
+
 			// Resolve group metadata from the network
 			meta, err := ResolveGroupMetadata(ctx, h, alias)
 			if err != nil {
@@ -1372,7 +1444,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 			}
 
 			privKey := h.Peerstore().PrivKey(h.ID())
-			
+
 			// Join locally
 			errJoin := JoinGroupProper(ctx, h, privKey, meta.GroupID, meta.GroupAlias, meta.CreatorID, meta.GroupType, meta.Signature, meta.CreatedAt, []string{})
 			if errJoin == nil {
@@ -1407,7 +1479,9 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		if len(parts) == 3 {
 			alias := parts[1]
 			member := parts[2]
-			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+			if !strings.HasPrefix(alias, "@") {
+				alias = "@" + alias
+			}
 
 			meta, err := corestore.LoadGroupMetadata(alias)
 			if err != nil {
@@ -1425,7 +1499,9 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 
 			if strings.HasPrefix(member, "@") {
 				resolved, err := ResolveAlias(ctx, h, member)
-				if err == nil { member = resolved } else {
+				if err == nil {
+					member = resolved
+				} else {
 					logger.Displayf("[Error] Failed to resolve member alias %s: %v\n", member, err)
 					return
 				}
@@ -1493,7 +1569,9 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		if len(parts) == 3 {
 			alias := parts[1]
 			member := parts[2]
-			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+			if !strings.HasPrefix(alias, "@") {
+				alias = "@" + alias
+			}
 
 			meta, err := corestore.LoadGroupMetadata(alias)
 			if err != nil {
@@ -1507,7 +1585,9 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 
 			if strings.HasPrefix(member, "@") {
 				resolved, err := ResolveAlias(ctx, h, member)
-				if err == nil { member = resolved } else {
+				if err == nil {
+					member = resolved
+				} else {
 					logger.Displayf("[Error] Failed to resolve member alias %s: %v\n", member, err)
 					return
 				}
@@ -1544,7 +1624,9 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		parts := strings.SplitN(msgStr, " ", 2)
 		if len(parts) == 2 {
 			alias := parts[1]
-			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+			if !strings.HasPrefix(alias, "@") {
+				alias = "@" + alias
+			}
 
 			meta, err := corestore.LoadGroupMetadata(alias)
 			if err != nil {
@@ -1573,7 +1655,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 			session, exists := activeGroups[meta.GroupID]
 			if exists {
 				_ = session.Topic.Publish(ctx, msgBytes)
-				
+
 				// Exit locally
 				session.Sub.Cancel()
 				session.Topic.Close()
@@ -1591,7 +1673,9 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		parts := strings.SplitN(msgStr, " ", 2)
 		if len(parts) == 2 {
 			alias := parts[1]
-			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+			if !strings.HasPrefix(alias, "@") {
+				alias = "@" + alias
+			}
 
 			meta, err := corestore.LoadGroupMetadata(alias)
 			if err != nil {
@@ -1632,7 +1716,9 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		parts := strings.SplitN(msgStr, " ", 2)
 		if len(parts) == 2 {
 			alias := parts[1]
-			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+			if !strings.HasPrefix(alias, "@") {
+				alias = "@" + alias
+			}
 
 			meta, err := corestore.LoadGroupMetadata(alias)
 			if err != nil {
@@ -1664,7 +1750,9 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		parts := strings.SplitN(msgStr, " ", 3)
 		if len(parts) == 3 {
 			targetStr := parts[1]
-			if !strings.HasPrefix(targetStr, "@") { targetStr = "@" + targetStr }
+			if !strings.HasPrefix(targetStr, "@") {
+				targetStr = "@" + targetStr
+			}
 
 			meta, err := corestore.LoadGroupMetadata(targetStr)
 			if err == nil {
@@ -1720,7 +1808,9 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		parts := strings.SplitN(msgStr, " ", 2)
 		if len(parts) == 2 {
 			alias := parts[1]
-			if !strings.HasPrefix(alias, "@") { alias = "@" + alias }
+			if !strings.HasPrefix(alias, "@") {
+				alias = "@" + alias
+			}
 			err := RegisterAlias(ctx, h, alias, h.ID().String())
 			if err != nil {
 				logger.Error().Err(err).Str("alias", alias).Msg("COMMAND: Failed to register alias")
@@ -1753,7 +1843,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 		}
 		return
 	}
-	
+
 	if strings.HasPrefix(msgStr, "/upload ") {
 		parts := strings.SplitN(msgStr, " ", 3)
 		if len(parts) == 3 {

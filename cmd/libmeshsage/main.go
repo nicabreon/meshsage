@@ -1253,7 +1253,69 @@ func GetPeerConnInfo(peerIDStr *C.char) *C.char {
 	return C.CString(string(b))
 }
 
+//export ConnectPeer
+func ConnectPeer(peerIDStr *C.char) *C.char {
+	peerIDRaw := C.GoString(peerIDStr)
+	if globalHost == nil || peerIDRaw == "" {
+		return C.CString("Host not initialized or empty Peer ID")
+	}
+
+	peerID, err := peer.Decode(peerIDRaw)
+	if err != nil {
+		return C.CString("Invalid Peer ID: " + err.Error())
+	}
+
+	// Run dial in the background so we don't block the UI
+	go func() {
+		// Pre-fetch mailbox coordinates in the background as preflight
+		coreproto.PrefetchMailboxCoords(peerID)
+
+		connected := false
+		
+		// 1. Try to connect using cached addresses first if we have them
+		if len(globalHost.Peerstore().Addrs(peerID)) > 0 {
+			logger.Debug().Str("target", peerID.String()).Msg("ConnectPeer: Trying cached addresses first...")
+			dialCtx, cancel := context.WithTimeout(globalCtx, 3*time.Second)
+			pinfo := peer.AddrInfo{
+				ID:    peerID,
+				Addrs: globalHost.Peerstore().Addrs(peerID),
+			}
+			err := globalHost.Connect(dialCtx, pinfo)
+			cancel()
+			if err == nil {
+				connected = true
+				logger.Info().Str("target", peerID.String()).Msg("ConnectPeer: Connected via cached addresses!")
+			}
+		}
+
+		// 2. If not connected, query Kademlia DHT to find fresh addresses and try again
+		if !connected && corenet.GlobalDHT != nil {
+			logger.Info().Str("target", peerID.String()).Msg("ConnectPeer: Querying DHT FindPeer for fresh addresses...")
+			findCtx, cancel := context.WithTimeout(globalCtx, 5*time.Second)
+			pinfo, err := corenet.GlobalDHT.FindPeer(findCtx, peerID)
+			cancel()
+			if err == nil {
+				logger.Info().Str("target", peerID.String()).Int("addrs", len(pinfo.Addrs)).Msg("ConnectPeer: Found fresh addresses via DHT")
+				globalHost.Peerstore().AddAddrs(peerID, pinfo.Addrs, 5*time.Minute)
+				
+				dialCtx2, cancel2 := context.WithTimeout(globalCtx, 5*time.Second)
+				defer cancel2()
+				if errConnect := globalHost.Connect(dialCtx2, pinfo); errConnect != nil {
+					logger.Warn().Err(errConnect).Str("target", peerID.String()).Msg("ConnectPeer: Dial with fresh addresses failed")
+				} else {
+					logger.Info().Str("target", peerID.String()).Msg("ConnectPeer: Connected via fresh addresses!")
+					connected = true
+				}
+			} else {
+				logger.Warn().Err(err).Str("target", peerID.String()).Msg("ConnectPeer: DHT FindPeer failed")
+			}
+		}
+	}()
+
+	return nil // Success
+}
 
 func main() {
 	// Mandatory main for C-shared libraries, but unused
 }
+

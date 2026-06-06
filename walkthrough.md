@@ -645,6 +645,71 @@ Consequently, when sending group messages, `SendGroupMessage` would query the lo
 3. **Flutter APK Built:** Built the updated release Flutter APK successfully.
 4. **Git Committed:** Committed changes to both `meshsage` and `meshsage_flutter` repositories.
 
+---
+
+## Walkthrough: Proactive Connection Upgrade on Chatroom Open
+
+### Problem Solved
+Previously, dialing a peer directly or via `p2p-circuit` relay would only happen when a message was sent or when a call was initiated. Because libp2p needs to negotiate connection details and establish the socket (or circuit relay tunnel) which can be slow on cellular networks, a strict 1-second dial timeout would force the signaling messages/first text message to failover to Mailbox storage. This caused significant connection setup delays for WebRTC calling since multiple candidates had to wait for 1-second timeouts in sequence.
+
+### Changes Made
+1. **Added `ConnectPeer` FFI function** in [main.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/cmd/libmeshsage/main.go):
+   - Decodes the target Peer ID and launches a background goroutine.
+   - If no addresses are cached in peerstore, queries Kademlia DHT using `FindPeer` (3-second timeout).
+   - Attempts to establish/upgrade the P2P connection to the peer via direct or `p2p-circuit` relay using `host.Connect` (5-second timeout).
+2. **Added FFI binding** in [ffi_bridge.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/ffi_bridge.dart):
+   - Linked Go's `ConnectPeer` as `connectPeer` to make it accessible in Flutter.
+3. **Implemented `proactiveConnect`** in [p2p_state.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/p2p_state.dart):
+   - Resolves target peer alias if needed.
+   - Triggers `FFIBridge.connectPeer` asynchronously in a background isolate (using `compute`) to keep the UI completely responsive.
+4. **Triggered on Chatroom Open** in [chat_room_screen.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/screens/chat_room_screen.dart):
+   - Inside `initState()`, if `widget.isGroup` is false (1:1 direct chat), it calls `widget.state.proactiveConnect(widget.targetID)`.
+
+This automatically starts dialing the target peer in the background as soon as the user opens the 1:1 chatroom.
+
+### Verification Results
+- All Go unit tests under `pkg/protocol/...` compiled and passed successfully:
+  ```text
+  ok  	github.com/nicabreon/meshsage/pkg/protocol	1.345s
+  ```
+- Recompiled Go native shared libraries (`libmeshsage.so`) successfully for all target architectures (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`).
+- Successfully built and packaged the release APK (`meshsage.apk`) to the workspace root directory.
+
+---
+
+## Walkthrough: Android Foreground Lifecycle Sync & Stream Dial Timeout Optimization
+
+### Problem Solved
+1. **Background Sync Suspended:** When the app was in the background, Android would suspend the P2P message sync because the Flutter main isolate was paused. Additionally, the native foreground service (`P2PBackgroundService`) was disabled/commented out in Kotlin, meaning the OS could easily kill or suspend the entire app process.
+2. **Slow Fallback to Mailbox on Disconnect:** When a peer disconnected or became unreachable, attempting to send a direct message via stream would block the Go FFI execution thread and the Dart background isolate for exactly 3 seconds (waiting for `NewStream` dial to time out). This delayed the fallback to the offline mailbox and blocked message delivery logic.
+
+### Changes Made
+1. **Active Foreground Lifecycle Sync:**
+   - Updated `didChangeAppLifecycleState` in [main.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/main.dart) to detect when the app returns to the foreground (`AppLifecycleState.resumed`) and immediately trigger a mailbox fetch via `_state.triggerManualFetch()`.
+2. **Enabled P2P Foreground Service:**
+   - Uncommented `startP2PService()` inside `MainActivity.onCreate` in [MainActivity.kt](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/android/app/src/main/kotlin/com/nicabreon/meshsage/meshsage_flutter/MainActivity.kt). This starts a persistent foreground service with a notification on app boot, preventing the OS from killing the background P2P node process.
+3. **Reduced Stream Dial Timeout:**
+   - Changed the context timeout for opening a new stream from `3*time.Second` to `100*time.Millisecond` in [messaging.go](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go). This ensures that if a peer is unreachable, the client falls back to storing the envelope in the mailbox in under 100ms instead of blocking for 3 seconds.
+4. **Enhanced Chat Notification (WhatsApp-like Behavior):**
+   - Configured `PendingIntent` inside `showLocalNotification` in [MainActivity.kt](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/android/app/src/main/kotlin/com/nicabreon/meshsage/meshsage_flutter/MainActivity.kt) to open the app directly when the notification is tapped.
+   - Updated the notification to use the app's actual launcher icon (`applicationInfo.icon`) instead of a generic system chat icon.
+   - Configured high priority, sound, vibration, flashing lights, and notification dots/badges on launcher icons for Android Oreo+ notification channels.
+5. **Interactive Full-screen Call Notification & Dialog (WhatsApp-like Incoming Calls):**
+   - Declared `uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"` in [AndroidManifest.xml](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/android/app/src/main/AndroidManifest.xml) to allow incoming calls to pop up the app when locked or minimized.
+   - Implemented `showCallNotification` and `cancelCallNotification` methods in [MainActivity.kt](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/android/app/src/main/kotlin/com/nicabreon/meshsage/meshsage_flutter/MainActivity.kt) using a dedicated incoming calls channel with high priority and default ringtone sound.
+   - Integrated call signaling handlers in [p2p_state.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/p2p_state.dart) to trigger call notifications on `offer` and automatically cancel/dismiss them on `hangup` or user response.
+   - Upgraded the incoming call modal in [p2p_state.dart](file:///Users/nicabreon/Documents/Distributed-Messaging-Platform/meshsage_flutter/lib/p2p_state.dart) to a stunning dark-themed custom overlay featuring a pulsating caller avatar, ringing state, and circular red/green action buttons.
+
+### Verification Results
+- All Go unit tests under `pkg/protocol/...` compiled and passed successfully.
+- Recompiled Go native shared libraries (`libmeshsage.so`) and rebuilt/deployed the Flutter APK.
+- Verified that returning the app to the foreground successfully triggers manual mailbox fetch on all active relays.
+- Verified that direct message sending falls back to offline mailbox storage in under 100ms if the peer goes offline.
+- Verified that incoming notification banners can be clicked to open the app, play sound, vibrate, and display the custom app icon.
+- Verified that incoming calls play the default system ringtone, display a heads-up notification in the background, and can be accepted/declined via a custom round button interface.
+
+
+
 
 
 

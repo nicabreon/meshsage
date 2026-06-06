@@ -2,26 +2,28 @@ package network
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
-	"encoding/json"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
-	"github.com/libp2p/go-libp2p/core/event"
-	"github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
-	"github.com/multiformats/go-multiaddr"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	libp2pwebrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
+	"github.com/multiformats/go-multiaddr"
 	"github.com/nicabreon/meshsage/pkg/logger"
+	pion_stun "github.com/pion/stun/v3"
 )
 
 // Config holds the configuration for the P2P node
@@ -33,6 +35,94 @@ type Config struct {
 	RelaySource    chan peer.AddrInfo
 	DataDir        string // Folder untuk menyimpan peers.datastore
 	ForcePublic    bool   // Paksa status keterjangkauan publik (khusus Relay)
+}
+
+// discoveredPublicIP holds the external IP discovered via STUN (thread-safe).
+var (
+	discoveredPublicIPMu sync.RWMutex
+	discoveredPublicIP   net.IP
+)
+
+// discoverPublicIPAsync queries a STUN server asynchronously to find our external/NAT-mapped IP.
+// Once discovered, it stores in discoveredPublicIP and triggers an address refresh via the emitter.
+func discoverPublicIPAsync(h host.Host) {
+	// List of public STUN servers to try in order
+	stunServers := []string{
+		"103.127.138.103:3478",      // Custom STUN server (priority)
+		"stun.l.google.com:19302",
+		"stun1.l.google.com:19302",
+		"stun.cloudflare.com:3478",
+	}
+
+	// Create an emitter to signal address updates to libp2p internals
+	emitter, err := h.EventBus().Emitter(new(event.EvtLocalAddressesUpdated))
+	if err != nil {
+		logger.Warn().Err(err).Msg("STUN: failed to create address update emitter, updates won't propagate")
+		emitter = nil
+	}
+
+	go func() {
+		if emitter != nil {
+			defer emitter.Close()
+		}
+		for _, server := range stunServers {
+			ip, err := querySTUN(server)
+			if err != nil {
+				logger.Debug().Str("server", server).Err(err).Msg("STUN: query failed, trying next")
+				continue
+			}
+			logger.Info().Str("external_ip", ip.String()).Str("via", server).Msg("STUN: discovered external IP")
+			discoveredPublicIPMu.Lock()
+			discoveredPublicIP = ip
+			discoveredPublicIPMu.Unlock()
+
+			// Signal libp2p that our addresses have changed (triggers AddrsFactory re-evaluation)
+			if emitter != nil {
+				_ = emitter.Emit(event.EvtLocalAddressesUpdated{})
+			}
+			return
+		}
+		logger.Warn().Msg("STUN: all servers failed, will rely on relay addresses for reachability")
+	}()
+}
+
+// querySTUN sends a STUN Binding Request and returns the XOR-MAPPED-ADDRESS IP.
+func querySTUN(server string) (net.IP, error) {
+	conn, err := net.DialTimeout("udp", server, 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	msg := pion_stun.MustBuild(pion_stun.TransactionID, pion_stun.BindingRequest)
+	_, err = conn.Write(msg.Raw)
+	if err != nil {
+		return nil, err
+	}
+
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp pion_stun.Message
+	resp.Raw = buf[:n]
+	if err := resp.Decode(); err != nil {
+		return nil, err
+	}
+
+	var xorAddr pion_stun.XORMappedAddress
+	if err := xorAddr.GetFrom(&resp); err != nil {
+		// Try MAPPED-ADDRESS as fallback
+		var mappedAddr pion_stun.MappedAddress
+		if err2 := mappedAddr.GetFrom(&resp); err2 != nil {
+			return nil, fmt.Errorf("no mapped address in STUN response: %v", err)
+		}
+		return mappedAddr.IP, nil
+	}
+	return xorAddr.IP, nil
 }
 
 // NewNode creates a new libp2p host.
@@ -87,16 +177,13 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 		),
 		// 4. Transports
 		//    QUIC: mature, low-latency UDP transport
-		//    WebRTC Direct: ICE-based, no external STUN configured — uses host
-		//    candidates only. Falls back to libp2p circuit relay (not STUN/TURN).
+		//    WebRTC Direct: ICE-based, uses host candidates + STUN-discovered public IP.
 		//    pion/webrtc is pure Go (no CGo) — safe for Android NDK cross-compile.
 		libp2p.Transport(libp2pquic.NewTransport),
 		libp2p.Transport(libp2pwebrtc.New),
 		libp2p.EnableRelay(),
-		// 5. Address Factory: advertise known addresses
-		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-			return addrs
-		}),
+		// 5. Address Factory: filter out loopback & link-local, inject STUN-discovered public IP
+		libp2p.AddrsFactory(filterAddrsWithSTUN),
 	}
 
 	// 6. NAT Traversal configuration (Android-aware)
@@ -161,11 +248,19 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 
 	// Audit: Print our own addresses periodically and on changes
 	printAddrs := func() {
-		for _, addr := range h.Addrs() {
-			logger.Info().Str("addr", addr.String()).Msg("Node is listening/observed on")
+		addrs := h.Addrs()
+		if len(addrs) == 0 {
+			logger.Warn().Msg("Node has NO advertised addresses (all filtered). Peers will connect via relay only.")
+		} else {
+			for _, addr := range addrs {
+				logger.Info().Str("addr", addr.String()).Msg("Node is listening/observed on")
+			}
 		}
 	}
 	printAddrs()
+
+	// Start STUN discovery in background — will trigger address refresh when done
+	discoverPublicIPAsync(h)
 
 	go func() {
 		sub, _ := h.EventBus().Subscribe(new(event.EvtLocalAddressesUpdated))
@@ -175,7 +270,7 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 			case <-ctx.Done():
 				return
 			case <-sub.Out():
-				logger.Info().Msg("Network addresses updated (Public IP discovered?)")
+				logger.Info().Msg("Network addresses updated")
 				printAddrs()
 			}
 		}
@@ -305,5 +400,180 @@ func hasPublicIP() bool {
 		}
 	}
 	return false
+}
+
+// filterAddrsWithSTUN menghapus loopback/link-local dari address list dan menyuntikkan
+// public IP yang ditemukan via STUN (jika ada) sebagai pengganti.
+// Jika tidak ada address valid dan tidak ada STUN IP, kembalikan slice kosong —
+// relay multiaddr masih akan digunakan oleh AutoRelay untuk konektivitas.
+//
+// Setiap alamat LAN (per-transport) mendapatkan pasangan public IP-nya sendiri,
+// menggunakan set deduplication agar tidak ada alamat duplikat dalam satu panggilan.
+func filterAddrsWithSTUN(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+	// Ambil STUN-discovered public IP (thread-safe)
+	discoveredPublicIPMu.RLock()
+	stunIP := discoveredPublicIP
+	discoveredPublicIPMu.RUnlock()
+
+	var filtered []multiaddr.Multiaddr
+	// injectedPublicAddrs tracks public addresses already added this call to prevent duplicates.
+	// Unlike the old stunInjected bool, this allows *each* LAN transport (quic-v1, webrtc-direct, etc.)
+	// to get its own corresponding public IP entry.
+	injectedPublicAddrs := make(map[string]struct{})
+
+	for _, addr := range addrs {
+		addrStr := addr.String()
+
+		// Selalu pertahankan circuit relay dan p2p-webrtc-star
+		if strings.Contains(addrStr, "/p2p-circuit") ||
+			strings.Contains(addrStr, "/p2p-webrtc-star") {
+			filtered = append(filtered, addr)
+			continue
+		}
+
+		// Ekstrak komponen ip4/ip6 dari multiaddr
+		ip := extractIP(addr)
+		if ip == nil {
+			// Bukan alamat IP (misal /dns4, /dns6) — pertahankan
+			filtered = append(filtered, addr)
+			continue
+		}
+
+		// Buang loopback (127.0.0.1, ::1)
+		if ip.IsLoopback() {
+			logger.Debug().Str("addr", addrStr).Msg("AddrsFactory: skipping loopback address")
+			continue
+		}
+
+		// Buang link-local (169.254.x.x, fe80::)
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			logger.Debug().Str("addr", addrStr).Msg("AddrsFactory: skipping link-local address")
+			continue
+		}
+
+		// Buang unspecified (0.0.0.0, ::) — gantikan dengan STUN IP jika tersedia
+		if ip.IsUnspecified() {
+			logger.Debug().Str("addr", addrStr).Msg("AddrsFactory: skipping unspecified address")
+			if stunIP != nil {
+				newAddr := replaceIP(addr, stunIP)
+				if newAddr != nil {
+					newAddrStr := newAddr.String()
+					if _, dup := injectedPublicAddrs[newAddrStr]; !dup {
+						logger.Debug().Str("addr", newAddrStr).Msg("AddrsFactory: injecting STUN-discovered public IP (replacing unspecified)")
+						filtered = append(filtered, newAddr)
+						injectedPublicAddrs[newAddrStr] = struct{}{}
+					}
+				}
+			}
+			continue
+		}
+
+		// Pertahankan semua yang lain: LAN (10.x, 172.16-31.x, 192.168.x), publik, dll.
+		logger.Debug().Str("addr", addrStr).Msg("AddrsFactory: advertising address")
+		filtered = append(filtered, addr)
+
+		// Untuk setiap alamat LAN, tambahkan pasangan public IP via STUN sebagai extra address.
+		// Tidak menggunakan flag boolean agar quic-v1 DAN webrtc-direct keduanya mendapat public IP.
+		if stunIP != nil && !ip.Equal(stunIP) && isPrivateIP(ip) {
+			newAddr := replaceIP(addr, stunIP)
+			if newAddr != nil {
+				newAddrStr := newAddr.String()
+				if _, dup := injectedPublicAddrs[newAddrStr]; !dup {
+					logger.Debug().Str("addr", newAddrStr).Msg("AddrsFactory: adding STUN public IP alongside LAN address")
+					filtered = append(filtered, newAddr)
+					injectedPublicAddrs[newAddrStr] = struct{}{}
+				}
+			}
+		}
+	}
+
+	// PENTING: Jangan fallback ke loopback jika tidak ada yang lolos filter.
+	// Konektivitas tetap terjaga via relay (p2p-circuit) yang dikelola AutoRelay.
+	if len(filtered) == 0 {
+		logger.Warn().Msg("AddrsFactory: no reachable addresses found. Peers will connect via relay only.")
+	}
+	return filtered
+
+}
+
+// replaceIP menggantikan komponen IP dalam multiaddr dengan ip baru.
+// Membangun ulang multiaddr dengan mengganti segmen ip4/ip6 awal.
+func replaceIP(addr multiaddr.Multiaddr, newIP net.IP) multiaddr.Multiaddr {
+	var proto int
+	var suffix []multiaddr.Multiaddr
+	found := false
+
+	multiaddr.ForEach(addr, func(c multiaddr.Component) bool {
+		if !found && (c.Protocol().Code == multiaddr.P_IP4 || c.Protocol().Code == multiaddr.P_IP6) {
+			proto = c.Protocol().Code
+			found = true
+			return true
+		}
+		if found {
+			maddr, err := multiaddr.NewMultiaddrBytes(c.Bytes())
+			if err == nil {
+				suffix = append(suffix, maddr)
+			}
+		}
+		return true
+	})
+
+	if !found {
+		return nil
+	}
+
+	var prefix multiaddr.Multiaddr
+	var err error
+	if proto == multiaddr.P_IP4 {
+		ip4 := newIP.To4()
+		if ip4 == nil {
+			return nil // STUN returned IPv6 but addr is IPv4 template
+		}
+		prefix, err = multiaddr.NewMultiaddr("/ip4/" + ip4.String())
+	} else {
+		ip6 := newIP.To16()
+		if ip6 == nil {
+			return nil
+		}
+		prefix, err = multiaddr.NewMultiaddr("/ip6/" + ip6.String())
+	}
+	if err != nil {
+		return nil
+	}
+
+	result := prefix
+	for _, s := range suffix {
+		result = result.Encapsulate(s)
+	}
+	return result
+}
+
+// isPrivateIP mengecek apakah IP adalah private/LAN address (RFC 1918).
+func isPrivateIP(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	return (ip4[0] == 10) ||
+		(ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31) ||
+		(ip4[0] == 192 && ip4[1] == 168) ||
+		(ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127)
+}
+
+// extractIP mengekstrak net.IP dari multiaddr ip4 atau ip6.
+func extractIP(addr multiaddr.Multiaddr) net.IP {
+	var ip net.IP
+	multiaddr.ForEach(addr, func(c multiaddr.Component) bool {
+		switch c.Protocol().Code {
+		case multiaddr.P_IP4:
+			ip = net.ParseIP(c.Value())
+			return false
+		case multiaddr.P_IP6:
+			ip = net.ParseIP(c.Value())
+			return false
+		}
+		return true
+	})
+	return ip
 }
 
