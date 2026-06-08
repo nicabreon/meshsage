@@ -838,6 +838,7 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 			logger.Debug().Str("peerID", relayID.String()).Msg("Mailbox sync loop exited, guard released")
 		}()
 
+		backoff := 5 * time.Second
 		for {
 			select {
 			case <-ctx.Done():
@@ -857,6 +858,7 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 			}
 
 			if subscribed {
+				backoff = 5 * time.Second // Reset backoff on success
 				// Successfully subscribed — wait until lost or ctx cancelled.
 				select {
 				case <-ctx.Done():
@@ -870,7 +872,13 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(5 * time.Second):
+			case <-time.After(backoff):
+			}
+
+			// Increase backoff for next failure
+			backoff *= 2
+			if backoff > 60*time.Second {
+				backoff = 60 * time.Second
 			}
 		}
 	}()
@@ -954,12 +962,12 @@ func ReplicateFileToRelays(ctx context.Context, h host.Host, manifestCID string)
 }
 
 // StartGlobalMailboxSyncManager runs a single global loop to fetch mailbox messages
-// sequentially from all connected infrastructure/relay nodes every 30 seconds as a fallback.
+// sequentially from all connected infrastructure/relay nodes every 1 minute as a fallback.
 // Real-time delivery is handled by push notifications (SubscribeNotifications).
-// The 30-second interval drastically reduces idle data usage compared to the prior 2-second polling.
+// The 1-minute interval drastically reduces idle data usage compared to the prior 30-second polling.
 func StartGlobalMailboxSyncManager(ctx context.Context, h host.Host, privKey crypto.PrivKey) {
-	logger.Info().Msg("Starting Global Mailbox Sync Manager (30s fallback polling)...")
-	ticker := time.NewTicker(30 * time.Second)
+	logger.Info().Msg("Starting Global Mailbox Sync Manager (1m fallback polling)...")
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for {

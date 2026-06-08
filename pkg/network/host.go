@@ -131,11 +131,20 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 		return nil, fmt.Errorf("private key is required")
 	}
 
+	// isAndroid detects if running on Android (for SELinux-safe configuration)
+	isAndroid := runtime.GOOS == "android"
+
 	// 0. Connection Manager (The "Bouncer")
 	// Limits active connections to save CPU/Battery/Bandwidth
+	lowWater := 100
+	highWater := 1000
+	if IsClientOnly || isAndroid {
+		lowWater = 15
+		highWater = 40
+	}
 	cm, err := connmgr.NewConnManager(
-		100,  // Low Watermark: Minimal connections to keep
-		1000, // High Watermark: Max connections (will start pruning above this)
+		lowWater,
+		highWater,
 		connmgr.WithGracePeriod(time.Minute*2),
 	)
 	if err != nil {
@@ -143,8 +152,14 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	}
 
 	// 0.1 Resource Manager (The "Security Guard")
-	// Scale default limits by 10x to support 10k+ connections and more conns per IP
-	limitConfig := rcmgr.DefaultLimits.Scale(10, 10)
+	var limitConfig rcmgr.ConcreteLimitConfig
+	if IsClientOnly || isAndroid {
+		// Use default concrete limits (scale by 1x)
+		limitConfig = rcmgr.DefaultLimits.Scale(1, 1)
+	} else {
+		// Scale default limits by 10x to support 10k+ connections and more conns per IP (Relay/Server only)
+		limitConfig = rcmgr.DefaultLimits.Scale(10, 10)
+	}
 	limiter := rcmgr.NewFixedLimiter(limitConfig)
 	rm, err := rcmgr.NewResourceManager(limiter)
 	if err != nil {
@@ -156,9 +171,6 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	if len(parts) >= 5 {
 		portStr = parts[4]
 	}
-
-	// isAndroid detects if running on Android (for SELinux-safe configuration)
-	isAndroid := runtime.GOOS == "android"
 
 	opts := []libp2p.Option{
 		// 1. Identity

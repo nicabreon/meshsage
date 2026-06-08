@@ -16,6 +16,10 @@ import (
 // DiscoveryServiceTag is the identifier for our application on the local and global network
 const DiscoveryServiceTag = "p2p-core-messaging"
 
+// EnableMDNS determines whether local mDNS peer discovery is active.
+// Set to false by default on mobile to save battery and network interface wakeup overhead.
+var EnableMDNS bool = false
+
 // mdnsNotifee gets notified when we find a new peer via mDNS
 type mdnsNotifee struct {
 	h host.Host
@@ -37,16 +41,18 @@ func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 
 // SetupDiscovery sets up mDNS discovery to automatically find local peers, and DHT routing discovery for global peers
 func SetupDiscovery(ctx context.Context, h host.Host) error {
-	// 1. Setup mDNS Service in background so it never blocks startup
-	go func() {
-		n := &mdnsNotifee{h: h}
-		s := mdns.NewMdnsService(h, DiscoveryServiceTag, n)
-		if err := s.Start(); err != nil {
-			logger.Error().Err(err).Msg("Failed to start mDNS service")
-		} else {
-			logger.Debug().Msg("mDNS service started successfully in background")
-		}
-	}()
+	// 1. Setup mDNS Service in background so it never blocks startup (if enabled)
+	if EnableMDNS {
+		go func() {
+			n := &mdnsNotifee{h: h}
+			s := mdns.NewMdnsService(h, DiscoveryServiceTag, n)
+			if err := s.Start(); err != nil {
+				logger.Error().Err(err).Msg("Failed to start mDNS service")
+			} else {
+				logger.Debug().Msg("mDNS service started successfully in background")
+			}
+		}()
+	}
 
 	// 2. Setup DHT Rendezvous Discovery in the background
 	go func() {
@@ -105,9 +111,9 @@ func SetupDiscovery(ctx context.Context, h host.Host) error {
 				}
 			}
 			
-			// Poll peer discovery every 45 seconds, with cancellation check
+			// Poll peer discovery every 2 minutes, with cancellation check
 			select {
-			case <-time.After(45 * time.Second):
+			case <-time.After(2 * time.Minute):
 			case <-ctx.Done():
 				return
 			}

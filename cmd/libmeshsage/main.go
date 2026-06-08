@@ -162,6 +162,11 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 	idPath := C.GoString(idPathStr)
 	isClientOnly := isClientOnlyVal != 0
 
+	// Initialize global network modes early so NewNode can access them
+	corenet.IsDedicated = false
+	corenet.IsClientOnly = isClientOnly
+	corenet.ForceClientOnly = isClientOnly
+
 	// 1. Direct standard log output & logger output to our JSON event queue
 	errWriter := &EventWriter{original: os.Stderr}
 	logger.SetOutput(errWriter)
@@ -252,11 +257,6 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 		}
 	}
 	globalHost = host
-
-	// 6. Global Modes
-	corenet.IsDedicated = false
-	corenet.IsClientOnly = isClientOnly
-	corenet.ForceClientOnly = isClientOnly
 
 	// 7. Initialize Protocols
 	dhtRouting, err := corenet.SetupDHT(globalCtx, host)
@@ -1313,6 +1313,33 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 	}()
 
 	return nil // Success
+}
+
+//export GetSeedNodes
+func GetSeedNodes() *C.char {
+	var seeds []string
+	for _, s := range DefaultSeeds {
+		ma, err := multiaddr.NewMultiaddr(s)
+		if err != nil {
+			continue
+		}
+		pinfo, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			continue
+		}
+		seeds = append(seeds, pinfo.ID.String())
+	}
+
+	// Deduplicate seeds
+	uniqueSeeds := make(map[string]bool)
+	var result []string
+	for _, s := range seeds {
+		if !uniqueSeeds[s] {
+			uniqueSeeds[s] = true
+			result = append(result, s)
+		}
+	}
+	return C.CString(strings.Join(result, ","))
 }
 
 func main() {

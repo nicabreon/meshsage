@@ -13,7 +13,11 @@ var (
 )
 
 func SetupDHT(ctx context.Context, h host.Host) (*dht.IpfsDHT, error) {
-	d, err := dht.New(ctx, h, dht.Mode(dht.ModeAuto))
+	mode := dht.ModeAuto
+	if IsClientOnly {
+		mode = dht.ModeClient
+	}
+	d, err := dht.New(ctx, h, dht.Mode(mode))
 	if err != nil {
 		return nil, err
 	}
