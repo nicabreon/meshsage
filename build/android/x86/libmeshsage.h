@@ -114,6 +114,7 @@ extern char* DownloadFile(char* manifestCIDStr, char* keyB64Str, char* savePathS
 extern char* GetPeerConnInfo(char* peerIDStr);
 extern char* ConnectPeer(char* peerIDStr);
 extern char* GetSeedNodes(void);
+extern char* GetIceServers(void);
 
 #ifdef __cplusplus
 }

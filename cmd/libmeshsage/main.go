@@ -1342,6 +1342,74 @@ func GetSeedNodes() *C.char {
 	return C.CString(strings.Join(result, ","))
 }
 
+//export GetIceServers
+func GetIceServers() *C.char {
+	var hosts []string
+
+	// 1. Extract hosts from default seeds
+	for _, s := range DefaultSeeds {
+		ma, err := multiaddr.NewMultiaddr(s)
+		if err != nil {
+			continue
+		}
+		if host, ok := extractHostFromMultiaddr(ma); ok {
+			hosts = append(hosts, host)
+		}
+	}
+
+	// 2. Extract hosts from currently connected peers
+	if globalHost != nil {
+		for _, peerID := range globalHost.Network().Peers() {
+			conns := globalHost.Network().ConnsToPeer(peerID)
+			for _, conn := range conns {
+				remoteAddr := conn.RemoteMultiaddr()
+				if host, ok := extractHostFromMultiaddr(remoteAddr); ok {
+					hosts = append(hosts, host)
+				}
+			}
+		}
+	}
+
+	// Deduplicate hosts
+	uniqueHosts := make(map[string]bool)
+	var finalHosts []string
+	for _, h := range hosts {
+		if !uniqueHosts[h] {
+			uniqueHosts[h] = true
+			finalHosts = append(finalHosts, h)
+		}
+	}
+
+	// Format as a compact JSON string to return
+	var parts []string
+	for _, h := range finalHosts {
+		parts = append(parts, fmt.Sprintf(`{"urls":["stun:%s:3478"]}`, h))
+		parts = append(parts, fmt.Sprintf(`{"urls":["turn:%s:3478"],"username":"meshuser","credential":"meshpass12345"}`, h))
+	}
+
+	jsonStr := "[" + strings.Join(parts, ",") + "]"
+	return C.CString(jsonStr)
+}
+
+func extractHostFromMultiaddr(ma multiaddr.Multiaddr) (string, bool) {
+	var host string
+	multiaddr.ForEach(ma, func(c multiaddr.Component) bool {
+		name := c.Protocol().Name
+		if name == "ip4" || name == "ip6" || name == "dns" || name == "dns4" || name == "dns6" || name == "dnsaddr" {
+			val := c.Value()
+			if val != "127.0.0.1" && val != "::1" && val != "0.0.0.0" {
+				host = val
+				return false // Stop iterating
+			}
+		}
+		return true
+	})
+	if host != "" {
+		return host, true
+	}
+	return "", false
+}
+
 func main() {
 	// Mandatory main for C-shared libraries, but unused
 }
