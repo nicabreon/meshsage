@@ -1297,6 +1297,38 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 		return C.CString("Host not initialized or empty Peer ID")
 	}
 
+	if strings.Contains(peerIDRaw, "/") {
+		// It's a multiaddress! e.g. /ip4/192.168.49.1/tcp/4001/p2p/12D3Koo...
+		ma, err := multiaddr.NewMultiaddr(peerIDRaw)
+		if err != nil {
+			return C.CString("Invalid multiaddress: " + err.Error())
+		}
+		pinfo, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			return C.CString("Failed to extract Peer info from multiaddress: " + err.Error())
+		}
+
+		go func() {
+			globalHost.Peerstore().AddAddrs(pinfo.ID, pinfo.Addrs, 5*time.Minute)
+			logger.Info().Str("target", pinfo.ID.String()).Str("addr", ma.String()).Msg("ConnectPeer: Attempting connection to explicit multiaddr")
+			dialCtx, cancel := context.WithTimeout(globalCtx, 5*time.Second)
+			defer cancel()
+			if err := globalHost.Connect(dialCtx, *pinfo); err != nil {
+				logger.Warn().Err(err).Str("target", pinfo.ID.String()).Msg("ConnectPeer: Dial with explicit multiaddr failed")
+			} else {
+				logger.Info().Str("target", pinfo.ID.String()).Msg("ConnectPeer: Connected via explicit multiaddr!")
+
+				// Open a stream to verify
+				streamCtx, cancelStream := context.WithTimeout(globalCtx, 4*time.Second)
+				defer cancelStream()
+				if s, errStream := globalHost.NewStream(streamCtx, pinfo.ID, "/p2p-core/msg/1.0.0"); errStream == nil {
+					s.Close()
+				}
+			}
+		}()
+		return nil
+	}
+
 	peerID, err := peer.Decode(peerIDRaw)
 	if err != nil {
 		return C.CString("Invalid Peer ID: " + err.Error())
