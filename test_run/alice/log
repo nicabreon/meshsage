@@ -1,0 +1,94 @@
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mGenerating new node identity[0m [36mpath=[0mtest_run/alice/node.key
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mLocal Identity Initialized[0m [36mpeerID=[0m12D3KooWD9F3a2B6BpYJWEgVJh9HYCfmfgxdAZPcPYkTdyBZGLKH
+[90m2026-06-08T14:58:26+07:00[0m [33mWRN[0m [1mAddrsFactory: no reachable addresses found. Peers will connect via relay only.[0m
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/192.168.77.68/udp/4002/quic-v1
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/192.168.77.68/udp/51757/webrtc-direct/certhash/uEiCoTB4v35heM3ikr-BkAeOhvMmVTCvAvwTQ5i1keEGKYQ
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1m>>> NODE STARTUP AUDIT[0m [36margs=[0m["./p2p-node","-port=4002","-db=test_run/alice/node.db","-identity=test_run/alice/node.key"] [36mpeerID=[0m12D3KooWD9F3a2B6BpYJWEgVJh9HYCfmfgxdAZPcPYkTdyBZGLKH
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNetwork addresses updated[0m
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/192.168.77.68/udp/4002/quic-v1
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/192.168.77.68/udp/51757/webrtc-direct/certhash/uEiCoTB4v35heM3ikr-BkAeOhvMmVTCvAvwTQ5i1keEGKYQ
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mSTUN: discovered external IP[0m [36mexternal_ip=[0m36.70.100.80 [36mvia=[0m103.127.138.103:3478
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNetwork addresses updated[0m
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/36.70.100.80/udp/4002/quic-v1
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/36.70.100.80/udp/51757/webrtc-direct/certhash/uEiCoTB4v35heM3ikr-BkAeOhvMmVTCvAvwTQ5i1keEGKYQ
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/192.168.77.68/udp/4002/quic-v1
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/192.168.77.68/udp/51757/webrtc-direct/certhash/uEiCoTB4v35heM3ikr-BkAeOhvMmVTCvAvwTQ5i1keEGKYQ
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mNode mode initialized[0m [36mclientOnly=[0mfalse [36mdedicated=[0mfalse [36mforceClientOnly=[0mfalse
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mMailbox service decision[0m [36mactAsRelay=[0mtrue
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mMeshsage Node is ready and listening for peers...[0m
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mStarting Global Mailbox Sync Manager (1m fallback polling)...[0m
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1m>>> NEW PEER CONNECTED[0m [36mpeerID=[0m12D3KooWKEfQUTesCatvbw8QHeZ8bQ6zGgoFpQQSaFLCLkFdNQ26
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1m>>> NEW PEER CONNECTED[0m [36mpeerID=[0m12D3KooWPW7o84MKBFCkVApr3Kq3u91cbiP1nN1VMLVc6W6wNqSU
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1mConnected to at least one peer. Starting background group restoration...[0m
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1m[RestoreGroups] Querying distinct group_ids from group_members_v2...[0m
+[90m2026-06-08T14:58:26+07:00[0m [32mINF[0m [1m[RestoreGroups] Query successful, parsing rows...[0m
+[90m2026-06-08T14:58:27+07:00[0m [32mINF[0m [1mLOG_STEP: MeasureAndRecordDialTimeout: Initiating test stream to measure latency...[0m [36mtarget=[0m12D3KooWKEfQUTesCatvbw8QHeZ8bQ6zGgoFpQQSaFLCLkFdNQ26
+[90m2026-06-08T14:58:27+07:00[0m [32mINF[0m [1mLOG_STEP: MeasureAndRecordDialTimeout: Initiating test stream to measure latency...[0m [36mtarget=[0m12D3KooWPW7o84MKBFCkVApr3Kq3u91cbiP1nN1VMLVc6W6wNqSU
+[90m2026-06-08T14:58:27+07:00[0m [32mINF[0m [1mLOG_STEP: MeasureAndRecordDialTimeout: Successfully measured stream creation time and saved custom dial timeout[0m [36mdial_timeout=[0m1000.211875 [36mstream_dial_rtt=[0m0.070625 [36mtarget=[0m12D3KooWKEfQUTesCatvbw8QHeZ8bQ6zGgoFpQQSaFLCLkFdNQ26
+[90m2026-06-08T14:58:27+07:00[0m [32mINF[0m [1mLOG_STEP: MeasureAndRecordDialTimeout: Successfully measured stream creation time and saved custom dial timeout[0m [36mdial_timeout=[0m1000.091752 [36mstream_dial_rtt=[0m0.030584 [36mtarget=[0m12D3KooWPW7o84MKBFCkVApr3Kq3u91cbiP1nN1VMLVc6W6wNqSU
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mStored compressed pre-keys[0m [36mcount=[0m10 [36mpeerID=[0m12D3KooWFZTmWWGaeNFY7ro95DtiSoV5txAqv6iZCERy6vLWTA95
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mIDENTIFIED INFRASTRUCTURE: Triggering Mailbox Sync Manager[0m [36mpeerID=[0m12D3KooWKEfQUTesCatvbw8QHeZ8bQ6zGgoFpQQSaFLCLkFdNQ26
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mSubscribed to push notifications[0m [36mpeerID=[0m12D3KooWKEfQUTesCatvbw8QHeZ8bQ6zGgoFpQQSaFLCLkFdNQ26
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mIDENTIFIED INFRASTRUCTURE: Triggering Mailbox Sync Manager[0m [36mpeerID=[0m12D3KooWPW7o84MKBFCkVApr3Kq3u91cbiP1nN1VMLVc6W6wNqSU
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mSubscribed to push notifications[0m [36mpeerID=[0m12D3KooWPW7o84MKBFCkVApr3Kq3u91cbiP1nN1VMLVc6W6wNqSU
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mPre-keys stock low, refilling without clearing existing keys[0m [36mlocal_count=[0m0 [36mpeerID=[0m12D3KooWKEfQUTesCatvbw8QHeZ8bQ6zGgoFpQQSaFLCLkFdNQ26 [36mrelay_count=[0m0
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mRefilled 10 pre-keys successfully[0m [36mpeerID=[0m12D3KooWKEfQUTesCatvbw8QHeZ8bQ6zGgoFpQQSaFLCLkFdNQ26
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mPre-keys stock low, refilling without clearing existing keys[0m [36mlocal_count=[0m10 [36mpeerID=[0m12D3KooWPW7o84MKBFCkVApr3Kq3u91cbiP1nN1VMLVc6W6wNqSU [36mrelay_count=[0m0
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mStored compressed pre-keys[0m [36mcount=[0m10 [36mpeerID=[0m12D3KooWPW7o84MKBFCkVApr3Kq3u91cbiP1nN1VMLVc6W6wNqSU
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mRefilled 10 pre-keys successfully[0m [36mpeerID=[0m12D3KooWPW7o84MKBFCkVApr3Kq3u91cbiP1nN1VMLVc6W6wNqSU
+[90m2026-06-08T14:58:28+07:00[0m [32mINF[0m [1mStored compressed pre-keys[0m [36mcount=[0m10 [36mpeerID=[0m12D3KooWKEfQUTesCatvbw8QHeZ8bQ6zGgoFpQQSaFLCLkFdNQ26
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mNetwork addresses updated[0m
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/36.70.100.80/udp/4002/quic-v1
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/36.70.100.80/udp/51757/webrtc-direct/certhash/uEiCoTB4v35heM3ikr-BkAeOhvMmVTCvAvwTQ5i1keEGKYQ
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/192.168.77.68/udp/4002/quic-v1
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mNode is listening/observed on[0m [36maddr=[0m/ip4/192.168.77.68/udp/51757/webrtc-direct/certhash/uEiCoTB4v35heM3ikr-BkAeOhvMmVTCvAvwTQ5i1keEGKYQ
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1m>>> NEW PEER CONNECTED[0m [36mpeerID=[0m12D3KooWFmrgtKT6GurpiqVHDMJrtHh9LBX8dqM7XBvYm7E1xFAg
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mCLIENT: Registration accepted by peer[0m [36mpeerID=[0m12D3KooWFmrgtKT6GurpiqVHDMJrtHh9LBX8dqM7XBvYm7E1xFAg
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWDAXzwhatnXKkYoNMm3VdteoVtbcuhtWAguDipTaBQf28
+[90m2026-06-08T14:58:31+07:00[0m [33mWRN[0m [1mCLIENT: Registration rejected by peer[0m [36mpeerID=[0m12D3KooWKEfQUTesCatvbw8QHeZ8bQ6zGgoFpQQSaFLCLkFdNQ26 [36mresponse=[0mERROR_ALREADY_OWNED
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWN72h1yPadAsLFptfBu2Rz9gizwseQ4cn9DvtMGS9psTb
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWMLuoexWf8kjGivfzJsLXgm4jgF4m4rt52mXy4GzX4Bp5
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWKrEWrfmoMPPxiZRo7HS9LXPg3gshgLtvuxWfrcnbjgAu
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWLBJHE72DJhXKcRtgwdqXjbsMqTJAw5SL2ExcDMC6Lo3f
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWB2XBi6vdBYg8GLZ9m2KG7gkgYyfqZko9SNkKcN2GxumE
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWC6A6HUEREc3cNbbELa6aZyrKFuJTaw6yErUtfRyWDpDf
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWLiUQPdsE6Q8jQNmLjCiAQf3yEQd3T3rc2gEuiA61edDV
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWLBkAosKAgB534t8d5aYwSmbTaep1BfGRZJqBCDG7PBSF
+[90m2026-06-08T14:58:31+07:00[0m [32mINF[0m [1mDHT Discovery: Attempting connection to discovered peer[0m [36mpeerID=[0m12D3KooWJg14MWLyQ69DSanLUdqa49qqW7t3ReQ8s53TjDRpauqh
+[90m2026-06-08T14:58:31+07:00[0m [33mWRN[0m [1mCLIENT: Registration rejected by peer[0m [36mpeerID=[0m12D3KooWFZTmWWGaeNFY7ro95DtiSoV5txAqv6iZCERy6vLWTA95 [36mresponse=[0mERROR_ALREADY_OWNED
+[90m2026-06-08T14:58:31+07:00[0m [33mWRN[0m [1mCLIENT: Registration rejected by peer[0m [36mpeerID=[0m12D3KooWPW7o84MKBFCkVApr3Kq3u91cbiP1nN1VMLVc6W6wNqSU [36mresponse=[0mERROR_ALREADY_OWNED
+[Alias] Successfully registered '@alice' on 1 nodes with Digital Signature!
+[90m2026-06-08T14:58:32+07:00[0m [32mINF[0m [1mLOG_STEP: MeasureAndRecordDialTimeout: Initiating test stream to measure latency...[0m [36mtarget=[0m12D3KooWFmrgtKT6GurpiqVHDMJrtHh9LBX8dqM7XBvYm7E1xFAg
+[90m2026-06-08T14:58:32+07:00[0m [32mINF[0m [1mLOG_STEP: MeasureAndRecordDialTimeout: Successfully measured stream creation time and saved custom dial timeout[0m [36mdial_timeout=[0m1000.136875 [36mstream_dial_rtt=[0m0.045625 [36mtarget=[0m12D3KooWFmrgtKT6GurpiqVHDMJrtHh9LBX8dqM7XBvYm7E1xFAg
+[90m2026-06-08T14:58:33+07:00[0m [32mINF[0m [1mIDENTIFIED INFRASTRUCTURE: Triggering Mailbox Sync Manager[0m [36mpeerID=[0m12D3KooWFmrgtKT6GurpiqVHDMJrtHh9LBX8dqM7XBvYm7E1xFAg
+[90m2026-06-08T14:58:33+07:00[0m [32mINF[0m [1mSubscribed to push notifications[0m [36mpeerID=[0m12D3KooWFmrgtKT6GurpiqVHDMJrtHh9LBX8dqM7XBvYm7E1xFAg
+[90m2026-06-08T14:58:33+07:00[0m [32mINF[0m [1mPre-keys stock low, refilling without clearing existing keys[0m [36mlocal_count=[0m20 [36mpeerID=[0m12D3KooWFmrgtKT6GurpiqVHDMJrtHh9LBX8dqM7XBvYm7E1xFAg [36mrelay_count=[0m0
+[90m2026-06-08T14:58:33+07:00[0m [32mINF[0m [1mRefilled 10 pre-keys successfully[0m [36mpeerID=[0m12D3KooWFmrgtKT6GurpiqVHDMJrtHh9LBX8dqM7XBvYm7E1xFAg
+[90m2026-06-08T14:58:33+07:00[0m [32mINF[0m [1mStored compressed pre-keys[0m [36mcount=[0m10 [36mpeerID=[0m12D3KooWFmrgtKT6GurpiqVHDMJrtHh9LBX8dqM7XBvYm7E1xFAg
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1m>>> NEW PEER CONNECTED[0m [36mpeerID=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mNo session found. Initiating X3DH Handshake flow[0m [36mpeers=[0m5 [36mtarget=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mLOG_STEP: X3DH HANDSHAKE: Fetching Pre-Key starting...[0m [36mrelay=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr [36mtarget=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mLOG_STEP: X3DH HANDSHAKE: FetchPreKey finished[0m [36merror=[0m[31m[1m"ERROR: No keys available\n"[0m[0m [36melapsed=[0m0.65375 [36mrelay=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr [36mtarget=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mLOG_STEP: X3DH HANDSHAKE: Fetching Pre-Key starting...[0m [36mrelay=[0m12D3KooWFZTmWWGaeNFY7ro95DtiSoV5txAqv6iZCERy6vLWTA95 [36mtarget=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mLOG_STEP: X3DH HANDSHAKE: FetchPreKey finished[0m [36melapsed=[0m18.691708 [36mrelay=[0m12D3KooWFZTmWWGaeNFY7ro95DtiSoV5txAqv6iZCERy6vLWTA95 [36mtarget=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mX3DH SUCCESS: Pre-Key found[0m [36mrelay=[0m12D3KooWFZTmWWGaeNFY7ro95DtiSoV5txAqv6iZCERy6vLWTA95 [36mtarget=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mX3DH HANDSHAKE: Saving Initial Session with Ratchet Keys[0m [36mpeerID=[0m...6PVzRrwn [36mrootKey=[0m4VVUM5
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mLOG_STEP: prepareSecureEnvelope completed[0m [36melapsed=[0m20.458 [36mtarget=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mtransmitEnvelope: No active connection found, skipping dial and sending via offline mailbox[0m [36mtarget=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mLOG_STEP: transmitEnvelope completed[0m [36melapsed=[0m0.07275 [36mtarget=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mMessage sent successfully[0m [36mpeerID=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mOffline message stored successfully[0m [36mnodes=[0m2
+[90m2026-06-08T14:58:40+07:00[0m [32mINF[0m [1mBackground StoreOfflineMessage succeeded[0m [36mtarget=[0m12D3KooWJxUhHyYkNS2bMMVaEJtY9gNgCDBjVxrRAVPQ6PVzRrwn
+[90m2026-06-08T14:58:41+07:00[0m [32mINF[0m [1mLOG_STEP: MeasureAndRecordDialTimeout: Initiating test stream to measure latency...[0m [36mtarget=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr
+[90m2026-06-08T14:58:41+07:00[0m [32mINF[0m [1mLOG_STEP: MeasureAndRecordDialTimeout: Successfully measured stream creation time and saved custom dial timeout[0m [36mdial_timeout=[0m1000.239499 [36mstream_dial_rtt=[0m0.079833 [36mtarget=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr
+[90m2026-06-08T14:58:42+07:00[0m [32mINF[0m [1mIDENTIFIED INFRASTRUCTURE: Triggering Mailbox Sync Manager[0m [36mpeerID=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr
+[90m2026-06-08T14:58:42+07:00[0m [32mINF[0m [1mSubscribed to push notifications[0m [36mpeerID=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr
+[90m2026-06-08T14:58:42+07:00[0m [32mINF[0m [1mPre-keys stock low, refilling without clearing existing keys[0m [36mlocal_count=[0m30 [36mpeerID=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr [36mrelay_count=[0m0
+[90m2026-06-08T14:58:42+07:00[0m [32mINF[0m [1mRefilled 10 pre-keys successfully[0m [36mpeerID=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr
+[90m2026-06-08T14:58:42+07:00[0m [32mINF[0m [1mStored compressed pre-keys[0m [36mcount=[0m10 [36mpeerID=[0m12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr
+[Error] Unknown command: '/join GRP_CORE 12D3KooWS8yUU5RJWmqCsFEywmCC3BJLbykBCpMRCtD6T4PSTEbr,12D3KooWDAXzwhatnXKkYoNMm3VdteoVtbcuhtWAguDipTaBQf28'
+Available commands: /msg, /group, /join, /fetch, /register, /upload, /latency, /reset-session
+[Error] Failed to send message to group: not in group @GRP_CORE. Use /group-join or /group-create first
+[90m2026-06-08T14:59:05+07:00[0m [32mINF[0m [1mShutting down Meshsage node...[0m

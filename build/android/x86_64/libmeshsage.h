@@ -89,6 +89,7 @@ extern "C" {
 
 extern char* StartNode(char* dbPathStr, char* idPathStr, int port, int isClientOnlyVal, int enableRelayVal);
 extern char* SendDirectMessage(char* targetStr, char* contentStr);
+extern char* SendReadReceipt(char* targetStr, char* msgIDStr);
 extern char* SendGroupChat(char* groupIDStr, char* contentStr);
 extern char* JoinGroup(char* groupIDStr, char* membersStr);
 extern char* CreateGroup(char* membersStr);

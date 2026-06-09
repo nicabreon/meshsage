@@ -507,6 +507,32 @@ func SendDirectMessage(targetStr, contentStr *C.char) *C.char {
 	return C.CString("ok:" + msgID)
 }
 
+//export SendReadReceipt
+func SendReadReceipt(targetStr, msgIDStr *C.char) *C.char {
+	target := C.GoString(targetStr)
+	msgID := C.GoString(msgIDStr)
+
+	if strings.HasPrefix(target, "@") {
+		resolved, err := coreproto.ResolveAlias(globalCtx, globalHost, target)
+		if err != nil {
+			return C.CString("Failed to resolve alias: " + err.Error())
+		}
+		target = resolved
+	}
+
+	targetID, err := peer.Decode(target)
+	if err != nil {
+		return C.CString("Invalid peer ID: " + err.Error())
+	}
+
+	err = coreproto.SendStatusUpdate(globalCtx, globalHost, targetID, msgID, coreproto.StatusRead)
+	if err != nil {
+		return C.CString("Failed to send read receipt: " + err.Error())
+	}
+	return nil
+}
+
+
 //export SendGroupChat
 func SendGroupChat(groupIDStr, contentStr *C.char) *C.char {
 	groupID := C.GoString(groupIDStr)
