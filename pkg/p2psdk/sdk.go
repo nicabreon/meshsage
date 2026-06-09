@@ -80,8 +80,9 @@ func InitNode(port C.int, dataDir *C.char) *C.char {
 	}
 
 	cfg := corenet.Config{
-		ListenAddr: fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", int(port)),
-		PrivateKey: priv,
+		ListenAddr:  fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", int(port)),
+		PrivateKey:  priv,
+		EnableRelay: true,
 	}
 
 	h, err := corenet.NewNode(ctx, cfg)

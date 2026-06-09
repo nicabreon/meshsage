@@ -110,6 +110,17 @@ For a detailed look at the subsystems, sequence flows, and network topology, see
 *   **Cryptography**: X25519 (Diffie-Hellman), AES-GCM (Encryption), HMAC-SHA256 (Ratchet).
 *   **Storage**: SQLite (with WAL mode for high concurrency).
 
+## **💖 Support the Developer**
+
+If you find **Meshsage** useful and would like to support its development, feel free to make a donation:
+
+*   **☕ Ko-fi**: [ko-fi.com/nicabreon](https://ko-fi.com/nicabreon)
+*   **🪙 Bitcoin (BTC)**: `bc1qmj23p2uye2nlp76wz2rncqhnv0zc3l48lsl32d`
+*   **🪙 Ethereum (ETH / USDT)**: `0xd65f29994fa6b4dbaac5f8b96d0342e739fd71eb`
+*   **🪙 Solana (SOL)**: `EptZbaSqaa3YLnCz3YAg57pdCdz5Smx3ERZvG83GjArU`
+
+Your support is highly appreciated!
+
 ---
 
 ## **📜 License**

@@ -87,7 +87,7 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
-extern char* StartNode(char* dbPathStr, char* idPathStr, int port, int isClientOnlyVal);
+extern char* StartNode(char* dbPathStr, char* idPathStr, int port, int isClientOnlyVal, int enableRelayVal);
 extern char* SendDirectMessage(char* targetStr, char* contentStr);
 extern char* SendGroupChat(char* groupIDStr, char* contentStr);
 extern char* JoinGroup(char* groupIDStr, char* membersStr);

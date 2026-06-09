@@ -135,7 +135,7 @@ func (ew *EventWriter) Write(p []byte) (n int, err error) {
 // -----------------------------------------------------------------------------
 
 //export StartNode
-func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) *C.char {
+func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, enableRelayVal C.int) *C.char {
 	// Clean up previous host and context if they exist (prevents resource/port collision on restart)
 	if globalHost != nil {
 		logger.Warn().Msg("Starting a new Go node, but a previous node is still running. Stopping it in background...")
@@ -227,6 +227,8 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 
 	relaySource := make(chan peer.AddrInfo, 10)
 
+	enableRelay := enableRelayVal != 0
+
 	// Build the Node host.
 	// Use a short timeout so we don't hang forever if the port from the previous
 	// session is still held by Android OS (happens on reinstall-without-uninstall).
@@ -240,6 +242,9 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 		StaticRelays: staticRelays,
 		RelaySource:  relaySource,
 		ForcePublic:  false,
+		IsDedicated:  false,
+		IsClientOnly: isClientOnly,
+		EnableRelay:  enableRelay,
 	})
 	if err != nil {
 		// Port might be busy from old session. Retry with random port (0).
@@ -251,6 +256,9 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 			StaticRelays: staticRelays,
 			RelaySource:  relaySource,
 			ForcePublic:  false,
+			IsDedicated:  false,
+			IsClientOnly: isClientOnly,
+			EnableRelay:  enableRelay,
 		})
 		if err != nil {
 			return C.CString("Failed to build host: " + err.Error())
@@ -346,6 +354,9 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int) 
 			eventQueue.Push(string(data))
 
 			logger.Info().Str("peerID", remoteID.String()).Msg(">>> NEW PEER CONNECTED")
+
+			// Measure and record the peer's custom dial timeout
+			coreproto.MeasureAndRecordDialTimeout(globalCtx, host, remoteID)
 
 			go func() {
 				var protos []protocol.ID
@@ -1093,7 +1104,7 @@ func TriggerMailboxFetch() *C.char {
 		protos, _ := globalHost.Peerstore().GetProtocols(p)
 		isRelay := false
 		for _, proto := range protos {
-			if string(proto) == "/p2p-core/mailbox/1.0.0" {
+			if string(proto) == coreproto.InfrastructureProtocolID {
 				isRelay = true
 				break
 			}
@@ -1308,6 +1319,39 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 				}
 			} else {
 				logger.Warn().Err(err).Str("target", peerID.String()).Msg("ConnectPeer: DHT FindPeer failed")
+			}
+		}
+
+		if connected {
+			logger.Info().Str("target", peerID.String()).Msg("ConnectPeer: Proactively opening test stream as connection proof...")
+			startStream := time.Now()
+			streamCtx, cancelStream := context.WithTimeout(globalCtx, 4*time.Second)
+			s, errStream := globalHost.NewStream(streamCtx, peerID, "/p2p-core/msg/1.0.0")
+			cancelStream()
+
+			if errStream == nil {
+				elapsed := time.Since(startStream)
+				routeType := "DIRECT (QUIC/UDP)"
+				conns := globalHost.Network().ConnsToPeer(peerID)
+				if len(conns) > 0 {
+					addrStr := conns[0].RemoteMultiaddr().String()
+					if strings.Contains(addrStr, "p2p-circuit") {
+						routeType = "RELAYED (Circuit)"
+					} else if strings.Contains(addrStr, "webrtc-direct") {
+						routeType = "DIRECT (WebRTC)"
+					}
+				}
+				logger.Info().
+					Str("peerID", peerID.String()).
+					Dur("elapsed", elapsed).
+					Str("route", routeType).
+					Msg(">>> CONNECTPEER PROOF: Stream established successfully!")
+				s.Close()
+			} else {
+				logger.Warn().
+					Err(errStream).
+					Str("target", peerID.String()).
+					Msg(">>> CONNECTPEER PROOF: Failed to open test stream")
 			}
 		}
 	}()

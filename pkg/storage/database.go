@@ -208,6 +208,12 @@ func InitDatabase(dbPath string) error {
 	CREATE TABLE IF NOT EXISTS processed_mailbox_messages (
 		msg_hash TEXT PRIMARY KEY,
 		processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	
+	-- 12. Persistent envelope deduplication cache (hashes of successfully decrypted/processed direct or mailbox envelopes)
+	CREATE TABLE IF NOT EXISTS processed_envelopes (
+		env_hash TEXT PRIMARY KEY,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	_, err = DB.Exec(query)
@@ -482,6 +488,25 @@ func DeleteProcessedMailboxMessage(msgHash string) error {
 	}
 	_, err := DB.Exec(`DELETE FROM processed_mailbox_messages WHERE msg_hash = ?`, msgHash)
 	return err
+}
+
+// SaveProcessedEnvelope persists an envelope hash that has been successfully decrypted/processed
+func SaveProcessedEnvelope(envHash string) error {
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	_, err := DB.Exec(`INSERT OR IGNORE INTO processed_envelopes (env_hash) VALUES (?)`, envHash)
+	return err
+}
+
+// IsEnvelopeProcessed checks if an envelope hash has already been successfully processed
+func IsEnvelopeProcessed(envHash string) bool {
+	if DB == nil {
+		return false
+	}
+	var exists int
+	err := DB.QueryRow(`SELECT 1 FROM processed_envelopes WHERE env_hash = ?`, envHash).Scan(&exists)
+	return err == nil && exists == 1
 }
 
 // GetMessageByHash retrieves a message by its hash

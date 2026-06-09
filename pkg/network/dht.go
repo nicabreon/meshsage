@@ -16,6 +16,8 @@ func SetupDHT(ctx context.Context, h host.Host) (*dht.IpfsDHT, error) {
 	mode := dht.ModeAuto
 	if IsClientOnly {
 		mode = dht.ModeClient
+	} else if IsDedicated {
+		mode = dht.ModeServer
 	}
 	d, err := dht.New(ctx, h, dht.Mode(mode))
 	if err != nil {

@@ -162,7 +162,24 @@ func handleStream(s network.Stream) {
 // ProcessSecureEnvelope menangani dekripsi X3DH dan pemrosesan JSON payload
 func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, envelope string, msgHash string) {
 	success := false
+
+	// Detect and unwrap SignedMailboxEnvelope if present
+	actualEnvelope := envelope
+	if strings.HasPrefix(envelope, "{") {
+		var signedEnv SignedMailboxEnvelope
+		if err := json.Unmarshal([]byte(envelope), &signedEnv); err == nil && signedEnv.Payload != "" {
+			actualEnvelope = signedEnv.Payload
+		}
+	}
+	envelope = actualEnvelope
+
+	envHashBytes := sha256.Sum256([]byte(envelope))
+	envHash := fmt.Sprintf("%x", envHashBytes)
+
 	defer func() {
+		if success {
+			_ = corestore.SaveProcessedEnvelope(envHash)
+		}
 		if msgHash != "" {
 			if success {
 				processedMailboxMessages.Store(msgHash, true)
@@ -174,16 +191,10 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		}
 	}()
 
-	// Detect and unwrap SignedMailboxEnvelope if present
-	if strings.HasPrefix(envelope, "{") {
-		var signedEnv SignedMailboxEnvelope
-		if err := json.Unmarshal([]byte(envelope), &signedEnv); err != nil {
-			logger.Error().Err(err).Msg("ProcessSecureEnvelope: failed to unmarshal SignedMailboxEnvelope JSON")
-		} else if signedEnv.Payload == "" {
-			logger.Warn().Msg("ProcessSecureEnvelope: SignedMailboxEnvelope has empty payload")
-		} else {
-			envelope = signedEnv.Payload
-		}
+	if corestore.IsEnvelopeProcessed(envHash) {
+		logger.Info().Str("envHash", envHash[:8]).Msg("ProcessSecureEnvelope: Envelope ciphertext already processed, skipping duplicate")
+		success = true
+		return
 	}
 
 	envType := "UNKNOWN"
@@ -1133,6 +1144,176 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 	return msgID, sendSecureEnvelope(ctx, h, priv, target, env)
 }
 
+var (
+	customDialTimeouts sync.Map // map[string]time.Duration
+	customDialRTTs     sync.Map // map[string]time.Duration
+)
+
+// getRelayRTT returns the minimum stream dial RTT to any currently connected dedicated relay.
+// If no dedicated relay is connected or measured, it returns 0.
+func getRelayRTT(h host.Host) time.Duration {
+	if h == nil {
+		return 0
+	}
+	var bestRTT time.Duration = 0
+	for _, p := range h.Network().Peers() {
+		// Verify if peer is a dedicated relay
+		protos, err := h.Peerstore().GetProtocols(p)
+		if err != nil {
+			continue
+		}
+		isDedicated := false
+		for _, proto := range protos {
+			if string(proto) == "/p2p-core/infra/dedicated/1.1.0" {
+				isDedicated = true
+				break
+			}
+		}
+		if isDedicated {
+			if val, ok := customDialRTTs.Load(p.String()); ok {
+				if rtt, ok := val.(time.Duration); ok {
+					if bestRTT == 0 || rtt < bestRTT {
+						bestRTT = rtt
+					}
+				}
+			}
+		}
+	}
+	return bestRTT
+}
+
+// MeasureAndRecordDialTimeout measures stream creation latency to a newly connected peer
+// and saves a custom adaptive dial timeout for it.
+func MeasureAndRecordDialTimeout(ctx context.Context, h host.Host, target peer.ID) {
+	go func() {
+		// Wait a moment for connection handshakes (QUIC/TCP, security, muxer) to settle down.
+		time.Sleep(1 * time.Second)
+
+		logger.Info().Str("target", target.String()).Msg("LOG_STEP: MeasureAndRecordDialTimeout: Initiating test stream to measure latency...")
+		start := time.Now()
+		dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		s, err := h.NewStream(dialCtx, target, "/ipfs/ping/1.0.0")
+		cancel()
+
+		if err == nil {
+			elapsed := time.Since(start)
+			s.Close()
+
+			customDialRTTs.Store(target.String(), elapsed)
+
+			// Calculate adaptive timeout: 3 * elapsed + 1 second buffer (longer buffer to handle spikes or relay routes)
+			timeout := 3*elapsed + 1*time.Second
+			if timeout < 500*time.Millisecond {
+				timeout = 500 * time.Millisecond
+			}
+			if timeout > 3*time.Second {
+				timeout = 3 * time.Second
+			}
+
+			customDialTimeouts.Store(target.String(), timeout)
+			logger.Info().
+				Str("target", target.String()).
+				Dur("stream_dial_rtt", elapsed).
+				Dur("dial_timeout", timeout).
+				Msg("LOG_STEP: MeasureAndRecordDialTimeout: Successfully measured stream creation time and saved custom dial timeout")
+		} else {
+			logger.Warn().
+				Str("target", target.String()).
+				Err(err).
+				Msg("LOG_STEP: MeasureAndRecordDialTimeout: Failed to open test stream to measure latency")
+		}
+	}()
+}
+
+func getPeerDialTimeout(ctx context.Context, h host.Host, target peer.ID) time.Duration {
+	// Establish maximum timeout limit. Hard cap is 3 seconds.
+	maxLimit := 3 * time.Second
+
+	// If we are connected to a dedicated relay, scale maxLimit dynamically based on the relay's RTT.
+	// Since relay routing takes at least 1 relay RTT (plus stream negotiation/handshakes),
+	// we scale the limit to 3 * relayRTT + 500ms.
+	if relayRTT := getRelayRTT(h); relayRTT > 0 {
+		adaptiveLimit := 3*relayRTT + 500*time.Millisecond
+		if adaptiveLimit < maxLimit {
+			maxLimit = adaptiveLimit
+			// Ensure a floor of 1.0 second so we don't time out too aggressively under normal jitter
+			if maxLimit < 1*time.Second {
+				maxLimit = 1 * time.Second
+			}
+		}
+	}
+
+	// First, check if we have a measured custom dial timeout
+	if val, ok := customDialTimeouts.Load(target.String()); ok {
+		if timeout, ok := val.(time.Duration); ok {
+			if timeout > maxLimit {
+				timeout = maxLimit
+			}
+			logger.Debug().
+				Str("target", target.String()).
+				Dur("dial_timeout", timeout).
+				Dur("max_limit", maxLimit).
+				Msg("LOG_STEP: getPeerDialTimeout: Using custom recorded dial timeout (capped by limit)")
+			return timeout
+		}
+	}
+
+	// Retrieve EWMA latency from Peerstore
+	ewma := h.Peerstore().LatencyEWMA(target)
+	if ewma > 0 {
+		// Calculate adaptive timeout: 4x RTT + 500ms safety buffer
+		timeout := 4 * ewma + 500 * time.Millisecond
+		// Bound it between 300ms and maxLimit
+		if timeout < 300*time.Millisecond {
+			timeout = 300 * time.Millisecond
+		}
+		if timeout > maxLimit {
+			timeout = maxLimit
+		}
+		logger.Debug().
+			Str("target", target.String()).
+			Dur("ewma_rtt", ewma).
+			Dur("calculated_timeout", timeout).
+			Dur("max_limit", maxLimit).
+			Msg("LOG_STEP: getPeerDialTimeout: Calculated timeout using stored EWMA latency")
+		return timeout
+	}
+
+	// Fallback to active ping measurement if no EWMA latency is stored
+	logger.Debug().Str("target", target.String()).Msg("LOG_STEP: getPeerDialTimeout: No EWMA latency stored, performing active ping...")
+	pingCtx, pingCancel := context.WithTimeout(ctx, 1*time.Second)
+	defer pingCancel()
+	pings := ping.Ping(pingCtx, h, target)
+	select {
+	case res, ok := <-pings:
+		if ok && res.Error == nil && res.RTT > 0 {
+			timeout := 4 * res.RTT + 500 * time.Millisecond
+			if timeout < 300*time.Millisecond {
+				timeout = 300 * time.Millisecond
+			}
+			if timeout > maxLimit {
+				timeout = maxLimit
+			}
+			logger.Debug().
+				Str("target", target.String()).
+				Dur("ping_rtt", res.RTT).
+				Dur("calculated_timeout", timeout).
+				Dur("max_limit", maxLimit).
+				Msg("LOG_STEP: getPeerDialTimeout: Calculated timeout using active ping")
+			return timeout
+		}
+	case <-pingCtx.Done():
+	}
+
+	// Default fallback timeout
+	fallback := 3 * time.Second
+	if fallback > maxLimit {
+		fallback = maxLimit
+	}
+	logger.Debug().Str("target", target.String()).Dur("fallback", fallback).Msg("LOG_STEP: getPeerDialTimeout: Active ping failed or timed out, falling back to default")
+	return fallback
+}
+
 func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWireEnvelope string) error {
 	startTransmit := time.Now()
 	defer func() {
@@ -1153,8 +1334,11 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 
 	if isConnected {
 		logger.Info().Str("target", target.String()).Msg("LOG_STEP: transmitEnvelope: Active connection found, attempting direct stream dial...")
+		dialTimeout := getPeerDialTimeout(ctx, h, target)
+		logger.Info().Str("target", target.String()).Dur("timeout", dialTimeout).Msg("LOG_STEP: transmitEnvelope: Using calculated dial timeout")
+
 		startDial := time.Now()
-		dialCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 		s, err = h.NewStream(dialCtx, target, MessagingProtocolID)
 		cancel()
 		logger.Info().Str("target", target.String()).Dur("elapsed", time.Since(startDial)).Err(err).Msg("LOG_STEP: transmitEnvelope: NewStream dial finished")
@@ -1184,6 +1368,23 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 			if errWrite == nil {
 				// Track outgoing bytes (4-byte length prefix + envelope payload)
 				AddBytesSent(4 + len(finalWireEnvelope))
+
+				// Determine connection type for routing logs
+				routeType := "DIRECT (QUIC/UDP)"
+				conns := h.Network().ConnsToPeer(target)
+				if len(conns) > 0 {
+					addrStr := conns[0].RemoteMultiaddr().String()
+					if strings.Contains(addrStr, "p2p-circuit") {
+						routeType = "RELAYED (Circuit)"
+					} else if strings.Contains(addrStr, "webrtc-direct") {
+						routeType = "DIRECT (WebRTC)"
+					}
+				}
+				logger.Info().
+					Str("peerID", target.String()).
+					Str("route", routeType).
+					Msg(">>> MESSAGE DELIVERED ONLINE")
+
 				return nil
 			}
 			logger.Warn().Err(errWrite).Str("target", target.String()).Msg("transmitEnvelope: Direct write failed, falling back to mailbox")
@@ -1211,6 +1412,11 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 		pubKeyBytes, _ = h.ID().MarshalBinary() // fallback: use raw peer ID bytes
 	}
 	senderPubkeyB64 := base64.StdEncoding.EncodeToString(pubKeyBytes)
+
+	logger.Info().
+		Str("peerID", target.String()).
+		Msg(">>> TARGET OFFLINE/UNREACHABLE: Storing message in offline mailbox")
+
 	// Run mailbox storage in the background to avoid blocking the FFI / UI thread
 	go func() {
 		bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1219,7 +1425,9 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 		if err != nil {
 			logger.Warn().Err(err).Str("target", target.String()).Msg("Background StoreOfflineMessage failed")
 		} else {
-			logger.Info().Str("target", target.String()).Msg("Background StoreOfflineMessage succeeded")
+			logger.Info().
+				Str("peerID", target.String()).
+				Msg(">>> OFFLINE MAILBOX UPLOAD SUCCESSFUL")
 		}
 	}()
 	return nil
@@ -1791,7 +1999,7 @@ func ProcessCommand(ctx context.Context, h host.Host, priv crypto.PrivKey, msgSt
 			protos, _ := h.Peerstore().GetProtocols(p)
 			isRelay := false
 			for _, proto := range protos {
-				if string(proto) == "/p2p-core/mailbox/1.0.0" {
+				if string(proto) == InfrastructureProtocolID {
 					isRelay = true
 					break
 				}

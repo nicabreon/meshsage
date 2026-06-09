@@ -1,12 +1,14 @@
 package network
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	libp2pwebrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
 	"github.com/multiformats/go-multiaddr"
@@ -35,6 +38,9 @@ type Config struct {
 	RelaySource    chan peer.AddrInfo
 	DataDir        string // Folder untuk menyimpan peers.datastore
 	ForcePublic    bool   // Paksa status keterjangkauan publik (khusus Relay)
+	IsDedicated    bool
+	IsClientOnly   bool
+	EnableRelay    bool   // Mengaktifkan libp2p relay client & AutoRelay
 }
 
 // discoveredPublicIP holds the external IP discovered via STUN (thread-safe).
@@ -125,6 +131,66 @@ func querySTUN(server string) (net.IP, error) {
 	return xorAddr.IP, nil
 }
 
+func getSystemTotalMemory() uint64 {
+	// Fallback/default to 2GB in bytes
+	var defaultMem uint64 = 2 * 1024 * 1024 * 1024
+
+	switch runtime.GOOS {
+	case "linux":
+		file, err := os.Open("/proc/meminfo")
+		if err != nil {
+			return defaultMem
+		}
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "MemTotal:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					val, err := strconv.ParseUint(parts[1], 10, 64)
+					if err == nil {
+						return val * 1024 // /proc/meminfo is in kB
+					}
+				}
+			}
+		}
+	}
+	// On macOS or other systems, scale memory linearly by NumCPU as an approximation for local testing/simulation
+	cpus := runtime.NumCPU()
+	if cpus > 8 {
+		cpus = 8
+	}
+	return uint64(cpus) * 2 * 1024 * 1024 * 1024
+}
+
+func autoDetectRelayLimits() (lowWater, highWater int, rcmgrScale int, maxReservations int) {
+	cpus := runtime.NumCPU()
+	ramBytes := getSystemTotalMemory()
+	ramGB := ramBytes / (1024 * 1024 * 1024)
+
+	logger.Info().
+		Int("cpus", cpus).
+		Uint64("ram_gb", ramGB).
+		Msg(">>> HARDWARE AUTO-DETECTION: Estimating Dedicated Relay capacities")
+
+	// TIER 3: Skala Besar (>= 8 Cores ATAU >= 16 GB RAM)
+	if cpus >= 8 || ramGB >= 16 {
+		logger.Info().Msg(">>> AUTO-LIMITS: Selected TIER 3 (Large Scale Relay). Scaling up to 20,000 connections / 30,000 sirkuit.")
+		return 15000, 20000, 150, 30000
+	}
+
+	// TIER 2: Skala Menengah (>= 4 Cores ATAU >= 4 GB RAM)
+	if cpus >= 4 || ramGB >= 4 {
+		logger.Info().Msg(">>> AUTO-LIMITS: Selected TIER 2 (Medium Scale Relay). Scaling up to 8,000 connections / 10,000 sirkuit.")
+		return 5000, 8000, 50, 10000
+	}
+
+	// TIER 1: Skala Kecil (Bawaan / VPS murah)
+	logger.Info().Msg(">>> AUTO-LIMITS: Selected TIER 1 (Small Scale Relay). Scaling up to 1,000 connections / 1,000 sirkuit.")
+	return 500, 1000, 10, 1000
+}
+
 // NewNode creates a new libp2p host.
 func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	if cfg.PrivateKey == nil {
@@ -134,14 +200,25 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	// isAndroid detects if running on Android (for SELinux-safe configuration)
 	isAndroid := runtime.GOOS == "android"
 
+	// Set global mode variables based on config
+	IsDedicated = cfg.IsDedicated
+	IsClientOnly = cfg.IsClientOnly
+
 	// 0. Connection Manager (The "Bouncer")
 	// Limits active connections to save CPU/Battery/Bandwidth
 	lowWater := 100
 	highWater := 1000
+	rcmgrScale := 10
+	maxReservations := 1000
+
 	if IsClientOnly || isAndroid {
 		lowWater = 15
 		highWater = 40
+		rcmgrScale = 1
+	} else if IsDedicated {
+		lowWater, highWater, rcmgrScale, maxReservations = autoDetectRelayLimits()
 	}
+
 	cm, err := connmgr.NewConnManager(
 		lowWater,
 		highWater,
@@ -157,8 +234,8 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 		// Use default concrete limits (scale by 1x)
 		limitConfig = rcmgr.DefaultLimits.Scale(1, 1)
 	} else {
-		// Scale default limits by 10x to support 10k+ connections and more conns per IP (Relay/Server only)
-		limitConfig = rcmgr.DefaultLimits.Scale(10, 10)
+		// Scale default limits dynamically to support scaling connections (Relay/Server only)
+		limitConfig = rcmgr.DefaultLimits.Scale(int64(rcmgrScale), rcmgrScale)
 	}
 	limiter := rcmgr.NewFixedLimiter(limitConfig)
 	rm, err := rcmgr.NewResourceManager(limiter)
@@ -193,7 +270,6 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 		//    pion/webrtc is pure Go (no CGo) — safe for Android NDK cross-compile.
 		libp2p.Transport(libp2pquic.NewTransport),
 		libp2p.Transport(libp2pwebrtc.New),
-		libp2p.EnableRelay(),
 		// 5. Address Factory: filter out loopback & link-local, inject STUN-discovered public IP
 		libp2p.AddrsFactory(filterAddrsWithSTUN),
 	}
@@ -220,16 +296,38 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	// DCUtR Hole Punching: relay-based, safe on Android — always enabled
 	opts = append(opts, libp2p.EnableHolePunching())
 
+	// Conditionally enable Relay Client functionality
+	if cfg.EnableRelay {
+		opts = append(opts, libp2p.EnableRelay())
+	}
+
+	// Configure Dedicated Relay custom service limits
+	var relayOpts []relay.Option
+	if IsDedicated {
+		resources := relay.DefaultResources()
+		resources.MaxReservations = maxReservations
+		resources.MaxCircuits = maxReservations / 2
+		resources.BufferSize = 65536 // 64KB buffers for high throughput relaying
+		resources.MaxReservationsPerPeer = 4
+		resources.MaxReservationsPerIP = 8
+
+		relayOpts = append(relayOpts, relay.WithResources(resources))
+		logger.Info().
+			Int("max_reservations", resources.MaxReservations).
+			Int("max_circuits", resources.MaxCircuits).
+			Msg(">>> RELAY SERVICE: Configured custom resource manager limits")
+	}
+
 	// Paksa status publik/privat berdasarkan jenis node dan ketersediaan IP publik asli
 	if cfg.ForcePublic {
-		opts = append(opts, libp2p.ForceReachabilityPublic(), libp2p.EnableRelayService())
+		opts = append(opts, libp2p.ForceReachabilityPublic(), libp2p.EnableRelayService(relayOpts...))
 	} else if !hasPublicIP() {
 		// Paksa client menjadi ReachabilityPrivate agar AutoRelay langsung melakukan reservasi ke Relay Server
 		opts = append(opts, libp2p.ForceReachabilityPrivate())
 	}
 
-	// Tambahkan AutoRelay dengan sumber dinamis
-	if cfg.RelaySource != nil {
+	// Tambahkan AutoRelay dengan sumber dinamis jika relay diaktifkan
+	if cfg.EnableRelay && cfg.RelaySource != nil {
 		peerSource := func(ctx context.Context, num int) <-chan peer.AddrInfo {
 			return cfg.RelaySource
 		}

@@ -708,8 +708,69 @@ This automatically starts dialing the target peer in the background as soon as t
 - Verified that incoming notification banners can be clicked to open the app, play sound, vibrate, and display the custom app icon.
 - Verified that incoming calls play the default system ringtone, display a heads-up notification in the background, and can be accepted/declined via a custom round button interface.
 
+---
 
+## Walkthrough: Fixed Manual Mailbox Fetch Relay Filtering (Client-Only Exclusion)
 
+### Problem Solved
+When triggering a manual mailbox fetch from the Flutter UI (which calls `TriggerMailboxFetch` via FFI) or using the `/fetch` command in the CLI, the client incorrectly reported that it was fetching mailboxes from 4 relays, despite there only being 3 actual infrastructure relays and 1 client-only peer connected.
 
+This was caused by the fetch routines checking whether connected peers supported the general `MailboxProtocolID` (`/p2p-core/mailbox/1.0.0`). Because all nodes (including client-only ones) register this handler in `SetupMailbox` to support local mailbox services, the client-only node was incorrectly classified as an infrastructure relay during manual fetch queries.
 
+### Changes Made
+1. **FFI Bridge (`TriggerMailboxFetch`)**:
+   - Modified [main.go](file:///Users/nicabreon/Distributed-Messaging-Platform/meshsage/cmd/libmeshsage/main.go) to query for `coreproto.InfrastructureProtocolID` (`/p2p-core/infra/1.1.0`) instead of `/p2p-core/mailbox/1.0.0` when traversing active peers.
+2. **CLI command `/fetch`**:
+   - Modified [messaging.go](file:///Users/nicabreon/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go) to match the same check, validating that the target node is an actual infrastructure relay (`InfrastructureProtocolID`).
+3. **Rebuilt FFI libraries**:
+   - Recompiled the static library using `./build_ios.sh` and verified compilation success.
+
+### Verification Results
+- The packages compiled successfully without any errors (`go build ./cmd/node && go build ./cmd/libmeshsage`).
+- Verified that `./build_ios.sh` outputs `✅ Compiled static library build/ios/libmeshsage.a` and successfully copies headers and static libraries into the Flutter workspace.
+
+---
+
+## Walkthrough: Visual P2P Connection Type Indicators in UI
+
+### Problem Solved
+While the underlying P2P direct QUIC/WebRTC and relay-assisted fallback protocols were fully functional, the user could not visually verify the active transport/routing type for connected peers without drilling down into manual diagnostics. The P2P network topology felt invisible.
+
+### Changes Made
+1. **Interactive Chat Room AppBar**:
+   - Modified [chat_room_screen.dart](file:///Users/nicabreon/Distributed-Messaging-Platform/meshsage_flutter/lib/screens/chat_room_screen.dart) to start a periodic `Timer` (every 3 seconds) that queries the peer's connection info via `FFIBridge.getPeerConnInfo`.
+   - Updated the Chat Room app bar to display a clean glowing colored dot indicator next to the peer's name:
+     - 🟢 **Green**: Direct connection via QUIC/UDP.
+     - 🔵 **Blue**: Direct connection via WebRTC (ICE).
+     - 🟡 **Amber**: Relayed connection via Server.
+     - ⚪ **Grey**: Offline / Mailbox mode.
+   - Tapping on the AppBar title or dot continues to launch the full details dialog containing detailed connection status information.
+2. **Connected Peers Dialog**:
+   - Modified [main.dart](file:///Users/nicabreon/Distributed-Messaging-Platform/meshsage_flutter/lib/main.dart) to import `dart:convert` and `ffi_bridge.dart`.
+   - Enriched the "Connected Peers" dialog list to display a neat connection type badge (e.g. `QUIC`, `WebRTC`, `Relay`, `Offline`) next to the peer's display name.
+
+### Verification Results
+- All Go and Flutter source files compile successfully.
+- Rebuilt native iOS simulator libraries using `./build_ios.sh`.
+
+---
+
+## Walkthrough: Explicit Message Delivery Route Logging
+
+### Problem Solved
+When sending a message, the platform fell back silently or printed system-level debug trace logs indicating the transmission route. The user could not easily see in real-time within the app logs console whether their message was successfully sent directly over QUIC/UDP, WebRTC, relayed via a Circuit Relay, or stored offline in a Mailbox.
+
+### Changes Made
+- Modified `transmitEnvelope` in [messaging.go](file:///Users/nicabreon/Distributed-Messaging-Platform/meshsage/pkg/protocol/messaging.go):
+  - On successful direct delivery, it inspects the active connection to target peer and logs: `>>> MESSAGE DELIVERED ONLINE` with route type:
+    - `DIRECT (QUIC/UDP)`
+    - `DIRECT (WebRTC)`
+    - `RELAYED (Circuit)`
+  - On connection failures or offline state, it logs: `>>> TARGET OFFLINE/UNREACHABLE: Storing message in offline mailbox`.
+  - On successful mailbox store-and-forward upload, it logs: `>>> OFFLINE MAILBOX UPLOAD SUCCESSFUL`.
+- These logs are logged at `Info` level, making them instantly visible in the "LIVE NETWORK LOGS" console on the mobile client's dashboard.
+
+### Verification Results
+- Verified that compiling the Go command packages (`cmd/node`, `cmd/libmeshsage`) is successful.
+- Recompiled Android native shared libraries (`.so` files for all CPU architectures) and iOS simulator libraries (`.a` static archive).
 

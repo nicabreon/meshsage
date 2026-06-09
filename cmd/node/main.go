@@ -111,6 +111,9 @@ func main() {
 		StaticRelays: staticRelays,
 		RelaySource:  relaySource,
 		ForcePublic:  *forcePublic,
+		IsDedicated:  *isDedicated,
+		IsClientOnly: *isClientOnly,
+		EnableRelay:  true,
 	})
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to create network node")
@@ -196,6 +199,10 @@ func main() {
 			recentlyConnected.Store(remoteID, now)
 
 			logger.Info().Str("peerID", remoteID.String()).Msg(">>> NEW PEER CONNECTED")
+
+			// Measure and record the peer's custom dial timeout
+			coreproto.MeasureAndRecordDialTimeout(ctx, host, remoteID)
+
 			logger.Debug().Str("peerID", remoteID.String()).Msg("Checking capabilities for new peer...")
 
 			// Wait a moment for protocol negotiation to finish
