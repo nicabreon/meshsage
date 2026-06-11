@@ -41,6 +41,7 @@ libmeshsage
 
 # Local runtime data
 .data/
+test_run/
 *.db
 *.db-shm
 *.db-wal
