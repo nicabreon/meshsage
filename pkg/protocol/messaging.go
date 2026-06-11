@@ -45,6 +45,34 @@ var (
 	x3dhRequestCooldown sync.Map // map[peerID string]time.Time
 )
 
+type PeerActivityInfo struct {
+	LastSeen time.Time
+	Type     string
+	RelayVia string
+}
+
+var (
+	PeerActivityMap = make(map[string]PeerActivityInfo)
+	PeerActivityMu  sync.RWMutex
+)
+
+func UpdatePeerActivity(peerID string, connType string, relayVia string) {
+	PeerActivityMu.Lock()
+	defer PeerActivityMu.Unlock()
+	PeerActivityMap[peerID] = PeerActivityInfo{
+		LastSeen: time.Now(),
+		Type:     connType,
+		RelayVia: relayVia,
+	}
+}
+
+func GetPeerActivity(peerID string) (PeerActivityInfo, bool) {
+	PeerActivityMu.RLock()
+	defer PeerActivityMu.RUnlock()
+	act, found := PeerActivityMap[peerID]
+	return act, found
+}
+
 // sentMsg adalah pesan yang sudah dikirim oleh node ini, disimpan untuk kemungkinan retry
 // jika receiver mengalami masalah sesi dan meminta X3DH ulang.
 type sentMsg struct {
@@ -161,6 +189,36 @@ func handleStream(s network.Stream) {
 
 // ProcessSecureEnvelope menangani dekripsi X3DH dan pemrosesan JSON payload
 func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, envelope string, msgHash string) {
+	// Update last active status of the peer
+	connType := "relay"
+	relayVia := ""
+	if h != nil {
+		conns := h.Network().ConnsToPeer(senderID)
+		if len(conns) > 0 {
+			addrStr := conns[0].RemoteMultiaddr().String()
+			if strings.Contains(addrStr, "webrtc-direct") {
+				connType = "direct_webrtc"
+			} else if strings.Contains(addrStr, "p2p-circuit") {
+				connType = "relay"
+				parts := strings.Split(addrStr, "/")
+				for i, part := range parts {
+					if part == "p2p-circuit" && i >= 2 {
+						for j := i - 1; j >= 0; j-- {
+							if parts[j] == "p2p" && j+1 < i {
+								relayVia = parts[j+1]
+								break
+							}
+						}
+						break
+					}
+				}
+			} else {
+				connType = "direct_quic"
+			}
+		}
+	}
+	UpdatePeerActivity(senderID.String(), connType, relayVia)
+
 	success := false
 
 	// Detect and unwrap SignedMailboxEnvelope if present
@@ -611,6 +669,8 @@ func pushDecryptionErrorToUI(senderID peer.ID, errStr string) {
 			Content:   content,
 			UnixTime:  time.Now().UnixNano() / 1e6,
 		})
+	} else {
+		logger.Info().Msg("Callback is nil for error")
 	}
 }
 
@@ -627,11 +687,62 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 	}
 
 	switch env.Type {
+	case MsgTypeProfileKeyShare:
+		logger.Info().Str("peerID", senderID.String()).Msg("Received E2EE profile key share from peer")
+		avatarKey := env.Content
+		if avatarKey != "" {
+			name, cid, _, path, err := corestore.GetPeerProfile(senderID.String())
+			if err == nil && name != "" {
+				_ = corestore.SavePeerProfile(senderID.String(), name, cid, avatarKey, path)
+				if cid != "" {
+					TriggerAvatarDownload(senderID.String(), cid, avatarKey)
+				}
+			}
+		}
+		// Notify Dart UI of profile update
+		if MessageCallback != nil {
+			MessageCallback(MessageEvent{
+				Type:   "profile_updated",
+				Sender: senderID.String(),
+			})
+		}
+		return true
+
+	case MsgTypeProfileUpdate:
+		logger.Info().Str("peerID", senderID.String()).Msg("Received E2EE profile update from peer")
+		var payload struct {
+			DisplayName string `json:"display_name"`
+			AvatarCID   string `json:"avatar_cid"`
+			AvatarKey   string `json:"avatar_key"`
+		}
+		if err := json.Unmarshal([]byte(env.Content), &payload); err == nil {
+			_, _, _, path, _ := corestore.GetPeerProfile(senderID.String())
+			_ = corestore.SavePeerProfile(senderID.String(), payload.DisplayName, payload.AvatarCID, payload.AvatarKey, path)
+			if payload.AvatarCID != "" && payload.AvatarKey != "" {
+				TriggerAvatarDownload(senderID.String(), payload.AvatarCID, payload.AvatarKey)
+			}
+		}
+		// Notify Dart UI of profile update
+		if MessageCallback != nil {
+			MessageCallback(MessageEvent{
+				Type:   "profile_updated",
+				Sender: senderID.String(),
+			})
+		}
+		return true
+
 	case MsgTypeHandshakeAck:
 		// Silent: X3DH bidirectional handshake completed. No UI display.
 		// Receiving this ACK means both sides now have a fully operational
 		// Double Ratchet session in both directions.
 		logger.Info().Str("peerID", senderID.String()).Msg("X3DH handshake ACK received: bidirectional session established")
+		// Automatically send profile key share back to the sender
+		go func() {
+			time.Sleep(100 * time.Millisecond) // Let it settle
+			if err := SendProfileKeyShare(ctx, h, senderID); err != nil {
+				logger.Warn().Err(err).Str("targetID", senderID.String()).Msg("Failed to auto-send profile key share on ACK receipt")
+			}
+		}()
 		return true
 
 	case MsgTypeStatus:
@@ -764,10 +875,11 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "direct")
 
 		logger.Info().Str("senderID", senderID.String()).Str("msgID", env.ID).Msg("Received standard text message successfully")
+		TrackMsgRecv() // Track incoming message
 
 		ts := time.Now().Format("02/01 15:04:05")
 		logger.Displayf("\033[92m[%s] [Message from %s]: %s\033[0m\n", ts, FormatSender(senderID.String()), env.Content)
-		TrackMsgRecv() // Track incoming message
+
 		if MessageCallback != nil {
 			MessageCallback(MessageEvent{
 				Type:      "direct",
@@ -777,9 +889,11 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 				Content:   env.Content,
 				UnixTime:  env.Timestamp / 1e6,
 			})
+			// OTOMATIS: Kirim status "delivered" (Centang 2)
+			go SendStatusUpdate(ctx, h, senderID, env.ID, StatusDelivered)
+		} else {
+			logger.Info().Msg("Callback is nil for message")
 		}
-		// OTOMATIS: Kirim status "delivered" (Centang 2)
-		go SendStatusUpdate(ctx, h, senderID, env.ID, StatusDelivered)
 		return true
 
 	case MsgTypeFile:
@@ -799,6 +913,8 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 					Content:   env.Content,
 					UnixTime:  env.Timestamp / 1e6,
 				})
+			} else {
+				logger.Info().Msg("Callback is nil for file")
 			}
 		}
 		return true
@@ -1087,6 +1203,13 @@ func sendHandshakeAck(ctx context.Context, h host.Host, targetID peer.ID) {
 		logger.Debug().Err(err).Str("targetID", targetID.String()).Msg("sendHandshakeAck: failed to send ACK (peer may be offline, will recover on next message)")
 	} else {
 		logger.Info().Str("targetID", targetID.String()).Msg("sendHandshakeAck: X3DH ACK sent — bidirectional session is now complete")
+		// Automatically send profile key share right after ACK is sent
+		go func() {
+			time.Sleep(100 * time.Millisecond) // Let it settle
+			if err := SendProfileKeyShare(ctx, h, targetID); err != nil {
+				logger.Warn().Err(err).Str("targetID", targetID.String()).Msg("Failed to auto-send profile key share after ACK")
+			}
+		}()
 	}
 }
 
@@ -1116,7 +1239,31 @@ func ProbeSessionWarmup(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 	}
 }
 
-// deriveNextKeys is deprecated, logic moved to corecrypto.RatchetStep
+// InitiateSession triggers a silent X3DH handshake to proactively establish
+// a Double Ratchet session with a peer (e.g. when adding them to contacts).
+func InitiateSession(ctx context.Context, h host.Host, priv crypto.PrivKey, target peer.ID) error {
+	privKey := h.Peerstore().PrivKey(h.ID())
+	if privKey == nil {
+		return fmt.Errorf("local private key not found in peerstore")
+	}
+
+	// If session already exists, send a warmup probe to verify health
+	if corestore.HasSession(target.String()) {
+		logger.Info().Str("targetID", target.String()).Msg("Session already exists, sending proactive warmup probe instead")
+		ProbeSessionWarmup(ctx, h, priv, target)
+		return nil
+	}
+
+	ackID := fmt.Sprintf("hshk-%x", sha256.Sum256([]byte(target.String()+time.Now().String())))[:12]
+	ackEnv := MessageEnvelope{
+		ID:        ackID,
+		Type:      MsgTypeHandshakeAck,
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	logger.Info().Str("targetID", target.String()).Msg("Initiating proactive Double Ratchet session via silent handshake ack")
+	return sendSecureEnvelope(ctx, h, privKey, target, ackEnv)
+}
 
 func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target peer.ID, msg string) (string, error) {
 	msg = strings.TrimSuffix(msg, "\n")
@@ -1262,7 +1409,7 @@ func getPeerDialTimeout(ctx context.Context, h host.Host, target peer.ID) time.D
 	ewma := h.Peerstore().LatencyEWMA(target)
 	if ewma > 0 {
 		// Calculate adaptive timeout: 4x RTT + 500ms safety buffer
-		timeout := 4 * ewma + 500 * time.Millisecond
+		timeout := 4*ewma + 500*time.Millisecond
 		// Bound it between 300ms and maxLimit
 		if timeout < 300*time.Millisecond {
 			timeout = 300 * time.Millisecond
@@ -1287,7 +1434,7 @@ func getPeerDialTimeout(ctx context.Context, h host.Host, target peer.ID) time.D
 	select {
 	case res, ok := <-pings:
 		if ok && res.Error == nil && res.RTT > 0 {
-			timeout := 4 * res.RTT + 500 * time.Millisecond
+			timeout := 4*res.RTT + 500*time.Millisecond
 			if timeout < 300*time.Millisecond {
 				timeout = 300 * time.Millisecond
 			}
@@ -1371,15 +1518,33 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 
 				// Determine connection type for routing logs
 				routeType := "DIRECT (QUIC/UDP)"
+				connType := "direct_quic"
+				relayVia := ""
 				conns := h.Network().ConnsToPeer(target)
 				if len(conns) > 0 {
 					addrStr := conns[0].RemoteMultiaddr().String()
 					if strings.Contains(addrStr, "p2p-circuit") {
 						routeType = "RELAYED (Circuit)"
+						connType = "relay"
+						parts := strings.Split(addrStr, "/")
+						for i, part := range parts {
+							if part == "p2p-circuit" && i >= 2 {
+								for j := i - 1; j >= 0; j-- {
+									if parts[j] == "p2p" && j+1 < i {
+										relayVia = parts[j+1]
+										break
+									}
+								}
+								break
+							}
+						}
 					} else if strings.Contains(addrStr, "webrtc-direct") {
 						routeType = "DIRECT (WebRTC)"
+						connType = "direct_webrtc"
 					}
 				}
+				UpdatePeerActivity(target.String(), connType, relayVia)
+
 				logger.Info().
 					Str("peerID", target.String()).
 					Str("route", routeType).

@@ -63,11 +63,6 @@ func handlePreKeyStream(s network.Stream) {
 	peerID := s.Conn().RemotePeer().String()
 	logger.Debug().Str("peerID", peerID).Msg("Incoming pre-key stream")
 	
-	if !corenet.ShouldActAsRelay() {
-		logger.Debug().Str("peerID", peerID).Msg("Rejecting pre-key stream: Node is not a relay")
-		s.Reset()
-		return
-	}
 	defer s.Close()
 	buf := bufio.NewReader(s)
 	line, err := buf.ReadString('\n')
@@ -76,8 +71,15 @@ func handlePreKeyStream(s network.Stream) {
 	parts := strings.SplitN(strings.TrimSpace(line), " ", 2)
 	if len(parts) < 2 { return }
 
+	isRelay := corenet.ShouldActAsRelay()
+
 	switch parts[0] {
 	case "UPLOAD_GZIP":
+		if !isRelay {
+			logger.Debug().Str("peerID", s.Conn().RemotePeer().String()).Msg("Rejecting compressed pre-key UPLOAD: Node is not a relay")
+			s.Write([]byte("ERROR: Not a relay\n"))
+			return
+		}
 		size := 0
 		fmt.Sscanf(parts[1], "%d", &size)
 		if size <= 0 { return }
@@ -125,6 +127,11 @@ func handlePreKeyStream(s network.Stream) {
 		s.Write([]byte("OK\n"))
 
 	case "UPLOAD":
+		if !isRelay {
+			logger.Debug().Str("peerID", s.Conn().RemotePeer().String()).Msg("Rejecting uncompressed pre-key UPLOAD: Node is not a relay")
+			s.Write([]byte("ERROR: Not a relay\n"))
+			return
+		}
 		logger.Debug().Str("peerID", s.Conn().RemotePeer().String()).Msg("Received uncompressed pre-key UPLOAD")
 		var batch PreKeyBatch
 		if err := json.Unmarshal([]byte(parts[1]), &batch); err != nil {
@@ -160,6 +167,13 @@ func handlePreKeyStream(s network.Stream) {
 		requesterID := s.Conn().RemotePeer().String()
 		logger.Debug().Str("requester", requesterID).Str("target", targetID).Msg("PREKEY SERVICE: Incoming FETCH request")
 
+		// If we are not a relay, we ONLY allow FETCH if targetID is our own peer ID (direct P2P exchange)
+		if !isRelay && targetID != s.Conn().LocalPeer().String() {
+			logger.Warn().Str("target", targetID).Msg("Rejecting FETCH: target is not local node and we are not a relay")
+			s.Write([]byte("ERROR: Not a relay\n"))
+			return
+		}
+
 		limitKey := requesterID + ":" + targetID
 		fetchHistoryMutex.Lock()
 		count := fetchHistory[limitKey]
@@ -179,12 +193,14 @@ func handlePreKeyStream(s network.Stream) {
 			return
 		}
 
-		// Broadcast deletion of consumed pre-key to cluster sync
-		BroadcastClusterEvent(context.Background(), ClusterEvent{
-			Type:    "PREKEY_DELETE",
-			Hash:    keyID,
-			OwnerID: targetID,
-		})
+		if isRelay {
+			// Broadcast deletion of consumed pre-key to cluster sync
+			BroadcastClusterEvent(context.Background(), ClusterEvent{
+				Type:    "PREKEY_DELETE",
+				Hash:    keyID,
+				OwnerID: targetID,
+			})
+		}
 		
 		resp, _ := json.Marshal(map[string]string{
 			"key_id":     keyID,
@@ -195,6 +211,11 @@ func handlePreKeyStream(s network.Stream) {
 		logger.Info().Str("keyID", keyID).Str("peerID", targetID).Msg("PREKEY SERVICE: Delivered pre-key to requester")
 
 	case "COUNT":
+		if !isRelay {
+			logger.Debug().Str("peerID", s.Conn().RemotePeer().String()).Msg("Rejecting pre-key COUNT: Node is not a relay")
+			s.Write([]byte("ERROR: Not a relay\n"))
+			return
+		}
 		ownerID := parts[1]
 		count := corestore.GetPreKeyCount(ownerID)
 		logger.Debug().Str("peerID", ownerID).Int("count", count).Msg("PREKEY SERVICE: Providing pre-key count")

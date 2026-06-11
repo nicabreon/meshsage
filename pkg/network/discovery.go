@@ -92,6 +92,13 @@ func SetupDiscovery(ctx context.Context, h host.Host) error {
 						
 						// Connect if not already connected
 						if h.Network().Connectedness(pinfo.ID) != network.Connected {
+							// Khusus Dedicated Relay: Hanya lakukan dial keluar ke peer yang memiliki alamat IP publik valid (Relay/Hybrid).
+							// Mencegah pemborosan resource saat dial keluar ke client-only nodes di belakang NAT.
+							if IsDedicated && !HasPublicAddr(pinfo.Addrs) {
+								logger.Debug().Str("peerID", pinfo.ID.String()).Msg("DHT Discovery: Skipping dialing client-only peer (no public addresses)")
+								continue
+							}
+
 							logger.Info().Str("peerID", pinfo.ID.String()).Msg("DHT Discovery: Attempting connection to discovered peer")
 							
 							// Run dial in a separate goroutine so it doesn't block the channel reader

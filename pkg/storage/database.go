@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/big"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,9 +14,11 @@ import (
 )
 
 var DB *sql.DB
+var DataDir string
 
 // InitDatabase initializes the local SQLite database.
 func InitDatabase(dbPath string) error {
+	DataDir = filepath.Dir(dbPath)
 	if DB != nil {
 		oldDB := DB
 		DB = nil
@@ -214,6 +217,16 @@ func InitDatabase(dbPath string) error {
 	CREATE TABLE IF NOT EXISTS processed_envelopes (
 		env_hash TEXT PRIMARY KEY,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	-- 13. Persistent profile registry cache (names, avatar CIDs and local file paths)
+	CREATE TABLE IF NOT EXISTS profile_store (
+		peer_id TEXT PRIMARY KEY,
+		display_name TEXT NOT NULL,
+		avatar_cid TEXT DEFAULT "",
+		avatar_key TEXT DEFAULT "",
+		local_path TEXT DEFAULT "",
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	_, err = DB.Exec(query)
@@ -967,4 +980,26 @@ func SaveNetworkStats(totalSent, totalRecv, msgSent, msgRecv, handshakes, fileSe
 		VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		totalSent, totalRecv, msgSent, msgRecv, handshakes, fileSent, fileRecv)
 	return err
+}
+
+// SavePeerProfile stores or updates a cached peer profile record.
+func SavePeerProfile(peerID, displayName, avatarCID, avatarKey, localPath string) error {
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	_, err := DB.Exec(`
+		INSERT OR REPLACE INTO profile_store (peer_id, display_name, avatar_cid, avatar_key, local_path, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		peerID, displayName, avatarCID, avatarKey, localPath)
+	return err
+}
+
+// GetPeerProfile loads a cached peer profile record.
+func GetPeerProfile(peerID string) (displayName, avatarCID, avatarKey, localPath string, err error) {
+	if DB == nil {
+		return "", "", "", "", fmt.Errorf("database not initialized")
+	}
+	row := DB.QueryRow("SELECT display_name, avatar_cid, avatar_key, local_path FROM profile_store WHERE peer_id = ?", peerID)
+	err = row.Scan(&displayName, &avatarCID, &avatarKey, &localPath)
+	return
 }

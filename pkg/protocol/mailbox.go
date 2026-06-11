@@ -838,7 +838,7 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 			logger.Debug().Str("peerID", relayID.String()).Msg("Mailbox sync loop exited, guard released")
 		}()
 
-		backoff := 5 * time.Second
+		backoff := 15 * time.Second
 		for {
 			select {
 			case <-ctx.Done():
@@ -858,7 +858,7 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 			}
 
 			if subscribed {
-				backoff = 5 * time.Second // Reset backoff on success
+				backoff = 15 * time.Second // Reset backoff on success
 				// Successfully subscribed — wait until lost or ctx cancelled.
 				select {
 				case <-ctx.Done():

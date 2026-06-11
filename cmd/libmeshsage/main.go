@@ -1,7 +1,20 @@
 package main
 
 /*
+#cgo CFLAGS: -I/opt/homebrew/Caskroom/flutter/3.38.9/flutter/bin/cache/dart-sdk/include
 #include <stdlib.h>
+#include "dart_api_dl.h"
+
+// Helper function to post string messages via Dart_PostCObject_DL
+static bool post_string_to_dart(int64_t port_id, const char* str) {
+    if (Dart_PostCObject_DL == NULL) {
+        return false;
+    }
+    Dart_CObject obj;
+    obj.type = Dart_CObject_kString;
+    obj.value.as_string = str;
+    return Dart_PostCObject_DL(port_id, &obj);
+}
 */
 import "C"
 
@@ -17,6 +30,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -41,6 +55,10 @@ var (
 	globalPriv   crypto.PrivKey
 	globalCtx    context.Context
 	globalCancel context.CancelFunc
+)
+
+var (
+	globalPortID int64 // accessed atomically
 )
 
 var DefaultSeeds = []string{
@@ -71,8 +89,33 @@ func (q *Queue) Push(event string) {
 	if q.closed {
 		return
 	}
-	q.events = append(q.events, event)
-	q.cond.Signal()
+
+	portID := atomic.LoadInt64(&globalPortID)
+
+	if portID != 0 {
+		cStr := C.CString(event)
+		C.post_string_to_dart(C.int64_t(portID), cStr)
+		C.free(unsafe.Pointer(cStr))
+	} else {
+		q.events = append(q.events, event)
+		q.cond.Signal()
+	}
+}
+
+func (q *Queue) FlushPending(portID int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.events) == 0 {
+		return
+	}
+	// Use raw stdout print to avoid recursive logging deadlocks
+	fmt.Printf("[Go EventQueue] Flushing %d pending events to registered Dart Port %d\n", len(q.events), portID)
+	for _, event := range q.events {
+		cStr := C.CString(event)
+		C.post_string_to_dart(C.int64_t(portID), cStr)
+		C.free(unsafe.Pointer(cStr))
+	}
+	q.events = nil
 }
 
 // Close wakes up all blocked Pop() callers so they can exit cleanly.
@@ -209,6 +252,27 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 	}
 	coreproto.InitStats()
 
+	// Inject database check callback to networking package to break import cycle
+	corenet.HasActiveSessionFn = func(peerID string) bool {
+		var count int
+		// 1. Check if has active E2EE session
+		err := corestore.DB.QueryRow("SELECT COUNT(1) FROM sessions WHERE peer_id = ? AND root_key != ''", peerID).Scan(&count)
+		if err == nil && count > 0 {
+			return true
+		}
+		// 2. Check if peer exists in profile_store (added contact)
+		err = corestore.DB.QueryRow("SELECT COUNT(1) FROM profile_store WHERE peer_id = ?", peerID).Scan(&count)
+		if err == nil && count > 0 {
+			return true
+		}
+		// 3. Check if peer exists in alias_store (resolved alias contact)
+		err = corestore.DB.QueryRow("SELECT COUNT(1) FROM alias_store WHERE peer_id = ?", peerID).Scan(&count)
+		if err == nil && count > 0 {
+			return true
+		}
+		return false
+	}
+
 	// 5. Setup Host Context & Relays
 	globalCtx, globalCancel = context.WithCancel(context.Background())
 
@@ -279,6 +343,7 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 	coreproto.SetupMailbox(host, isClientOnly)
 	coreproto.SetupPreKeyService(host)
 	coreproto.SetupAliasService(host)
+	coreproto.SetupProfileService(host)
 	coreproto.SetupClusterSync(globalCtx, host)
 
 	// Start the global sequential mailbox sync manager
@@ -402,26 +467,40 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 		},
 	})
 
-	// Start reconnection loops in background
+	// Start reconnection loops in background (grouped by Peer ID to avoid dial backoff race conditions)
 	go func() {
+		// Group seeds by Peer ID once
+		groupedSeeds := make(map[peer.ID][]multiaddr.Multiaddr)
+		for _, s := range DefaultSeeds {
+			ma, err := multiaddr.NewMultiaddr(s)
+			if err != nil {
+				continue
+			}
+			pinfo, err := peer.AddrInfoFromP2pAddr(ma)
+			if err != nil {
+				continue
+			}
+			groupedSeeds[pinfo.ID] = append(groupedSeeds[pinfo.ID], pinfo.Addrs...)
+		}
+
+		var seedsInfo []peer.AddrInfo
+		for id, addrs := range groupedSeeds {
+			seedsInfo = append(seedsInfo, peer.AddrInfo{
+				ID:    id,
+				Addrs: addrs,
+			})
+		}
+
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
 		for {
-			for _, s := range DefaultSeeds {
-				ma, err := multiaddr.NewMultiaddr(s)
-				if err != nil {
-					continue
-				}
-				pinfo, err := peer.AddrInfoFromP2pAddr(ma)
-				if err != nil {
-					continue
-				}
-				if pinfo.ID == host.ID() {
+			for _, pi := range seedsInfo {
+				if pi.ID == host.ID() {
 					continue
 				}
 
-				if host.Network().Connectedness(pinfo.ID) == network.Connected {
+				if host.Network().Connectedness(pi.ID) == network.Connected {
 					// Verify connection is actually alive by trying to open a stream.
 					// Stale QUIC connections will fail this check.
 					go func(pid peer.ID) {
@@ -434,20 +513,20 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 						} else {
 							str.Close()
 						}
-					}(pinfo.ID)
+					}(pi.ID)
 				} else {
 					// Clear dial backoff to allow immediate reconnection attempt.
 					if s, ok := host.Network().(*swarm.Swarm); ok {
-						s.Backoff().Clear(pinfo.ID)
+						s.Backoff().Clear(pi.ID)
 					}
-					logger.Debug().Str("peerID", pinfo.ID.String()).Msg("Attempting to reconnect to seed...")
-					go func(pi peer.AddrInfo) {
-						if errDial := host.Connect(globalCtx, pi); errDial != nil {
-							logger.Debug().Err(errDial).Str("peerID", pi.ID.String()).Msg("Reconnection failed")
+					logger.Debug().Str("peerID", pi.ID.String()).Msg("Attempting to reconnect to seed...")
+					go func(addrInfo peer.AddrInfo) {
+						if errDial := host.Connect(globalCtx, addrInfo); errDial != nil {
+							logger.Debug().Err(errDial).Str("peerID", addrInfo.ID.String()).Msg("Reconnection failed")
 						} else {
-							logger.Info().Str("peerID", pi.ID.String()).Msg("Successfully reconnected to seed node")
+							logger.Info().Str("peerID", addrInfo.ID.String()).Msg("Successfully reconnected to seed node")
 						}
-					}(*pinfo)
+					}(pi)
 				}
 			}
 
@@ -507,6 +586,34 @@ func SendDirectMessage(targetStr, contentStr *C.char) *C.char {
 	return C.CString("ok:" + msgID)
 }
 
+//export InitiateSession
+func InitiateSession(targetStr *C.char) *C.char {
+	target := C.GoString(targetStr)
+
+	if strings.HasPrefix(target, "@") {
+		resolved, err := coreproto.ResolveAlias(globalCtx, globalHost, target)
+		if err != nil {
+			return C.CString("Failed to resolve alias " + target + ": " + err.Error())
+		}
+		target = resolved
+	}
+
+	targetID, err := peer.Decode(target)
+	if err != nil {
+		return C.CString("Invalid peer ID: " + err.Error())
+	}
+
+	// Whitelist the peer ID in Connection Gater by saving a blank profile
+	_ = corestore.SavePeerProfile(targetID.String(), "", "", "", "")
+
+	err = coreproto.InitiateSession(globalCtx, globalHost, globalPriv, targetID)
+	if err != nil {
+		return C.CString("Failed to initiate session: " + err.Error())
+	}
+
+	return nil
+}
+
 //export SendReadReceipt
 func SendReadReceipt(targetStr, msgIDStr *C.char) *C.char {
 	target := C.GoString(targetStr)
@@ -531,6 +638,34 @@ func SendReadReceipt(targetStr, msgIDStr *C.char) *C.char {
 	}
 	return nil
 }
+
+//export ResetPeerSession
+func ResetPeerSession(peerIDStr *C.char) *C.char {
+	peerIDRaw := C.GoString(peerIDStr)
+	if globalHost == nil || peerIDRaw == "" {
+		return C.CString("Host not initialized")
+	}
+
+	if strings.HasPrefix(peerIDRaw, "@") {
+		resolved, err := coreproto.ResolveAlias(globalCtx, globalHost, peerIDRaw)
+		if err != nil {
+			return C.CString("Failed to resolve alias: " + err.Error())
+		}
+		peerIDRaw = resolved
+	}
+
+	peerID, err := peer.Decode(peerIDRaw)
+	if err != nil {
+		return C.CString("Invalid peer ID: " + err.Error())
+	}
+
+	err = coreproto.SendSessionReset(globalCtx, globalHost, peerID)
+	if err != nil {
+		return C.CString("Failed to send session reset: " + err.Error())
+	}
+	return nil
+}
+
 
 
 //export SendGroupChat
@@ -658,10 +793,24 @@ func StopNode() {
 		}()
 		globalHost = nil
 
+		atomic.StoreInt64(&globalPortID, 0)
+
 		eventQueue.Close()
 		// Replace with fresh queue for future restarts
 		eventQueue = NewQueue()
 	}
+}
+
+//export InitializeDartApi
+func InitializeDartApi(data unsafe.Pointer) C.int {
+	return C.int(C.Dart_InitializeApiDL(data))
+}
+
+//export RegisterPort
+func RegisterPort(portID C.int64_t) {
+	atomic.StoreInt64(&globalPortID, int64(portID))
+	logger.Info().Int64("portID", int64(portID)).Msg("Registered Dart Native Port ID in Go")
+	eventQueue.FlushPending(int64(portID))
 }
 
 //export GetNetworkStats
@@ -1244,6 +1393,14 @@ func GetPeerConnInfo(peerIDStr *C.char) *C.char {
 
 	conns := globalHost.Network().ConnsToPeer(peerID)
 	if len(conns) == 0 {
+		if act, found := coreproto.GetPeerActivity(peerIDRaw); found && time.Since(act.LastSeen) < 5*time.Second {
+			b, _ := json.Marshal(PeerConnInfoResult{
+				Type:     act.Type,
+				RelayVia: act.RelayVia,
+			})
+			return C.CString(string(b))
+		}
+
 		b, _ := json.Marshal(PeerConnInfoResult{Type: "offline"})
 		return C.CString(string(b))
 	}
@@ -1286,6 +1443,8 @@ func GetPeerConnInfo(peerIDStr *C.char) *C.char {
 		}
 	}
 
+	coreproto.UpdatePeerActivity(peerIDRaw, result.Type, result.RelayVia)
+
 	b, _ := json.Marshal(result)
 	return C.CString(string(b))
 }
@@ -1307,6 +1466,7 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 		if err != nil {
 			return C.CString("Failed to extract Peer info from multiaddress: " + err.Error())
 		}
+		corenet.AllowPeerExplicitly(pinfo.ID)
 
 		go func() {
 			globalHost.Peerstore().AddAddrs(pinfo.ID, pinfo.Addrs, 5*time.Minute)
@@ -1334,6 +1494,18 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 		return C.CString("Invalid Peer ID: " + err.Error())
 	}
 
+	// Ensure default seed addresses are in the peerstore if we are connecting to a seed node
+	for _, s := range DefaultSeeds {
+		ma, err := multiaddr.NewMultiaddr(s)
+		if err == nil {
+			pinfo, err := peer.AddrInfoFromP2pAddr(ma)
+			if err == nil && pinfo.ID == peerID {
+				globalHost.Peerstore().AddAddrs(pinfo.ID, pinfo.Addrs, 1*time.Hour)
+			}
+		}
+	}
+	corenet.AllowPeerExplicitly(peerID)
+
 	// Run dial in the background so we don't block the UI
 	go func() {
 		// Pre-fetch mailbox coordinates in the background as preflight
@@ -1342,18 +1514,22 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 		connected := false
 		
 		// 1. Try to connect using cached addresses first if we have them
-		if len(globalHost.Peerstore().Addrs(peerID)) > 0 {
-			logger.Debug().Str("target", peerID.String()).Msg("ConnectPeer: Trying cached addresses first...")
+		cachedAddrs := globalHost.Peerstore().Addrs(peerID)
+		logger.Info().Str("target", peerID.String()).Int("cached_count", len(cachedAddrs)).Msg("ConnectPeer: Checked cached addresses")
+		if len(cachedAddrs) > 0 {
+			logger.Info().Str("target", peerID.String()).Msg("ConnectPeer: Trying cached addresses first...")
 			dialCtx, cancel := context.WithTimeout(globalCtx, 3*time.Second)
 			pinfo := peer.AddrInfo{
 				ID:    peerID,
-				Addrs: globalHost.Peerstore().Addrs(peerID),
+				Addrs: cachedAddrs,
 			}
 			err := globalHost.Connect(dialCtx, pinfo)
 			cancel()
 			if err == nil {
 				connected = true
 				logger.Info().Str("target", peerID.String()).Msg("ConnectPeer: Connected via cached addresses!")
+			} else {
+				logger.Warn().Err(err).Str("target", peerID.String()).Msg("ConnectPeer: Dial with cached addresses failed")
 			}
 		}
 
@@ -1510,6 +1686,158 @@ func extractHostFromMultiaddr(ma multiaddr.Multiaddr) (string, bool) {
 		return host, true
 	}
 	return "", false
+}
+
+//export SetLocalProfile
+func SetLocalProfile(displayNameVal, avatarCIDVal, avatarKeyVal *C.char) {
+	if globalHost == nil {
+		return
+	}
+	displayName := C.GoString(displayNameVal)
+	avatarCID := C.GoString(avatarCIDVal)
+	avatarKey := C.GoString(avatarKeyVal)
+
+	coreproto.SetLocalProfileInfo(displayName, avatarCID, avatarKey)
+
+	// Save our own profile to the database under our peerID
+	myPeerID := globalHost.ID().String()
+	_, _, _, existingPath, _ := corestore.GetPeerProfile(myPeerID)
+	// If existingPath is empty but the file exists, set it
+	if existingPath == "" {
+		profilesDir := filepath.Join(corestore.DataDir, "profiles")
+		checkPath := filepath.Join(profilesDir, myPeerID+".jpg")
+		if _, err := os.Stat(checkPath); err == nil {
+			existingPath = checkPath
+		}
+	}
+	_ = corestore.SavePeerProfile(myPeerID, displayName, avatarCID, avatarKey, existingPath)
+
+	// Publish our new profile metadata to the DHT
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := coreproto.PublishProfile(ctx, globalHost, displayName, avatarCID)
+		if err != nil {
+			logger.Warn().Err(err).Msg("FFI: Failed to publish local profile update to DHT")
+		}
+	}()
+
+	// Broadcast profile update to all peers with active E2EE sessions
+	go func() {
+		if corestore.DB == nil {
+			return
+		}
+		rows, err := corestore.DB.Query("SELECT peer_id FROM sessions")
+		if err != nil {
+			return
+		}
+		defer rows.Close()
+
+		var targets []string
+		for rows.Next() {
+			var pid string
+			if err := rows.Scan(&pid); err == nil && pid != "" {
+				targets = append(targets, pid)
+			}
+		}
+
+		if len(targets) > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			coreproto.BroadcastProfileUpdate(ctx, globalHost, targets, displayName, avatarCID, avatarKey)
+		}
+	}()
+}
+
+//export GetPeerProfile
+func GetPeerProfile(peerIDVal *C.char) *C.char {
+	peerID := C.GoString(peerIDVal)
+	displayName, avatarCID, avatarKey, localPath, err := corestore.GetPeerProfile(peerID)
+	if err != nil {
+		return C.CString("{}")
+	}
+
+	result := struct {
+		DisplayName string `json:"display_name"`
+		AvatarCID   string `json:"avatar_cid"`
+		AvatarKey   string `json:"avatar_key"`
+		LocalPath   string `json:"local_path"`
+	}{
+		DisplayName: displayName,
+		AvatarCID:   avatarCID,
+		AvatarKey:   avatarKey,
+		LocalPath:   localPath,
+	}
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		return C.CString("{}")
+	}
+	return C.CString(string(data))
+}
+
+//export ResolveOfflineProfile
+func ResolveOfflineProfile(peerIDVal *C.char) {
+	if globalHost == nil {
+		return
+	}
+	peerID := C.GoString(peerIDVal)
+	pid, err := peer.Decode(peerID)
+	if err == nil {
+		corenet.AllowPeerExplicitly(pid)
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		name, _, err := coreproto.ResolveProfile(ctx, globalHost, peerID)
+		if err == nil {
+			logger.Info().Str("peerID", peerID).Str("name", name).Msg("FFI: Resolved profile from DHT successfully")
+			// Notify Dart UI
+			event := map[string]string{
+				"type":   "profile_updated",
+				"sender": peerID,
+			}
+			data, _ := json.Marshal(event)
+			eventQueue.Push(string(data))
+		} else {
+			logger.Warn().Err(err).Str("peerID", peerID).Msg("FFI: Failed to resolve profile from DHT")
+		}
+	}()
+}
+
+//export SendProfileKeyShare
+func SendProfileKeyShare(peerIDVal *C.char) *C.char {
+	if globalHost == nil {
+		return C.CString("Node not running")
+	}
+	peerID := C.GoString(peerIDVal)
+	pid, err := peer.Decode(peerID)
+	if err != nil {
+		return C.CString("Invalid peer ID: " + err.Error())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = coreproto.SendProfileKeyShare(ctx, globalHost, pid)
+	if err != nil {
+		return C.CString(err.Error())
+	}
+	return nil
+}
+
+//export BroadcastProfileUpdate
+func BroadcastProfileUpdate(targetsCSV, displayNameVal, avatarCIDVal, avatarKeyVal *C.char) {
+	if globalHost == nil {
+		return
+	}
+	targets := strings.Split(C.GoString(targetsCSV), ",")
+	displayName := C.GoString(displayNameVal)
+	avatarCID := C.GoString(avatarCIDVal)
+	avatarKey := C.GoString(avatarKeyVal)
+
+	ctx := context.Background()
+	coreproto.BroadcastProfileUpdate(ctx, globalHost, targets, displayName, avatarCID, avatarKey)
 }
 
 func main() {

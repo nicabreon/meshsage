@@ -98,6 +98,7 @@ func InitNode(port C.int, dataDir *C.char) *C.char {
 	coreproto.SetupMessaging(h)
 	coreproto.SetupMailbox(h, true)
 	coreproto.SetupAliasService(h)
+	coreproto.SetupProfileService(h)
 	_ = corenet.SetupDiscovery(ctx, h)
 
 	nodeInstance = &Node{host: h, ctx: ctx, priv: priv}

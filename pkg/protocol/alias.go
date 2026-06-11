@@ -233,6 +233,9 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 		go func(peerID peer.ID) {
 			defer wg.Done()
 
+			corenet.AllowPeerExplicitly(peerID)
+			defer corenet.RemoveExplicitPeer(peerID)
+
 			dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
 
@@ -322,6 +325,9 @@ func ResolveAlias(ctx context.Context, h host.Host, alias string) (string, error
 		wg.Add(1)
 		go func(peerID peer.ID) {
 			defer wg.Done()
+
+			corenet.AllowPeerExplicitly(peerID)
+			defer corenet.RemoveExplicitPeer(peerID)
 
 			dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()

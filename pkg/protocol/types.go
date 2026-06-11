@@ -19,6 +19,8 @@ const (
 	MsgTypeFile         = "file"
 	MsgTypeGroup        = "group"
 	MsgTypeHandshakeAck = "hshk_ack" // Silent bidirectional handshake confirmation (never shown to user)
+	MsgTypeProfileKeyShare = "profile_key_share"
+	MsgTypeProfileUpdate   = "profile_update"
 
 	StatusDelivered = "delivered"
 	StatusRead      = "read"

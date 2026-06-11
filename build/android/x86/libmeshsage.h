@@ -23,7 +23,20 @@ extern const char *_GoStringPtr(_GoString_ s);
 
 #line 3 "main.go"
 
+
 #include <stdlib.h>
+#include "dart_api_dl.h"
+
+// Helper function to post string messages via Dart_PostCObject_DL
+static bool post_string_to_dart(int64_t port_id, const char* str) {
+    if (Dart_PostCObject_DL == NULL) {
+        return false;
+    }
+    Dart_CObject obj;
+    obj.type = Dart_CObject_kString;
+    obj.value.as_string = str;
+    return Dart_PostCObject_DL(port_id, &obj);
+}
 
 #line 1 "cgo-generated-wrapper"
 
@@ -89,7 +102,9 @@ extern "C" {
 
 extern char* StartNode(char* dbPathStr, char* idPathStr, int port, int isClientOnlyVal, int enableRelayVal);
 extern char* SendDirectMessage(char* targetStr, char* contentStr);
+extern char* InitiateSession(char* targetStr);
 extern char* SendReadReceipt(char* targetStr, char* msgIDStr);
+extern char* ResetPeerSession(char* peerIDStr);
 extern char* SendGroupChat(char* groupIDStr, char* contentStr);
 extern char* JoinGroup(char* groupIDStr, char* membersStr);
 extern char* CreateGroup(char* membersStr);
@@ -100,6 +115,8 @@ extern char* GetLocalPeerID(void);
 extern char* PollEvent(void);
 extern void FreeString(char* ptr);
 extern void StopNode(void);
+extern int InitializeDartApi(void* data);
+extern void RegisterPort(int64_t portID);
 extern char* GetNetworkStats(void);
 extern char* CreateGroupProper(char* aliasStr, char* groupTypeStr, char* membersStr);
 extern char* JoinGroupProper(char* aliasStr);
@@ -116,6 +133,11 @@ extern char* GetPeerConnInfo(char* peerIDStr);
 extern char* ConnectPeer(char* peerIDStr);
 extern char* GetSeedNodes(void);
 extern char* GetIceServers(void);
+extern void SetLocalProfile(char* displayNameVal, char* avatarCIDVal, char* avatarKeyVal);
+extern char* GetPeerProfile(char* peerIDVal);
+extern void ResolveOfflineProfile(char* peerIDVal);
+extern char* SendProfileKeyShare(char* peerIDVal);
+extern void BroadcastProfileUpdate(char* targetsCSV, char* displayNameVal, char* avatarCIDVal, char* avatarKeyVal);
 
 #ifdef __cplusplus
 }

@@ -129,6 +129,16 @@ func main() {
 		logger.Fatal().Err(err).Msg("Failed to initialize database")
 	}
 
+	// Inject database check callback to networking package to break import cycle
+	corenet.HasActiveSessionFn = func(peerID string) bool {
+		var count int
+		err := corestore.DB.QueryRow("SELECT COUNT(1) FROM sessions WHERE peer_id = ? AND root_key != ''", peerID).Scan(&count)
+		if err != nil {
+			return false
+		}
+		return count > 0
+	}
+
 	// 3. Global State Initialization
 	corenet.IsDedicated = *isDedicated
 	corenet.IsClientOnly = *isClientOnly
@@ -148,6 +158,7 @@ func main() {
 	coreproto.SetupMailbox(host, *isClientOnly)
 	coreproto.SetupPreKeyService(host)
 	coreproto.SetupAliasService(host)
+	coreproto.SetupProfileService(host)
 	coreproto.SetupClusterSync(ctx, host)
 
 	// Start the global sequential mailbox sync manager
@@ -240,32 +251,45 @@ func main() {
 		},
 	})
 
-	// Start the Aggressive Reconnection Loop
+	// Start the Aggressive Reconnection Loop (grouped by Peer ID to avoid dial backoff race conditions)
 	go func() {
 		seeds := DefaultSeeds
 		if *targetPeer != "" {
 			seeds = []string{*targetPeer}
 		}
 
+		// Group seeds by Peer ID once
+		groupedSeeds := make(map[peer.ID][]multiaddr.Multiaddr)
+		for _, s := range seeds {
+			ma, err := multiaddr.NewMultiaddr(s)
+			if err != nil {
+				continue
+			}
+			pinfo, err := peer.AddrInfoFromP2pAddr(ma)
+			if err != nil {
+				continue
+			}
+			groupedSeeds[pinfo.ID] = append(groupedSeeds[pinfo.ID], pinfo.Addrs...)
+		}
+
+		var seedsInfo []peer.AddrInfo
+		for id, addrs := range groupedSeeds {
+			seedsInfo = append(seedsInfo, peer.AddrInfo{
+				ID:    id,
+				Addrs: addrs,
+			})
+		}
+
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
 		for {
-			for _, s := range seeds {
-				ma, err := multiaddr.NewMultiaddr(s)
-				if err != nil {
-					continue
-				}
-				pinfo, err := peer.AddrInfoFromP2pAddr(ma)
-				if err != nil {
+			for _, pi := range seedsInfo {
+				if pi.ID == host.ID() {
 					continue
 				}
 
-				if pinfo.ID == host.ID() {
-					continue
-				}
-
-				if host.Network().Connectedness(pinfo.ID) == network.Connected {
+				if host.Network().Connectedness(pi.ID) == network.Connected {
 					// Verify connection is actually alive by trying to open a stream.
 					// Stale QUIC connections will fail this check.
 					go func(pid peer.ID) {
@@ -278,20 +302,20 @@ func main() {
 						} else {
 							str.Close()
 						}
-					}(pinfo.ID)
+					}(pi.ID)
 				} else {
 					// Clear dial backoff to allow immediate reconnection attempt.
 					if s, ok := host.Network().(*swarm.Swarm); ok {
-						s.Backoff().Clear(pinfo.ID)
+						s.Backoff().Clear(pi.ID)
 					}
-					logger.Debug().Str("peerID", pinfo.ID.String()).Msg("Attempting to reconnect to seed...")
-					go func(pi peer.AddrInfo) {
-						if err := host.Connect(ctx, pi); err != nil {
-							logger.Debug().Err(err).Str("peerID", pi.ID.String()).Msg("Reconnection failed")
+					logger.Debug().Str("peerID", pi.ID.String()).Msg("Attempting to reconnect to seed...")
+					go func(addrInfo peer.AddrInfo) {
+						if err := host.Connect(ctx, addrInfo); err != nil {
+							logger.Debug().Err(err).Str("peerID", addrInfo.ID.String()).Msg("Reconnection failed")
 						} else {
-							logger.Info().Str("peerID", pi.ID.String()).Msg("Successfully reconnected to seed node")
+							logger.Info().Str("peerID", addrInfo.ID.String()).Msg("Successfully reconnected to seed node")
 						}
-					}(*pinfo)
+					}(pi)
 				}
 			}
 

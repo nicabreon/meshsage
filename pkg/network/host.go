@@ -249,12 +249,16 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 		portStr = parts[4]
 	}
 
+	gater := NewRestrictedConnectionGater(cfg.StaticRelays)
+
 	opts := []libp2p.Option{
 		// 1. Identity
 		libp2p.Identity(cfg.PrivateKey),
 		// 2. Connection Management & Resource Limits
 		libp2p.ConnectionManager(cm),
 		libp2p.ResourceManager(rm),
+		// 2.1 Connection Gater to enforce client-only network whitelist
+		libp2p.ConnectionGater(gater),
 		// 3. Listen Addresses — dual transport: QUIC + WebRTC Direct
 		//    QUIC: configured port (UDP)
 		//    WebRTC Direct: port 0 (kernel assigns random UDP port)
@@ -296,8 +300,8 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	// DCUtR Hole Punching: relay-based, safe on Android — always enabled
 	opts = append(opts, libp2p.EnableHolePunching())
 
-	// Conditionally enable Relay Client functionality
-	if cfg.EnableRelay {
+	// Conditionally enable Relay Client functionality (never enabled for Dedicated Relay)
+	if cfg.EnableRelay && !cfg.IsDedicated {
 		opts = append(opts, libp2p.EnableRelay())
 	}
 
@@ -326,8 +330,8 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 		opts = append(opts, libp2p.ForceReachabilityPrivate())
 	}
 
-	// Tambahkan AutoRelay dengan sumber dinamis jika relay diaktifkan
-	if cfg.EnableRelay && cfg.RelaySource != nil {
+	// Tambahkan AutoRelay dengan sumber dinamis jika relay diaktifkan (tidak untuk Dedicated Relay)
+	if cfg.EnableRelay && cfg.RelaySource != nil && !cfg.IsDedicated {
 		peerSource := func(ctx context.Context, num int) <-chan peer.AddrInfo {
 			return cfg.RelaySource
 		}
@@ -350,6 +354,8 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
+
+	gater.Start(h)
 
 	// Explicitly add private key to Peerstore to guarantee h.Peerstore().PrivKey(h.ID()) is never nil
 	if cfg.PrivateKey != nil {
@@ -534,10 +540,12 @@ func filterAddrsWithSTUN(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 	for _, addr := range addrs {
 		addrStr := addr.String()
 
-		// Selalu pertahankan circuit relay dan p2p-webrtc-star
+		// Selalu pertahankan circuit relay dan p2p-webrtc-star (kecuali jika Dedicated Relay)
 		if strings.Contains(addrStr, "/p2p-circuit") ||
 			strings.Contains(addrStr, "/p2p-webrtc-star") {
-			filtered = append(filtered, addr)
+			if !IsDedicated {
+				filtered = append(filtered, addr)
+			}
 			continue
 		}
 
@@ -600,7 +608,13 @@ func filterAddrsWithSTUN(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 	// PENTING: Jangan fallback ke loopback jika tidak ada yang lolos filter.
 	// Konektivitas tetap terjaga via relay (p2p-circuit) yang dikelola AutoRelay.
 	if len(filtered) == 0 {
-		logger.Warn().Msg("AddrsFactory: no reachable addresses found. Peers will connect via relay only.")
+		var checkedStr []string
+		for _, addr := range addrs {
+			checkedStr = append(checkedStr, addr.String())
+		}
+		logger.Warn().
+			Interface("checked_addrs", checkedStr).
+			Msg("AddrsFactory: no reachable addresses found. Peers will connect via relay only.")
 	}
 	return filtered
 
@@ -686,4 +700,32 @@ func extractIP(addr multiaddr.Multiaddr) net.IP {
 	})
 	return ip
 }
+
+// HasPublicAddr mengecek apakah slice multiaddr mengandung alamat IP publik eksternal yang valid
+func HasPublicAddr(addrs []multiaddr.Multiaddr) bool {
+	for _, addr := range addrs {
+		addrStr := addr.String()
+		if strings.Contains(addrStr, "/p2p-circuit") {
+			continue
+		}
+		ip := extractIP(addr)
+		if ip == nil {
+			// Jika alamat berbasis DNS (seperti /dns4/example.com), anggap publik kecuali localhost/.local
+			if strings.Contains(addrStr, "/dns") && 
+				!strings.Contains(addrStr, "localhost") && 
+				!strings.Contains(addrStr, ".local") {
+				return true
+			}
+			continue
+		}
+		if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			continue
+		}
+		if !isPrivateIP(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 
