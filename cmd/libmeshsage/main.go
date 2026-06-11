@@ -379,6 +379,19 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 		}
 	}
 
+	// Hook the subscription status callback to forward push notification status to Flutter
+	coreproto.SubscriptionStatusCallback = func(event coreproto.SubscriptionStatusEvent) {
+		data, err := json.Marshal(map[string]interface{}{
+			"type":     "push_subscription_status",
+			"relay_id": event.RelayID,
+			"active":   event.Active,
+		})
+		if err == nil {
+			eventQueue.Push(string(data))
+		}
+	}
+
+
 	// Background group restoration on startup once connected to at least one peer
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)

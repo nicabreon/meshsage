@@ -40,6 +40,16 @@ var MessageCallback func(event MessageEvent)
 // StatusCallback is a global hook invoked when a delivery status update is received
 var StatusCallback func(event StatusEvent)
 
+// SubscriptionStatusEvent represents a change in mailbox notification subscription status
+type SubscriptionStatusEvent struct {
+	RelayID string `json:"relay_id"`
+	Active  bool   `json:"active"`
+}
+
+// SubscriptionStatusCallback is a global hook invoked when push notification subscription status changes
+var SubscriptionStatusCallback func(event SubscriptionStatusEvent)
+
+
 // FormatSender returns a human-friendly sender label:
 //   - "@alias" if the peer has a known alias registered locally
 //   - "...abc12345" (short) if no alias is registered

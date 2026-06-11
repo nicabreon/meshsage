@@ -80,12 +80,31 @@ func StartMailboxSync(ctx context.Context, h host.Host, relayID peer.ID, privKey
 
 			if subscribed {
 				backoff = 15 * time.Second // Reset backoff on success
+				if SubscriptionStatusCallback != nil {
+					SubscriptionStatusCallback(SubscriptionStatusEvent{
+						RelayID: relayID.String(),
+						Active:  true,
+					})
+				}
 				// Successfully subscribed — wait until lost or ctx cancelled.
 				select {
 				case <-ctx.Done():
 					return
 				case <-statusChan:
 					// Lost subscription, will retry after backoff below.
+					if SubscriptionStatusCallback != nil {
+						SubscriptionStatusCallback(SubscriptionStatusEvent{
+							RelayID: relayID.String(),
+							Active:  false,
+						})
+					}
+				}
+			} else {
+				if SubscriptionStatusCallback != nil {
+					SubscriptionStatusCallback(SubscriptionStatusEvent{
+						RelayID: relayID.String(),
+						Active:  false,
+					})
 				}
 			}
 
