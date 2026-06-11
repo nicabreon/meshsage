@@ -30,3 +30,17 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Compiled project binaries (use GitHub Releases for distribution)
+meshsage
+meshsage.apk
+node
+p2p-node
+p2p-node-relay
+libmeshsage
+
+# Local runtime data
+.data/
+*.db
+*.db-shm
+*.db-wal

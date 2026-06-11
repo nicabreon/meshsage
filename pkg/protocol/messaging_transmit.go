@@ -1,0 +1,562 @@
+package protocol
+
+import (
+	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
+	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
+	"github.com/nicabreon/meshsage/pkg/logger"
+	corestore "github.com/nicabreon/meshsage/pkg/storage"
+)
+
+var (
+	customDialTimeouts sync.Map // map[string]time.Duration
+	customDialRTTs     sync.Map // map[string]time.Duration
+)
+
+func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target peer.ID, msg string) (string, error) {
+	msg = strings.TrimSuffix(msg, "\n")
+	msgID := fmt.Sprintf("%x", sha256.Sum256([]byte(msg+time.Now().String())))[:8]
+	dataToSign := []byte(msg + msgID)
+	sigBytes, _ := priv.Sign(dataToSign)
+	sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
+
+	senderAlias, _ := corestore.FindAliasByPeerID(h.ID().String())
+
+	env := MessageEnvelope{
+		ID:        msgID,
+		Type:      MsgTypeText,
+		Content:   msg,
+		Timestamp: time.Now().UnixNano(),
+		Sender:    senderAlias,
+		Signature: sigB64,
+	}
+
+	// Simpan pesan ke sent-message buffer per-peer.
+	// Jika receiver mengalami masalah sesi dan mengirim REQUEST_X3DH,
+	// pesan ini akan di-kirim ulang setelah X3DH baru selesai.
+	trackSentMessage(target.String(), env)
+
+	return msgID, sendSecureEnvelope(ctx, h, priv, target, env)
+}
+
+func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID, jsonPayload []byte) (string, error) {
+	startPrep := time.Now()
+	defer func() {
+		logger.Info().Str("target", targetID.String()).Dur("elapsed", time.Since(startPrep)).Msg("LOG_STEP: prepareSecureEnvelope completed")
+	}()
+
+	// BUG-03: Lock per-peer agar tidak ada race condition pada session state
+	sessionMu := getSessionLock(targetID.String())
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
+	// 1. Cek apakah sudah punya sesi aktif (Session Cache)
+	remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, err := corestore.LoadSession(targetID.String())
+	if err == nil && rootB64 != "" {
+		// Sesi Aktif Ditemukan!
+		rootKey, _ := base64.StdEncoding.DecodeString(rootB64)
+		sendChain, _ := base64.StdEncoding.DecodeString(sendB64)
+		recvChain, _ := base64.StdEncoding.DecodeString(recvB64)
+		remoteRatchetPub, _ := base64.StdEncoding.DecodeString(remoteRatchetB64)
+		localRatchetPriv, _ := base64.StdEncoding.DecodeString(localRatchetPrivB64)
+		localRatchetPub, _ := base64.StdEncoding.DecodeString(localRatchetPubB64)
+
+		if len(sendChain) == 0 {
+			sendChain = rootKey
+		}
+
+		session := &corecrypto.SessionState{
+			PeerID:              targetID.String(),
+			RemoteIdentityKey:   []byte(remoteIdentityB64),
+			RootKey:             rootKey,
+			SendChainKey:        sendChain,
+			RecvChainKey:        recvChain,
+			RemoteRatchetPubkey: remoteRatchetPub,
+			LocalRatchetPrivkey: localRatchetPriv,
+			LocalRatchetPubkey:  localRatchetPub,
+			N:                   n,
+			M:                   m,
+			PN:                  pn,
+		}
+
+		ciphertext, err := session.EncryptWithRatchet(string(jsonPayload))
+		if err == nil {
+			// Save updated state
+			corestore.SaveSession(targetID.String(), remoteIdentityB64,
+				base64.StdEncoding.EncodeToString(session.RootKey),
+				base64.StdEncoding.EncodeToString(session.SendChainKey),
+				base64.StdEncoding.EncodeToString(session.RecvChainKey),
+				base64.StdEncoding.EncodeToString(session.RemoteRatchetPubkey),
+				base64.StdEncoding.EncodeToString(session.LocalRatchetPrivkey),
+				base64.StdEncoding.EncodeToString(session.LocalRatchetPubkey),
+				session.N, session.M, session.PN)
+
+			finalWireEnvelope := fmt.Sprintf("DR:%s", base64.StdEncoding.EncodeToString([]byte(ciphertext)))
+			return finalWireEnvelope, nil
+		}
+	}
+
+	// 2. Jika tidak ada sesi, lakukan alur X3DH
+	var keyID, pubKeyB64 string
+	preKeyFound := false
+	connectedPeers := h.Network().Peers()
+	logger.Info().
+		Str("target", targetID.String()).
+		Int("peers", len(connectedPeers)).
+		Msg("No session found. Initiating X3DH Handshake flow")
+
+	for _, relayPeer := range connectedPeers {
+		// Optimization: Check if peer supports the pre-key protocol before attempting to dial
+		protos, err := h.Peerstore().GetProtocols(relayPeer)
+		if err != nil {
+			continue
+		}
+		supportsPreKey := false
+		for _, proto := range protos {
+			if string(proto) == PreKeyProtocolID {
+				supportsPreKey = true
+				break
+			}
+		}
+		if !supportsPreKey {
+			continue
+		}
+
+		logger.Info().Str("target", targetID.String()).Str("relay", relayPeer.String()).Msg("LOG_STEP: X3DH HANDSHAKE: Fetching Pre-Key starting...")
+		startFetch := time.Now()
+		id, pub, _, err := FetchPreKey(ctx, h, relayPeer, targetID.String())
+		logger.Info().Str("target", targetID.String()).Str("relay", relayPeer.String()).Dur("elapsed", time.Since(startFetch)).Err(err).Msg("LOG_STEP: X3DH HANDSHAKE: FetchPreKey finished")
+		if err == nil && pub != "" {
+			keyID = id
+			pubKeyB64 = pub
+			preKeyFound = true
+			logger.Info().Str("target", targetID.String()).Str("relay", relayPeer.String()).Msg("X3DH SUCCESS: Pre-Key found")
+			break
+		}
+		logger.Debug().
+			Err(err).
+			Str("target", targetID.String()).
+			Str("relay", relayPeer.String()).
+			Msg("X3DH: FetchPreKey failed from this peer (not a relay, or no key available)")
+	}
+	if !preKeyFound {
+		logger.Warn().
+			Str("target", targetID.String()).
+			Int("peers_tried", len(connectedPeers)).
+			Msg("X3DH FAILED: no pre-key found for target on any connected peer")
+		return "", fmt.Errorf("no pre-key found")
+	}
+
+	logger.Debug().Msg("X3DH HANDSHAKE: Generating Ephemeral Keypair & Deriving Shared Secret")
+	ePriv, ePub, err := corecrypto.GenerateEphemeralKeypair()
+	if err != nil {
+		return "", err
+	}
+
+	peerPubKeyBytes, _ := base64.StdEncoding.DecodeString(pubKeyB64)
+	aesKey, err := corecrypto.DeriveSharedSecret(ePriv, peerPubKeyBytes)
+	if err != nil {
+		return "", err
+	}
+
+	// Inisialisasi Double Ratchet: Generate ratchet keypair lokal
+	localRatchetPriv, localRatchetPub, err := corecrypto.GenerateEphemeralKeypair()
+	if err != nil {
+		return "", err
+	}
+
+	// Lakukan DH Send Step awal menggunakan localRatchetPriv dan pubKeyB64 (Pre-key Bob)
+	sharedSecret, err := corecrypto.DeriveSharedSecret(localRatchetPriv, peerPubKeyBytes)
+	if err != nil {
+		return "", err
+	}
+	res, err := corecrypto.HKDFExpand(sharedSecret, "p2p-core-dh-ratchet", 64)
+	if err != nil {
+		return "", err
+	}
+
+	initRootKey := res[:32]
+	initSendChainKey := res[32:]
+
+	senderRootKeyB64 := base64.StdEncoding.EncodeToString(initRootKey)
+	senderSendChainB64 := base64.StdEncoding.EncodeToString(initSendChainKey)
+	senderRatchetPrivB64 := base64.StdEncoding.EncodeToString(localRatchetPriv)
+	senderRatchetPubB64Out := base64.StdEncoding.EncodeToString(localRatchetPub)
+
+	logger.Info().Str("peerID", FormatPeerID(targetID.String())).Str("rootKey", senderRootKeyB64[:6]).Msg("X3DH HANDSHAKE: Saving Initial Session with Ratchet Keys")
+	TrackHandshake() // Track X3DH handshake
+	// BUG-1 FIX: Sender side — clear stale skipped keys before establishing new session.
+	if clearErr := corestore.ClearSkippedKeys(targetID.String()); clearErr != nil {
+		logger.Warn().Err(clearErr).Str("targetID", targetID.String()).Msg("X3DH SEND: Failed to clear stale skipped keys")
+	} else {
+		logger.Debug().Str("targetID", targetID.String()).Msg("X3DH SEND: Cleared stale skipped keys for new session")
+	}
+	// Simpan session dengan SendChainKey terisi, RecvChainKey kosong, dan RemoteRatchetPubkey = pubKeyB64
+	corestore.SaveSession(targetID.String(), pubKeyB64, senderRootKeyB64, senderSendChainB64, "", pubKeyB64, senderRatchetPrivB64, senderRatchetPubB64Out, 0, 0, 0)
+
+	// Sertakan localRatchetPub di dalam payload agar receiver bisa init RecvChainKey
+	ePubB64 := base64.StdEncoding.EncodeToString(ePub)
+	encryptedBytes, err := corecrypto.EncryptMessageRaw(aesKey, jsonPayload)
+	if err != nil {
+		return "", err
+	}
+
+	// Format: X3DH:keyID:ePub:senderRatchetPub:encryptedPayload
+	finalWireEnvelope := fmt.Sprintf("X3DH:%s:%s:%s:%s", keyID, ePubB64, senderRatchetPubB64Out, base64.StdEncoding.EncodeToString(encryptedBytes))
+	return finalWireEnvelope, nil
+}
+
+func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID, env MessageEnvelope) error {
+	jsonPayload, _ := json.Marshal(env)
+	finalWireEnvelope, err := prepareSecureEnvelope(ctx, h, priv, targetID, jsonPayload)
+	if err != nil {
+		return err
+	}
+	return transmitEnvelope(ctx, h, targetID, finalWireEnvelope)
+}
+
+// getRelayRTT returns the minimum stream dial RTT to any currently connected dedicated relay.
+// If no dedicated relay is connected or measured, it returns 0.
+func getRelayRTT(h host.Host) time.Duration {
+	if h == nil {
+		return 0
+	}
+	var bestRTT time.Duration = 0
+	for _, p := range h.Network().Peers() {
+		// Verify if peer is a dedicated relay
+		protos, err := h.Peerstore().GetProtocols(p)
+		if err != nil {
+			continue
+		}
+		isDedicated := false
+		for _, proto := range protos {
+			if string(proto) == "/p2p-core/infra/dedicated/1.1.0" {
+				isDedicated = true
+				break
+			}
+		}
+		if isDedicated {
+			if val, ok := customDialRTTs.Load(p.String()); ok {
+				if rtt, ok := val.(time.Duration); ok {
+					if bestRTT == 0 || rtt < bestRTT {
+						bestRTT = rtt
+					}
+				}
+			}
+		}
+	}
+	return bestRTT
+}
+
+// MeasureAndRecordDialTimeout measures stream creation latency to a newly connected peer
+// and saves a custom adaptive dial timeout for it.
+func MeasureAndRecordDialTimeout(ctx context.Context, h host.Host, target peer.ID) {
+	go func() {
+		// Wait a moment for connection handshakes (QUIC/TCP, security, muxer) to settle down.
+		time.Sleep(1 * time.Second)
+
+		logger.Info().Str("target", target.String()).Msg("LOG_STEP: MeasureAndRecordDialTimeout: Initiating test stream to measure latency...")
+		start := time.Now()
+		dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		s, err := h.NewStream(dialCtx, target, "/ipfs/ping/1.0.0")
+		cancel()
+
+		if err == nil {
+			elapsed := time.Since(start)
+			s.Close()
+
+			customDialRTTs.Store(target.String(), elapsed)
+
+			// Calculate adaptive timeout: 3 * elapsed + 1 second buffer (longer buffer to handle spikes or relay routes)
+			timeout := 3*elapsed + 1*time.Second
+			if timeout < 500*time.Millisecond {
+				timeout = 500 * time.Millisecond
+			}
+			if timeout > 3*time.Second {
+				timeout = 3 * time.Second
+			}
+
+			customDialTimeouts.Store(target.String(), timeout)
+			logger.Info().
+				Str("target", target.String()).
+				Dur("stream_dial_rtt", elapsed).
+				Dur("dial_timeout", timeout).
+				Msg("LOG_STEP: MeasureAndRecordDialTimeout: Successfully measured stream creation time and saved custom dial timeout")
+		} else {
+			logger.Warn().
+				Str("target", target.String()).
+				Err(err).
+				Msg("LOG_STEP: MeasureAndRecordDialTimeout: Failed to open test stream to measure latency")
+		}
+	}()
+}
+
+func getPeerDialTimeout(ctx context.Context, h host.Host, target peer.ID) time.Duration {
+	// Establish maximum timeout limit. Hard cap is 3 seconds.
+	maxLimit := 3 * time.Second
+
+	// If we are connected to a dedicated relay, scale maxLimit dynamically based on the relay's RTT.
+	// Since relay routing takes at least 1 relay RTT (plus stream negotiation/handshakes),
+	// we scale the limit to 3 * relayRTT + 500ms.
+	if relayRTT := getRelayRTT(h); relayRTT > 0 {
+		adaptiveLimit := 3*relayRTT + 500*time.Millisecond
+		if adaptiveLimit < maxLimit {
+			maxLimit = adaptiveLimit
+			// Ensure a floor of 1.0 second so we don't time out too aggressively under normal jitter
+			if maxLimit < 1*time.Second {
+				maxLimit = 1 * time.Second
+			}
+		}
+	}
+
+	// First, check if we have a measured custom dial timeout
+	if val, ok := customDialTimeouts.Load(target.String()); ok {
+		if timeout, ok := val.(time.Duration); ok {
+			if timeout > maxLimit {
+				timeout = maxLimit
+			}
+			logger.Debug().
+				Str("target", target.String()).
+				Dur("dial_timeout", timeout).
+				Dur("max_limit", maxLimit).
+				Msg("LOG_STEP: getPeerDialTimeout: Using custom recorded dial timeout (capped by limit)")
+			return timeout
+		}
+	}
+
+	// Retrieve EWMA latency from Peerstore
+	ewma := h.Peerstore().LatencyEWMA(target)
+	if ewma > 0 {
+		// Calculate adaptive timeout: 4x RTT + 500ms safety buffer
+		timeout := 4*ewma + 500*time.Millisecond
+		// Bound it between 300ms and maxLimit
+		if timeout < 300*time.Millisecond {
+			timeout = 300 * time.Millisecond
+		}
+		if timeout > maxLimit {
+			timeout = maxLimit
+		}
+		logger.Debug().
+			Str("target", target.String()).
+			Dur("ewma_rtt", ewma).
+			Dur("calculated_timeout", timeout).
+			Dur("max_limit", maxLimit).
+			Msg("LOG_STEP: getPeerDialTimeout: Calculated timeout using stored EWMA latency")
+		return timeout
+	}
+
+	// Fallback to active ping measurement if no EWMA latency is stored
+	logger.Debug().Str("target", target.String()).Msg("LOG_STEP: getPeerDialTimeout: No EWMA latency stored, performing active ping...")
+	pingCtx, pingCancel := context.WithTimeout(ctx, 1*time.Second)
+	defer pingCancel()
+	pings := ping.Ping(pingCtx, h, target)
+	select {
+	case res, ok := <-pings:
+		if ok && res.Error == nil && res.RTT > 0 {
+			timeout := 4*res.RTT + 500*time.Millisecond
+			if timeout < 300*time.Millisecond {
+				timeout = 300 * time.Millisecond
+			}
+			if timeout > maxLimit {
+				timeout = maxLimit
+			}
+			logger.Debug().
+				Str("target", target.String()).
+				Dur("ping_rtt", res.RTT).
+				Dur("calculated_timeout", timeout).
+				Dur("max_limit", maxLimit).
+				Msg("LOG_STEP: getPeerDialTimeout: Calculated timeout using active ping")
+			return timeout
+		}
+	case <-pingCtx.Done():
+	}
+
+	// Default fallback timeout
+	fallback := 3 * time.Second
+	if fallback > maxLimit {
+		fallback = maxLimit
+	}
+	logger.Debug().Str("target", target.String()).Dur("fallback", fallback).Msg("LOG_STEP: getPeerDialTimeout: Active ping failed or timed out, falling back to default")
+	return fallback
+}
+
+func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWireEnvelope string) error {
+	startTransmit := time.Now()
+	defer func() {
+		logger.Info().Str("target", target.String()).Dur("elapsed", time.Since(startTransmit)).Msg("LOG_STEP: transmitEnvelope completed")
+	}()
+
+	if target == h.ID() {
+		logger.Info().Msg("transmitEnvelope: Self-message detected, processing locally without network dial")
+		go ProcessSecureEnvelope(ctx, h, h.ID(), finalWireEnvelope, "")
+		return nil
+	}
+
+	// Cek apakah ada koneksi aktif ke peer tersebut (direct maupun via relay)
+	isConnected := len(h.Network().ConnsToPeer(target)) > 0
+
+	var s network.Stream
+	var err error
+
+	if isConnected {
+		logger.Info().Str("target", target.String()).Msg("LOG_STEP: transmitEnvelope: Active connection found, attempting direct stream dial...")
+		dialTimeout := getPeerDialTimeout(ctx, h, target)
+		logger.Info().Str("target", target.String()).Dur("timeout", dialTimeout).Msg("LOG_STEP: transmitEnvelope: Using calculated dial timeout")
+
+		startDial := time.Now()
+		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+		s, err = h.NewStream(dialCtx, target, MessagingProtocolID)
+		cancel()
+		logger.Info().Str("target", target.String()).Dur("elapsed", time.Since(startDial)).Err(err).Msg("LOG_STEP: transmitEnvelope: NewStream dial finished")
+
+		if err == nil {
+			logger.Debug().Str("target", target.String()).Msg("transmitEnvelope: Direct stream succeeded, writing envelope")
+			s.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			startWrite := time.Now()
+			errWrite := binary.Write(s, binary.LittleEndian, uint32(len(finalWireEnvelope)))
+			if errWrite == nil {
+				_, errWrite = s.Write([]byte(finalWireEnvelope))
+			}
+			logger.Info().Str("target", target.String()).Dur("elapsed", time.Since(startWrite)).Err(errWrite).Msg("LOG_STEP: transmitEnvelope: stream Write finished")
+
+			if errWrite == nil {
+				// Read ACK
+				respReader := bufio.NewReader(s)
+				s.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				startAck := time.Now()
+				resp, errRead := respReader.ReadString('\n')
+				logger.Info().Str("target", target.String()).Dur("elapsed", time.Since(startAck)).Err(errRead).Msg("LOG_STEP: transmitEnvelope: stream Read ACK finished")
+				if errRead != nil || strings.TrimSpace(resp) != "OK" {
+					errWrite = fmt.Errorf("did not receive ACK from target: %v", errRead)
+				}
+			}
+			s.Close()
+			if errWrite == nil {
+				// Track outgoing bytes (4-byte length prefix + envelope payload)
+				AddBytesSent(4 + len(finalWireEnvelope))
+
+				// Determine connection type for routing logs
+				routeType := "DIRECT (QUIC/UDP)"
+				connType := "direct_quic"
+				relayVia := ""
+				conns := h.Network().ConnsToPeer(target)
+				if len(conns) > 0 {
+					addrStr := conns[0].RemoteMultiaddr().String()
+					if strings.Contains(addrStr, "p2p-circuit") {
+						routeType = "RELAYED (Circuit)"
+						connType = "relay"
+						parts := strings.Split(addrStr, "/")
+						for i, part := range parts {
+							if part == "p2p-circuit" && i >= 2 {
+								for j := i - 1; j >= 0; j-- {
+									if parts[j] == "p2p" && j+1 < i {
+										relayVia = parts[j+1]
+										break
+									}
+								}
+								break
+							}
+						}
+					} else if strings.Contains(addrStr, "webrtc-direct") {
+						routeType = "DIRECT (WebRTC)"
+						connType = "direct_webrtc"
+					}
+				}
+				UpdatePeerActivity(target.String(), connType, relayVia)
+
+				logger.Info().
+					Str("peerID", target.String()).
+					Str("route", routeType).
+					Msg(">>> MESSAGE DELIVERED ONLINE")
+
+				return nil
+			}
+			logger.Warn().Err(errWrite).Str("target", target.String()).Msg("transmitEnvelope: Direct write failed, falling back to mailbox")
+			err = errWrite
+		} else {
+			logger.Warn().Err(err).Str("target", target.String()).Msg("transmitEnvelope: Dial stream failed, falling back to mailbox")
+		}
+	} else {
+		logger.Info().Str("target", target.String()).Msg("transmitEnvelope: No active connection found, skipping dial and sending via offline mailbox")
+	}
+
+	// Wrap envelope with standard signature for spam-proof mailbox storage
+	sigWrapped, errSig := WrapEnvelopeWithSignature(h.Peerstore().PrivKey(h.ID()), finalWireEnvelope)
+	if errSig == nil {
+		finalWireEnvelope = sigWrapped
+	} else {
+		logger.Warn().Err(errSig).Msg("Failed to wrap envelope with standard signature, sending unwrapped")
+	}
+
+	encodedEnvelope := base64.StdEncoding.EncodeToString([]byte(finalWireEnvelope))
+	// Pass the actual marshalled public key (not the peer ID string) so the
+	// receiver can correctly reconstruct the sender peer ID when fetching from mailbox.
+	pubKeyBytes, errMarshal := crypto.MarshalPublicKey(h.Peerstore().PubKey(h.ID()))
+	if errMarshal != nil {
+		pubKeyBytes, _ = h.ID().MarshalBinary() // fallback: use raw peer ID bytes
+	}
+	senderPubkeyB64 := base64.StdEncoding.EncodeToString(pubKeyBytes)
+
+	logger.Info().
+		Str("peerID", target.String()).
+		Msg(">>> TARGET OFFLINE/UNREACHABLE: Storing message in offline mailbox")
+
+	// Run mailbox storage in the background to avoid blocking the FFI / UI thread
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := StoreOfflineMessage(bgCtx, h, target, senderPubkeyB64, encodedEnvelope)
+		if err != nil {
+			logger.Warn().Err(err).Str("target", target.String()).Msg("Background StoreOfflineMessage failed")
+		} else {
+			logger.Info().
+				Str("peerID", target.String()).
+				Msg(">>> OFFLINE MAILBOX UPLOAD SUCCESSFUL")
+		}
+	}()
+	return nil
+}
+
+func resolveTargetPeerID(ctx context.Context, h host.Host, targetStr string) (peer.ID, error) {
+	// First, if it doesn't look like an alias (doesn't start with @), try to decode it directly
+	if !strings.HasPrefix(targetStr, "@") {
+		if targetID, err := peer.Decode(targetStr); err == nil {
+			return targetID, nil
+		}
+	}
+
+	// Otherwise, treat it as an alias (prepend @ if missing)
+	aliasToResolve := targetStr
+	if !strings.HasPrefix(aliasToResolve, "@") {
+		aliasToResolve = "@" + aliasToResolve
+	}
+
+	// Exclude group aliases
+	if _, errMeta := corestore.LoadGroupMetadata(aliasToResolve); errMeta == nil {
+		return "", fmt.Errorf("'%s' is a group alias, cannot send private messages to it", aliasToResolve)
+	}
+	if meta, errGroup := ResolveGroupMetadata(ctx, h, aliasToResolve); errGroup == nil && meta.GroupID != "" {
+		return "", fmt.Errorf("'%s' is a group alias, cannot send private messages to it", aliasToResolve)
+	}
+
+	resolved, err := ResolveAlias(ctx, h, aliasToResolve)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve alias %s: %w", aliasToResolve, err)
+	}
+
+	return peer.Decode(resolved)
+}

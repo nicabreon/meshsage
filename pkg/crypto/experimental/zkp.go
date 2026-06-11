@@ -1,4 +1,9 @@
-package crypto
+// Package experimental contains cryptographic research code that is NOT
+// integrated into the production message flow.
+// ZKP (Zero-Knowledge Proof) Ring Signatures are preserved here for
+// potential future use (e.g., anonymous group membership proofs).
+// Do NOT import this package from production code.
+package experimental
 
 import (
 	"crypto/elliptic"
@@ -17,7 +22,8 @@ type RingSignature struct {
 	KeyImageY []byte
 }
 
-// PubKeyPoint represents a public key point on the P-256 curve
+// PubKeyPoint represents a public key point on the P-256 curve.
+// Redefined locally to keep the experimental package self-contained.
 type PubKeyPoint struct {
 	X *big.Int
 	Y *big.Int
