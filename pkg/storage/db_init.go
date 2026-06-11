@@ -102,6 +102,7 @@ func InitDatabase(dbPath string) error {
 		n INTEGER DEFAULT 0,
 		m INTEGER DEFAULT 0,
 		pn INTEGER DEFAULT 0,
+		outbound_msgs_since_ratchet INTEGER DEFAULT 0,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
@@ -234,6 +235,7 @@ func InitDatabase(dbPath string) error {
 	_, _ = DB.Exec("ALTER TABLE messages ADD COLUMN msg_id TEXT;")
 	_, _ = DB.Exec("ALTER TABLE messages ADD COLUMN msg_hash TEXT;")
 	_, _ = DB.Exec("ALTER TABLE messages ADD COLUMN msg_type TEXT;")
+	_, _ = DB.Exec("ALTER TABLE sessions ADD COLUMN outbound_msgs_since_ratchet INTEGER DEFAULT 0;")
 
 	// Database versioning & migration runner
 	var currentVersion int

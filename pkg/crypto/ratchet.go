@@ -10,22 +10,45 @@ import (
 
 // SessionState represents the current state of a Double Ratchet session with a peer.
 type SessionState struct {
-	PeerID               string
-	RemoteIdentityKey    []byte
-	RootKey              []byte
-	SendChainKey         []byte
-	RecvChainKey         []byte
-	RemoteRatchetPubkey  []byte
-	LocalRatchetPrivkey  []byte
-	LocalRatchetPubkey   []byte
-	N                    uint32 // Message counter for current send chain
-	M                    uint32 // Message counter for current receive chain
-	PN                   uint32 // Number of messages in previous send chain
+	PeerID                       string
+	RemoteIdentityKey            []byte
+	RootKey                      []byte
+	SendChainKey                 []byte
+	RecvChainKey                 []byte
+	RemoteRatchetPubkey          []byte
+	LocalRatchetPrivkey          []byte
+	LocalRatchetPubkey           []byte
+	N                            uint32 // Message counter for current send chain
+	M                            uint32 // Message counter for current receive chain
+	PN                           uint32 // Number of messages in previous send chain
+	OutboundMessagesSinceRatchet uint32 // Counter for proactive ratchet rotation
 }
 
 // EncryptWithRatchet advances the send chain and returns an encrypted message.
 // In a full implementation, this would also include the current Ratchet Public Key in the header.
 func (s *SessionState) EncryptWithRatchet(plaintext string) (string, error) {
+	// Proactive DH Ratchet Key Rotation if sender has sent exactly 5 messages without a reply.
+	// We rotate at most once before receiving a reply to prevent out-of-sync/decryption failures
+	// if the recipient is offline and receives multiple proactive rotations.
+	if s.OutboundMessagesSinceRatchet == 5 {
+		newPriv, newPub, err := GenerateEphemeralKeypair()
+		if err == nil {
+			sharedSecretSend, errSecret := DeriveSharedSecret(newPriv, s.RemoteRatchetPubkey)
+			if errSecret == nil {
+				resSend, errHKDF := HKDFExpand(sharedSecretSend, "p2p-core-dh-ratchet", 64)
+				if errHKDF == nil {
+					s.LocalRatchetPrivkey = newPriv
+					s.LocalRatchetPubkey = newPub
+					s.RootKey = resSend[:32]
+					s.SendChainKey = resSend[32:]
+					s.PN = s.N
+					s.N = 0
+					s.OutboundMessagesSinceRatchet = 6 // set to 6 (marker > 5) so we don't rotate again
+				}
+			}
+		}
+	}
+
 	msgKey, nextChainKey, err := RatchetStep(s.SendChainKey)
 	if err != nil { return "", err }
 	
@@ -33,6 +56,9 @@ func (s *SessionState) EncryptWithRatchet(plaintext string) (string, error) {
 	headerN := s.N
 	headerPN := s.PN
 	s.N++
+	if s.OutboundMessagesSinceRatchet < 5 {
+		s.OutboundMessagesSinceRatchet++
+	}
 	
 	// Encrypt using the derived message key
 	ciphertext, err := EncryptMessage(msgKey, plaintext)
@@ -109,5 +135,8 @@ func (s *SessionState) DecryptWithRatchet(payload string) (string, map[uint32][]
 	s.M++
 	
 	plaintext, err := DecryptMessage(msgKey, ciphertext)
+	if err == nil {
+		s.OutboundMessagesSinceRatchet = 0
+	}
 	return plaintext, skippedKeys, err
 }

@@ -224,7 +224,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 
 			// B. Jalur Standard Ratchet
 			// Dicapai saat: (1) tidak ada skipped key, atau (2) skipped key stale/gagal decrypt.
-			remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, err := corestore.LoadSession(senderID.String())
+			remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, outboundMsgsSinceRatchet, err := corestore.LoadSession(senderID.String())
 			if err != nil || rootB64 == "" {
 				logger.Error().Str("peerID", senderID.String()).Msg("No session found for E2EE decryption. Sending REQUEST_X3DH to sender.")
 				// Do NOT send RESET here (we have nothing to reset).
@@ -246,16 +246,17 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			}
 
 			session := &corecrypto.SessionState{
-				PeerID:              senderID.String(),
-				RootKey:             rootKey,
-				SendChainKey:        sendChain,
-				RecvChainKey:        recvChain,
-				RemoteRatchetPubkey: remoteRatchetPub,
-				LocalRatchetPrivkey: localRatchetPriv,
-				LocalRatchetPubkey:  localRatchetPub,
-				N:                   n,
-				M:                   m,
-				PN:                  pn,
+				PeerID:                       senderID.String(),
+				RootKey:                      rootKey,
+				SendChainKey:                 sendChain,
+				RecvChainKey:                 recvChain,
+				RemoteRatchetPubkey:          remoteRatchetPub,
+				LocalRatchetPrivkey:          localRatchetPriv,
+				LocalRatchetPubkey:           localRatchetPub,
+				N:                            n,
+				M:                            m,
+				PN:                           pn,
+				OutboundMessagesSinceRatchet: outboundMsgsSinceRatchet,
 			}
 
 			plaintext, skipped, err := session.DecryptWithRatchet(payloadStr)
@@ -287,7 +288,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				base64.StdEncoding.EncodeToString(session.RemoteRatchetPubkey),
 				base64.StdEncoding.EncodeToString(session.LocalRatchetPrivkey),
 				base64.StdEncoding.EncodeToString(session.LocalRatchetPubkey),
-				session.N, session.M, session.PN)
+				session.N, session.M, session.PN, session.OutboundMessagesSinceRatchet)
 
 			// Simpan skipped keys
 			for c, k := range skipped {
@@ -404,7 +405,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			logger.Debug().Str("peerID", senderID.String()).Msg("X3DH: Cleared stale skipped keys for new session")
 		}
 		// Simpan dengan SendChainKey, RecvChainKey dan ratchet keys terisi lengkap
-		corestore.SaveSession(senderID.String(), bobPreKeyPubB64, rootKeyB64, sendChainB64, recvChainB64, senderRatchetPubB64, localRatchetPrivB64, localRatchetPubB64, 0, 0, 0)
+		corestore.SaveSession(senderID.String(), bobPreKeyPubB64, rootKeyB64, sendChainB64, recvChainB64, senderRatchetPubB64, localRatchetPrivB64, localRatchetPubB64, 0, 0, 0, 0)
 	} else {
 		snippet := envelope
 		if len(snippet) > 50 {

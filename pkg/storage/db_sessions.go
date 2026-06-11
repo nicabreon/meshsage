@@ -6,24 +6,24 @@ import (
 )
 
 // SaveSession persists the Double Ratchet session state for a peer.
-func SaveSession(peerID, remoteIdentityKey, rootKey, sendChainKey, recvChainKey, remoteRatchetPub, localRatchetPriv, localRatchetPub string, n, m, pn uint32) error {
+func SaveSession(peerID, remoteIdentityKey, rootKey, sendChainKey, recvChainKey, remoteRatchetPub, localRatchetPriv, localRatchetPub string, n, m, pn, outboundMsgsSinceRatchet uint32) error {
 	if DB == nil {
 		return fmt.Errorf("database not initialized")
 	}
 	_, err := DB.Exec(`INSERT OR REPLACE INTO sessions 
-		(peer_id, remote_identity_key, root_key, send_chain_key, recv_chain_key, remote_ratchet_pubkey, local_ratchet_privkey, local_ratchet_pubkey, n, m, pn, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		peerID, remoteIdentityKey, rootKey, sendChainKey, recvChainKey, remoteRatchetPub, localRatchetPriv, localRatchetPub, n, m, pn)
+		(peer_id, remote_identity_key, root_key, send_chain_key, recv_chain_key, remote_ratchet_pubkey, local_ratchet_privkey, local_ratchet_pubkey, n, m, pn, outbound_msgs_since_ratchet, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		peerID, remoteIdentityKey, rootKey, sendChainKey, recvChainKey, remoteRatchetPub, localRatchetPriv, localRatchetPub, n, m, pn, outboundMsgsSinceRatchet)
 	return err
 }
 
 // LoadSession retrieves the Double Ratchet session state for a peer.
-func LoadSession(peerID string) (remoteIdentityKey, rootKey, sendChainKey, recvChainKey, remoteRatchetPub, localRatchetPriv, localRatchetPub string, n, m, pn uint32, err error) {
+func LoadSession(peerID string) (remoteIdentityKey, rootKey, sendChainKey, recvChainKey, remoteRatchetPub, localRatchetPriv, localRatchetPub string, n, m, pn, outboundMsgsSinceRatchet uint32, err error) {
 	if DB == nil {
-		return "", "", "", "", "", "", "", 0, 0, 0, fmt.Errorf("database not initialized")
+		return "", "", "", "", "", "", "", 0, 0, 0, 0, fmt.Errorf("database not initialized")
 	}
-	row := DB.QueryRow(`SELECT remote_identity_key, root_key, send_chain_key, recv_chain_key, remote_ratchet_pubkey, local_ratchet_privkey, local_ratchet_pubkey, n, m, pn FROM sessions WHERE peer_id = ?`, peerID)
-	err = row.Scan(&remoteIdentityKey, &rootKey, &sendChainKey, &recvChainKey, &remoteRatchetPub, &localRatchetPriv, &localRatchetPub, &n, &m, &pn)
+	row := DB.QueryRow(`SELECT remote_identity_key, root_key, send_chain_key, recv_chain_key, remote_ratchet_pubkey, local_ratchet_privkey, local_ratchet_pubkey, n, m, pn, outbound_msgs_since_ratchet FROM sessions WHERE peer_id = ?`, peerID)
+	err = row.Scan(&remoteIdentityKey, &rootKey, &sendChainKey, &recvChainKey, &remoteRatchetPub, &localRatchetPriv, &localRatchetPub, &n, &m, &pn, &outboundMsgsSinceRatchet)
 	return
 }
 

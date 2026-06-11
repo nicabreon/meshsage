@@ -65,7 +65,7 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 	defer sessionMu.Unlock()
 
 	// 1. Cek apakah sudah punya sesi aktif (Session Cache)
-	remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, err := corestore.LoadSession(targetID.String())
+	remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, outboundMsgsSinceRatchet, err := corestore.LoadSession(targetID.String())
 	if err == nil && rootB64 != "" {
 		// Sesi Aktif Ditemukan!
 		rootKey, _ := base64.StdEncoding.DecodeString(rootB64)
@@ -80,17 +80,18 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 		}
 
 		session := &corecrypto.SessionState{
-			PeerID:              targetID.String(),
-			RemoteIdentityKey:   []byte(remoteIdentityB64),
-			RootKey:             rootKey,
-			SendChainKey:        sendChain,
-			RecvChainKey:        recvChain,
-			RemoteRatchetPubkey: remoteRatchetPub,
-			LocalRatchetPrivkey: localRatchetPriv,
-			LocalRatchetPubkey:  localRatchetPub,
-			N:                   n,
-			M:                   m,
-			PN:                  pn,
+			PeerID:                       targetID.String(),
+			RemoteIdentityKey:            []byte(remoteIdentityB64),
+			RootKey:                      rootKey,
+			SendChainKey:                 sendChain,
+			RecvChainKey:                 recvChain,
+			RemoteRatchetPubkey:          remoteRatchetPub,
+			LocalRatchetPrivkey:          localRatchetPriv,
+			LocalRatchetPubkey:           localRatchetPub,
+			N:                            n,
+			M:                            m,
+			PN:                           pn,
+			OutboundMessagesSinceRatchet: outboundMsgsSinceRatchet,
 		}
 
 		ciphertext, err := session.EncryptWithRatchet(string(jsonPayload))
@@ -103,7 +104,7 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 				base64.StdEncoding.EncodeToString(session.RemoteRatchetPubkey),
 				base64.StdEncoding.EncodeToString(session.LocalRatchetPrivkey),
 				base64.StdEncoding.EncodeToString(session.LocalRatchetPubkey),
-				session.N, session.M, session.PN)
+				session.N, session.M, session.PN, session.OutboundMessagesSinceRatchet)
 
 			finalWireEnvelope := fmt.Sprintf("DR:%s", base64.StdEncoding.EncodeToString([]byte(ciphertext)))
 			return finalWireEnvelope, nil
@@ -206,7 +207,7 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 		logger.Debug().Str("targetID", targetID.String()).Msg("X3DH SEND: Cleared stale skipped keys for new session")
 	}
 	// Simpan session dengan SendChainKey terisi, RecvChainKey kosong, dan RemoteRatchetPubkey = pubKeyB64
-	corestore.SaveSession(targetID.String(), pubKeyB64, senderRootKeyB64, senderSendChainB64, "", pubKeyB64, senderRatchetPrivB64, senderRatchetPubB64Out, 0, 0, 0)
+	corestore.SaveSession(targetID.String(), pubKeyB64, senderRootKeyB64, senderSendChainB64, "", pubKeyB64, senderRatchetPrivB64, senderRatchetPubB64Out, 0, 0, 0, 0)
 
 	// Sertakan localRatchetPub di dalam payload agar receiver bisa init RecvChainKey
 	ePubB64 := base64.StdEncoding.EncodeToString(ePub)

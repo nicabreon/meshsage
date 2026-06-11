@@ -46,7 +46,7 @@ func TestBUG03_SessionLock_NoConcurrentCorruption(t *testing.T) {
 	sessionLocks = sync.Map{}
 
 	// Simpan session awal
-	err = corestore.SaveSession(peerID, "", "rootkey", "sendchain", "recvchain", "", "", "", 0, 0, 0)
+	err = corestore.SaveSession(peerID, "", "rootkey", "sendchain", "recvchain", "", "", "", 0, 0, 0, 0)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -62,14 +62,14 @@ func TestBUG03_SessionLock_NoConcurrentCorruption(t *testing.T) {
 			defer mu.Unlock()
 
 			// Baca session
-			_, rootB64, _, _, _, _, _, nVal, _, _, err := corestore.LoadSession(peerID)
+			_, rootB64, _, _, _, _, _, nVal, _, _, _, err := corestore.LoadSession(peerID)
 			if err != nil {
 				errors <- err
 				return
 			}
 
 			// Tulis session dengan counter incremented
-			err = corestore.SaveSession(peerID, "", rootB64, "sendchain", "recvchain", "", "", "", nVal+1, 0, 0)
+			err = corestore.SaveSession(peerID, "", rootB64, "sendchain", "recvchain", "", "", "", nVal+1, 0, 0, 0)
 			if err != nil {
 				errors <- err
 			}
@@ -85,7 +85,7 @@ func TestBUG03_SessionLock_NoConcurrentCorruption(t *testing.T) {
 	}
 
 	// Verifikasi session masih terbaca dengan benar
-	_, rootB64, _, _, _, _, _, _, _, _, err := corestore.LoadSession(peerID)
+	_, rootB64, _, _, _, _, _, _, _, _, _, err := corestore.LoadSession(peerID)
 	assert.NoError(t, err)
 	assert.NotEmpty(t, rootB64, "Session harus tetap ada setelah concurrent access")
 }
@@ -232,11 +232,11 @@ func TestBUG04_StorageSessionWithRatchetKeys(t *testing.T) {
 
 	// BUG-04 FIX: Semua field termasuk ratchet keys harus tersimpan
 	err = corestore.SaveSession(peerID, "identitykey", rootKey, sendChain, recvChain,
-		remoteRatchetPub, localRatchetPriv, localRatchetPub, 5, 3, 2)
+		remoteRatchetPub, localRatchetPriv, localRatchetPub, 5, 3, 2, 0)
 	require.NoError(t, err)
 
 	// Load dan verifikasi semua field tersimpan dengan benar
-	_, loadedRoot, loadedSend, loadedRecv, loadedRemoteRatchet, loadedLocalPriv, loadedLocalPub, n, m, pn, err :=
+	_, loadedRoot, loadedSend, loadedRecv, loadedRemoteRatchet, loadedLocalPriv, loadedLocalPub, n, m, pn, _, err :=
 		corestore.LoadSession(peerID)
 	require.NoError(t, err)
 
@@ -316,7 +316,7 @@ func TestDeleteSession(t *testing.T) {
 	peerID := "12D3KooWTestDeleteSession"
 	
 	// 1. Simpan session dan skipped keys
-	err = corestore.SaveSession(peerID, "identity", "root", "send", "recv", "remoteRatchet", "localPriv", "localPub", 1, 2, 3)
+	err = corestore.SaveSession(peerID, "identity", "root", "send", "recv", "remoteRatchet", "localPriv", "localPub", 1, 2, 3, 0)
 	require.NoError(t, err)
 
 	err = corestore.SaveSkippedKey(peerID, 0, []byte("key0"))
@@ -325,7 +325,7 @@ func TestDeleteSession(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verifikasi data masuk
-	_, rootB64, _, _, _, _, _, _, _, _, err := corestore.LoadSession(peerID)
+	_, rootB64, _, _, _, _, _, _, _, _, _, err := corestore.LoadSession(peerID)
 	require.NoError(t, err)
 	assert.Equal(t, "root", rootB64)
 
@@ -338,7 +338,7 @@ func TestDeleteSession(t *testing.T) {
 	require.NoError(t, err)
 
 	// 3. Verifikasi session terhapus
-	_, _, _, _, _, _, _, _, _, _, err = corestore.LoadSession(peerID)
+	_, _, _, _, _, _, _, _, _, _, _, err = corestore.LoadSession(peerID)
 	assert.Error(t, err, "Session harusnya terhapus dan mengembalikan error")
 
 	// Verifikasi skipped keys juga terhapus

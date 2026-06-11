@@ -3,6 +3,8 @@ package crypto
 import (
 	"bytes"
 	"encoding/base64"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -199,4 +201,93 @@ func TestHKDFExpand_Deterministic(t *testing.T) {
 	out3, err := HKDFExpand(secret, "different-info", 32)
 	require.NoError(t, err)
 	assert.False(t, bytes.Equal(out1, out3), "HKDF dengan info berbeda harus menghasilkan output berbeda")
+}
+
+// TestProactiveRatchetRotation memverifikasi logika rotasi kunci DH proaktif.
+func TestProactiveRatchetRotation(t *testing.T) {
+	alicePriv, alicePub, err := GenerateEphemeralKeypair()
+	require.NoError(t, err)
+	bobPriv, bobPub, err := GenerateEphemeralKeypair()
+	require.NoError(t, err)
+
+	aliceSecret, err := DeriveSharedSecret(alicePriv, bobPub)
+	require.NoError(t, err)
+	bobSecret, err := DeriveSharedSecret(bobPriv, alicePub)
+	require.NoError(t, err)
+
+	aliceSession := &SessionState{
+		PeerID:              "bob",
+		RootKey:             aliceSecret,
+		SendChainKey:        aliceSecret,
+		RecvChainKey:        bobSecret,
+		LocalRatchetPrivkey: alicePriv,
+		LocalRatchetPubkey:  alicePub,
+		RemoteRatchetPubkey: bobPub,
+	}
+
+	bobSession := &SessionState{
+		PeerID:              "alice",
+		RootKey:             bobSecret,
+		SendChainKey:        bobSecret,
+		RecvChainKey:        aliceSecret,
+		LocalRatchetPrivkey: bobPriv,
+		LocalRatchetPubkey:  bobPub,
+		RemoteRatchetPubkey: alicePub,
+	}
+
+	// 1. Simpan public key awal Alice
+	initialPubkey := aliceSession.LocalRatchetPubkey
+
+	// 2. Alice mengirim 5 pesan tanpa balasan
+	ciphertexts := make([]string, 7)
+	for i := 0; i < 5; i++ {
+		msg := fmt.Sprintf("Pesan ke-%d", i+1)
+		ciphertexts[i], err = aliceSession.EncryptWithRatchet(msg)
+		require.NoError(t, err)
+		assert.Equal(t, initialPubkey, aliceSession.LocalRatchetPubkey, "Kunci publik tidak boleh berubah selama 5 pesan pertama")
+		assert.Equal(t, uint32(i+1), aliceSession.OutboundMessagesSinceRatchet)
+	}
+
+	// 3. Pesan ke-6: harus memicu rotasi proaktif
+	ciphertexts[5], err = aliceSession.EncryptWithRatchet("Pesan ke-6 (Rotasi)")
+	require.NoError(t, err)
+	rotatedPubkey := aliceSession.LocalRatchetPubkey
+	assert.False(t, bytes.Equal(initialPubkey, rotatedPubkey), "Kunci publik harus berubah (rotasi proaktif) pada pesan ke-6")
+	assert.Equal(t, uint32(6), aliceSession.OutboundMessagesSinceRatchet, "Counter harus diset ke 6 (marker)")
+
+	// 4. Pesan ke-7: kunci publik tidak boleh berputar lagi
+	ciphertexts[6], err = aliceSession.EncryptWithRatchet("Pesan ke-7")
+	require.NoError(t, err)
+	assert.True(t, bytes.Equal(rotatedPubkey, aliceSession.LocalRatchetPubkey), "Kunci publik tidak boleh berputar lebih dari sekali")
+	assert.Equal(t, uint32(6), aliceSession.OutboundMessagesSinceRatchet, "Counter harus tetap 6")
+
+	// 5. Bob memproses pesan ke-6 terlebih dahulu (simulasi out-of-order)
+	// Bob harus secara otomatis melompati (skip) kunci untuk pesan 1-5
+	plaintext6, skipped, err := bobSession.DecryptWithRatchet(ciphertexts[5])
+	require.NoError(t, err)
+	assert.Equal(t, "Pesan ke-6 (Rotasi)", plaintext6)
+	assert.Len(t, skipped, 5, "Bob harus men-skip 5 kunci pesan sebelumnya")
+
+	// Verifikasi skipped keys bisa digunakan untuk mendekripsi pesan 1-5
+	for i := 0; i < 5; i++ {
+		msgKey, exists := skipped[uint32(i)]
+		require.True(t, exists, "Kunci pesan ke-%d harus di-skip", i+1)
+		
+		// ciphertext berformat: header|ciphertext. Header-nya dipisah dulu.
+		parts := strings.SplitN(ciphertexts[i], "|", 4)
+		require.Len(t, parts, 4)
+		
+		plain, err := DecryptMessage(msgKey, parts[3])
+		require.NoError(t, err)
+		assert.Equal(t, fmt.Sprintf("Pesan ke-%d", i+1), plain)
+	}
+
+	// 6. Bob mengirim balasan ke Alice
+	bobReplyCipher, err := bobSession.EncryptWithRatchet("Balasan dari Bob")
+	require.NoError(t, err)
+
+	// Alice mendekripsi balasan Bob -> OutboundMessagesSinceRatchet harus reset ke 0
+	_, _, err = aliceSession.DecryptWithRatchet(bobReplyCipher)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(0), aliceSession.OutboundMessagesSinceRatchet, "Counter harus di-reset setelah sukses dekripsi balasan")
 }
