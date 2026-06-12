@@ -390,6 +390,7 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 
 	// Hook the status callback to forward delivery receipts to Flutter
 	coreproto.StatusCallback = func(event coreproto.StatusEvent) {
+		_ = corestore.UpdateMessageStatus(event.RefID, event.Status)
 		data, err := json.Marshal(map[string]interface{}{
 			"type":   "delivery_status",
 			"ref_id": event.RefID,
@@ -885,6 +886,135 @@ func RegisterPort(portID C.int64_t) {
 //export GetNetworkStats
 func GetNetworkStats() *C.char {
 	return C.CString(coreproto.GetNetworkStatsJSON())
+}
+
+//export GetChatHistory
+func GetChatHistory(targetIDVal *C.char, isGroupVal C.int, limit C.int, offset C.int) *C.char {
+	if globalHost == nil {
+		return C.CString("[]")
+	}
+	targetID := C.GoString(targetIDVal)
+	isGroup := isGroupVal != 0
+	myID := globalHost.ID().String()
+
+	messages, err := corestore.GetChatMessages(myID, targetID, isGroup, int(limit), int(offset))
+	if err != nil {
+		logger.Error().Err(err).Str("targetID", targetID).Msg("GetChatHistory: failed to query messages")
+		return C.CString("[]")
+	}
+
+	data, err := json.Marshal(messages)
+	if err != nil {
+		logger.Error().Err(err).Msg("GetChatHistory: failed to marshal JSON")
+		return C.CString("[]")
+	}
+	return C.CString(string(data))
+}
+
+//export GetChatMetadata
+func GetChatMetadata() *C.char {
+	if globalHost == nil {
+		return C.CString("[]")
+	}
+	myID := globalHost.ID().String()
+
+	metadataList, err := corestore.GetChatMetadataList(myID)
+	if err != nil {
+		logger.Error().Err(err).Msg("GetChatMetadata: failed to query metadata list")
+		return C.CString("[]")
+	}
+
+	data, err := json.Marshal(metadataList)
+	if err != nil {
+		logger.Error().Err(err).Msg("GetChatMetadata: failed to marshal JSON")
+		return C.CString("[]")
+	}
+	return C.CString(string(data))
+}
+
+//export MarkMessagesAsRead
+func MarkMessagesAsRead(targetIDVal *C.char, isGroupVal C.int) *C.char {
+	if globalHost == nil {
+		return C.CString("Error: host not initialized")
+	}
+	targetID := C.GoString(targetIDVal)
+	isGroup := isGroupVal != 0
+	myID := globalHost.ID().String()
+
+	err := corestore.MarkChatAsRead(myID, targetID, isGroup)
+	if err != nil {
+		return C.CString("Error: " + err.Error())
+	}
+	return nil
+}
+
+//export DeleteMessageFFI
+func DeleteMessageFFI(msgIDVal *C.char) *C.char {
+	msgID := C.GoString(msgIDVal)
+	err := corestore.DeleteMessageByID(msgID)
+	if err != nil {
+		return C.CString("Error: " + err.Error())
+	}
+	return nil
+}
+
+//export ClearChatHistoryFFI
+func ClearChatHistoryFFI(targetIDVal *C.char, isGroupVal C.int) *C.char {
+	if globalHost == nil {
+		return C.CString("Error: host not initialized")
+	}
+	targetID := C.GoString(targetIDVal)
+	isGroup := isGroupVal != 0
+	myID := globalHost.ID().String()
+
+	err := corestore.ClearChatHistory(myID, targetID, isGroup)
+	if err != nil {
+		return C.CString("Error: " + err.Error())
+	}
+	return nil
+}
+
+//export ImportLegacyMessage
+func ImportLegacyMessage(senderVal, recipientVal, contentVal, msgIDVal, msgTypeVal, statusVal *C.char, timestampMs C.int64_t) *C.char {
+	sender := C.GoString(senderVal)
+	recipient := C.GoString(recipientVal)
+	content := C.GoString(contentVal)
+	msgID := C.GoString(msgIDVal)
+	msgType := C.GoString(msgTypeVal)
+	status := C.GoString(statusVal)
+
+	if corestore.DB == nil {
+		return C.CString("Error: database not initialized")
+	}
+
+	t := time.Unix(int64(timestampMs)/1000, (int64(timestampMs)%1000)*1000000)
+	timestampStr := t.UTC().Format("2006-01-02 15:04:05")
+
+	query := `INSERT INTO messages (sender_id, recipient_id, content, msg_id, msg_hash, msg_type, status, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	msgHash := msgID
+
+	_, err := corestore.DB.Exec(query, sender, recipient, content, msgID, msgHash, msgType, status, timestampStr)
+	if err != nil {
+		return C.CString("Error: " + err.Error())
+	}
+	return nil
+}
+
+//export SaveOutgoingMessage
+func SaveOutgoingMessage(senderIDVal, recipientIDVal, contentVal, msgIDVal, msgHashVal, msgTypeVal, statusVal *C.char) *C.char {
+	senderID := C.GoString(senderIDVal)
+	recipientID := C.GoString(recipientIDVal)
+	content := C.GoString(contentVal)
+	msgID := C.GoString(msgIDVal)
+	msgHash := C.GoString(msgHashVal)
+	msgType := C.GoString(msgTypeVal)
+	status := C.GoString(statusVal)
+
+	err := corestore.SaveMessage(senderID, recipientID, content, msgID, msgHash, msgType, status)
+	if err != nil {
+		return C.CString("Error: " + err.Error())
+	}
+	return nil
 }
 
 //export CreateGroupProper

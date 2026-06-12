@@ -59,6 +59,7 @@ func InitDatabase(dbPath string) error {
 		msg_id TEXT,
 		msg_hash TEXT,
 		msg_type TEXT,
+		status TEXT DEFAULT 'unread',
 		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	
@@ -228,6 +229,7 @@ func InitDatabase(dbPath string) error {
 	_, _ = DB.Exec("ALTER TABLE messages ADD COLUMN msg_id TEXT;")
 	_, _ = DB.Exec("ALTER TABLE messages ADD COLUMN msg_hash TEXT;")
 	_, _ = DB.Exec("ALTER TABLE messages ADD COLUMN msg_type TEXT;")
+	_ = EnsureColumn("messages", "status", "TEXT DEFAULT 'unread'")
 	_, _ = DB.Exec("ALTER TABLE sessions ADD COLUMN outbound_msgs_since_ratchet INTEGER DEFAULT 0;")
 
 	// Database versioning & migration runner

@@ -483,7 +483,7 @@ func pushDecryptionErrorToUI(h host.Host, senderID peer.ID, errStr string) {
 
 		// Simpan error ini ke SQLite database lokal agar tersimpan di chat history
 		if h != nil {
-			_ = corestore.SaveMessage(senderID.String(), h.ID().String(), content, "", "", "direct")
+			_ = corestore.SaveMessage(senderID.String(), h.ID().String(), content, "", "", "direct", "unread")
 		}
 
 		MessageCallback(MessageEvent{
@@ -694,7 +694,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		}
 
 		// Persist to SQLite only for actual user-visible chat messages
-		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "direct")
+		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "direct", "unread")
 
 		logger.Info().Str("senderID", senderID.String()).Str("msgID", env.ID).Msg("Received standard text message successfully")
 		TrackMsgRecv() // Track incoming message
@@ -720,7 +720,7 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 
 	case MsgTypeFile:
 		// Persist to SQLite
-		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "file")
+		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "file", "unread")
 
 		parts := strings.Split(env.Content, ":")
 		if len(parts) >= 4 {
