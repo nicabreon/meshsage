@@ -115,9 +115,10 @@ func TestSkippedKeysPersistence(t *testing.T) {
 
 	peerID := "12D3KooWSkippedKeyPeer"
 	counter := uint32(5)
+	ratchetPub := []byte("this-is-a-32-byte-ratchet-pub-!!")
 	msgKey := []byte("this-is-a-32-byte-msg-key-test-value!!")
 
-	err = corestore.SaveSkippedKey(peerID, counter, msgKey)
+	err = corestore.SaveSkippedKey(peerID, ratchetPub, counter, msgKey)
 	require.NoError(t, err)
 
 	// Tutup DB
@@ -130,7 +131,7 @@ func TestSkippedKeysPersistence(t *testing.T) {
 	defer corestore.DB.Close()
 
 	// Muat kembali skipped key
-	loadedKey, err := corestore.GetSkippedKey(peerID, counter)
+	loadedKey, err := corestore.GetSkippedKey(peerID, ratchetPub, counter)
 	require.NoError(t, err)
 	assert.Equal(t, msgKey, loadedKey, "Skipped key harus persisten dan sama setelah DB ditutup & dibuka kembali")
 }
