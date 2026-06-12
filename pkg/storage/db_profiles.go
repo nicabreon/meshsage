@@ -1,6 +1,10 @@
 package storage
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
 
 // SavePeerProfile stores or updates a cached peer profile record.
 func SavePeerProfile(peerID, displayName, avatarCID, avatarKey, localPath string) error {
@@ -43,5 +47,18 @@ func GetPeerProfile(peerID string) (displayName, avatarCID, avatarKey, localPath
 	}
 	row := DB.QueryRow("SELECT display_name, avatar_cid, avatar_key, local_path FROM profile_store WHERE peer_id = ?", peerID)
 	err = row.Scan(&displayName, &avatarCID, &avatarKey, &localPath)
+	if err != nil {
+		return
+	}
+	if localPath != "" {
+		if _, statErr := os.Stat(localPath); os.IsNotExist(statErr) {
+			reconstructedPath := filepath.Join(DataDir, "profiles", peerID+".jpg")
+			if _, statRecon := os.Stat(reconstructedPath); statRecon == nil {
+				localPath = reconstructedPath
+			} else {
+				localPath = ""
+			}
+		}
+	}
 	return
 }

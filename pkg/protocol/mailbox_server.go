@@ -59,7 +59,7 @@ func handleMailboxStream(h host.Host, s network.Stream) {
 
 	rateLimitMutex.Lock()
 	lastTime, exists := rateLimitMap[string(senderID)]
-	if !isInfra && exists && time.Since(lastTime) < 1*time.Millisecond {
+	if !isInfra && exists && time.Since(lastTime) < 5*time.Millisecond {
 		rateLimitMutex.Unlock()
 		logger.Warn().Str("peer", FormatPeerID(string(senderID))).Msg("Rate limit triggered for mailbox request")
 		s.Write([]byte("ERROR_RATE_LIMIT_EXCEEDED\n"))

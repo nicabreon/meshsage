@@ -374,6 +374,15 @@ func TestEndToEndMailboxAndSessionExpiration(t *testing.T) {
 	// Beri jeda kecil agar Bob menyimpan REQUEST_X3DH di mailbox Alice
 	time.Sleep(500 * time.Millisecond)
 
+	// Re-insert Bob's pre-keys to the shared DB again so Alice can fetch them during background re-handshake
+	for keyID, privBytes := range bobKeys {
+		pubBytes, _ := corecrypto.DerivePublicKey(privBytes)
+		sigBytes, _ := bobPrivKey.Sign(pubBytes)
+		_ = corestore.SavePreKey(hBob.ID().String(), keyID,
+			base64.StdEncoding.EncodeToString(pubBytes), base64.StdEncoding.EncodeToString(privBytes),
+			base64.StdEncoding.EncodeToString(sigBytes))
+	}
+
 	// 6. Alice online dan fetch mailbox-nya sendiri untuk menerima REQUEST_X3DH dari Bob
 	protocol.ResetMailboxRateLimiter()
 	protocol.ResetProcessedMailboxMessages()
@@ -382,15 +391,6 @@ func TestEndToEndMailboxAndSessionExpiration(t *testing.T) {
 	// Beri waktu bagi proses background REQUEST_X3DH dan re-handshake
 	// Alice akan merespon dengan sendHandshakeAck (menyimpan ACK & retried message di mailbox Bob)
 	time.Sleep(3 * time.Second)
-
-	// Re-insert Bob's pre-keys to the shared DB again since Alice's re-handshake fetch deleted them
-	for keyID, privBytes := range bobKeys {
-		pubBytes, _ := corecrypto.DerivePublicKey(privBytes)
-		sigBytes, _ := bobPrivKey.Sign(pubBytes)
-		_ = corestore.SavePreKey(hBob.ID().String(), keyID,
-			base64.StdEncoding.EncodeToString(pubBytes), base64.StdEncoding.EncodeToString(privBytes),
-			base64.StdEncoding.EncodeToString(sigBytes))
-	}
 
 	// 7. Bob online lagi dan fetch mailbox-nya untuk memproses re-handshake ACK & pesan yang di-retry
 	protocol.ResetMailboxRateLimiter()
