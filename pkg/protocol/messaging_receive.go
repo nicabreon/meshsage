@@ -475,28 +475,15 @@ func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID,
 	return handleIncomingPayload(ctx, h, senderID, env, msgHash)
 }
 
-func pushDecryptionErrorToUI(h host.Host, senderID peer.ID, errStr string) {
-	if MessageCallback != nil {
-		ts := time.Now().Format("02/01 15:04:05")
-		errID := fmt.Sprintf("err-%x", sha256.Sum256([]byte(errStr+time.Now().String())))[:8]
-		content := "[Error: Failed to decrypt message: " + errStr + "]"
-
-		// Simpan error ini ke SQLite database lokal agar tersimpan di chat history
-		if h != nil {
-			_ = corestore.SaveMessage(senderID.String(), h.ID().String(), content, "", "", "direct", "unread")
-		}
-
-		MessageCallback(MessageEvent{
-			Type:      "direct",
-			MsgID:     errID,
-			Timestamp: ts,
-			Sender:    senderID.String(),
-			Content:   content,
-			UnixTime:  time.Now().UnixNano() / 1e6,
-		})
-	} else {
-		logger.Info().Msg("Callback is nil for error")
+func isCallSignal(content string) bool {
+	if strings.HasPrefix(content, "{") && strings.HasSuffix(content, "}") {
+		return strings.Contains(content, `"msg_type":"call_signal"`) || strings.Contains(content, `msg_type:call_signal`)
 	}
+	return false
+}
+
+func pushDecryptionErrorToUI(h host.Host, senderID peer.ID, errStr string) {
+	logger.Error().Str("senderID", senderID.String()).Str("error", errStr).Msg("Decryption failed (suppressed from UI, auto-renegotiating if needed)")
 }
 
 func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, env MessageEnvelope, msgHash string) bool {
@@ -694,7 +681,9 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		}
 
 		// Persist to SQLite only for actual user-visible chat messages
-		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "direct", "unread")
+		if !isCallSignal(env.Content) {
+			corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "direct", "unread")
+		}
 
 		logger.Info().Str("senderID", senderID.String()).Str("msgID", env.ID).Msg("Received standard text message successfully")
 		TrackMsgRecv() // Track incoming message
