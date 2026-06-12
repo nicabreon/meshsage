@@ -22,11 +22,62 @@ import (
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
 )
 
+type timeTrackedDuration struct {
+	duration  time.Duration
+	updatedAt time.Time
+}
+
 var (
-	customDialTimeouts   sync.Map // map[string]time.Duration
-	customDialRTTs       sync.Map // map[string]time.Duration
+	customDialTimeouts   sync.Map // map[string]timeTrackedDuration
+	customDialRTTs       sync.Map // map[string]timeTrackedDuration
 	x3dhInitiateCooldown sync.Map // map[string]time.Time
 )
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+
+			// Clean up x3dhInitiateCooldown (older than 10 seconds, since cooldown limit is 5 seconds)
+			x3dhInitiateCooldown.Range(func(key, val interface{}) bool {
+				if lastTime, ok := val.(time.Time); ok {
+					if now.Sub(lastTime) > 10*time.Second {
+						x3dhInitiateCooldown.Delete(key)
+					}
+				} else {
+					x3dhInitiateCooldown.Delete(key)
+				}
+				return true
+			})
+
+			// Clean up customDialTimeouts (older than 1 hour)
+			customDialTimeouts.Range(func(key, val interface{}) bool {
+				if tracked, ok := val.(timeTrackedDuration); ok {
+					if now.Sub(tracked.updatedAt) > 1*time.Hour {
+						customDialTimeouts.Delete(key)
+					}
+				} else {
+					customDialTimeouts.Delete(key)
+				}
+				return true
+			})
+
+			// Clean up customDialRTTs (older than 1 hour)
+			customDialRTTs.Range(func(key, val interface{}) bool {
+				if tracked, ok := val.(timeTrackedDuration); ok {
+					if now.Sub(tracked.updatedAt) > 1*time.Hour {
+						customDialRTTs.Delete(key)
+					}
+				} else {
+					customDialRTTs.Delete(key)
+				}
+				return true
+			})
+		}
+	}()
+}
 
 func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target peer.ID, msg string) (string, error) {
 	msg = strings.TrimSuffix(msg, "\n")
@@ -262,7 +313,8 @@ func getRelayRTT(h host.Host) time.Duration {
 		}
 		if isDedicated {
 			if val, ok := customDialRTTs.Load(p.String()); ok {
-				if rtt, ok := val.(time.Duration); ok {
+				if tracked, ok := val.(timeTrackedDuration); ok {
+					rtt := tracked.duration
 					if bestRTT == 0 || rtt < bestRTT {
 						bestRTT = rtt
 					}
@@ -290,7 +342,8 @@ func MeasureAndRecordDialTimeout(ctx context.Context, h host.Host, target peer.I
 			elapsed := time.Since(start)
 			s.Close()
 
-			customDialRTTs.Store(target.String(), elapsed)
+			now := time.Now()
+			customDialRTTs.Store(target.String(), timeTrackedDuration{duration: elapsed, updatedAt: now})
 
 			// Calculate adaptive timeout: 3 * elapsed + 1 second buffer (longer buffer to handle spikes or relay routes)
 			timeout := 3*elapsed + 1*time.Second
@@ -301,7 +354,7 @@ func MeasureAndRecordDialTimeout(ctx context.Context, h host.Host, target peer.I
 				timeout = 3 * time.Second
 			}
 
-			customDialTimeouts.Store(target.String(), timeout)
+			customDialTimeouts.Store(target.String(), timeTrackedDuration{duration: timeout, updatedAt: now})
 			logger.Info().
 				Str("target", target.String()).
 				Dur("stream_dial_rtt", elapsed).
@@ -336,7 +389,8 @@ func getPeerDialTimeout(ctx context.Context, h host.Host, target peer.ID) time.D
 
 	// First, check if we have a measured custom dial timeout
 	if val, ok := customDialTimeouts.Load(target.String()); ok {
-		if timeout, ok := val.(time.Duration); ok {
+		if tracked, ok := val.(timeTrackedDuration); ok {
+			timeout := tracked.duration
 			if timeout > maxLimit {
 				timeout = maxLimit
 			}

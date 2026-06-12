@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	_ "modernc.org/sqlite"
+	"github.com/nicabreon/meshsage/pkg/logger"
 )
 
 // DB is the global SQLite database connection. All storage functions use this handle.
@@ -149,14 +150,6 @@ func InitDatabase(dbPath string) error {
 		PRIMARY KEY (group_id, sender_key)
 	);
 
-
-	-- 9. Group Members
-	CREATE TABLE IF NOT EXISTS group_members (
-		group_id TEXT,
-		peer_id TEXT,
-		PRIMARY KEY (group_id, peer_id)
-	);
-
 	-- Create alias_store table for persistent alias registry
 	CREATE TABLE IF NOT EXISTS alias_store (
 		alias_hash TEXT PRIMARY KEY,
@@ -232,17 +225,6 @@ func InitDatabase(dbPath string) error {
 	_ = EnsureColumn("messages", "status", "TEXT DEFAULT 'unread'")
 	_, _ = DB.Exec("ALTER TABLE sessions ADD COLUMN outbound_msgs_since_ratchet INTEGER DEFAULT 0;")
 
-	// Clean up legacy/corrupted signaling and decryption error messages from SQLite DB.
-	// This handles data saved by older versions of the app before filtering was added.
-	_, _ = DB.Exec(`DELETE FROM messages WHERE 
-		content LIKE '%"msg_type":"call_signal"%'
-		OR content LIKE '[Error: Failed to decrypt%'
-		OR content LIKE '[Error:%decrypt%'
-		OR content LIKE '{"type":"offer"%'
-		OR content LIKE '{"type":"answer"%'
-		OR content LIKE '{"type":"candidate"%'
-	`)
-
 	// Database versioning & migration runner
 	var currentVersion int
 	err = DB.QueryRow("PRAGMA user_version;").Scan(&currentVersion)
@@ -259,7 +241,36 @@ func InitDatabase(dbPath string) error {
 	}
 
 	// Future migrations go here:
-	// if currentVersion < 2 { ... }
+	if currentVersion < 2 {
+		logger.Info().Msg("Running database migration to version 2...")
+		
+		// Drop deprecated legacy group_members table
+		_, err = DB.Exec("DROP TABLE IF EXISTS group_members;")
+		if err != nil {
+			logger.Error().Err(err).Msg("Migration v2: failed to drop group_members table")
+		}
+
+		// Clean up legacy/corrupted signaling and decryption error messages from SQLite DB.
+		// This handles data saved by older versions of the app before filtering was added.
+		_, err = DB.Exec(`DELETE FROM messages WHERE 
+			content LIKE '%"msg_type":"call_signal"%'
+			OR content LIKE '[Error: Failed to decrypt%'
+			OR content LIKE '[Error:%decrypt%'
+			OR content LIKE '{"type":"offer"%'
+			OR content LIKE '{"type":"answer"%'
+			OR content LIKE '{"type":"candidate"%'
+		`)
+		if err != nil {
+			logger.Error().Err(err).Msg("Migration v2: failed to clean up legacy signaling/error messages")
+		}
+
+		_, err = DB.Exec("PRAGMA user_version = 2;")
+		if err != nil {
+			return fmt.Errorf("failed to update user_version to 2: %w", err)
+		}
+		currentVersion = 2
+		logger.Info().Msg("Database migration to version 2 completed successfully")
+	}
 
 	// Performance & Concurrency Tuning (applied again after schema creation)
 	DB.Exec("PRAGMA journal_mode = WAL;")

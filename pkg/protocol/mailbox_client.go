@@ -330,23 +330,33 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 					logger.Warn().Err(err).Str("hash", msgHash).Msg("Mailbox fetch: failed to retrieve message by hash from DB")
 				}
 			} else if msgID != "" {
-				ts := time.Now().Format("02/01 15:04:05")
-				if MessageCallback != nil {
-					var groupID string
-					if msgType == "group" {
-						groupID = recipient
+					// Skip signaling and error content — must never reach the UI
+					isSignaling := strings.Contains(content, `"msg_type":"call_signal"`) ||
+						strings.HasPrefix(content, `{"type":"offer"`) ||
+						strings.HasPrefix(content, `{"type":"answer"`) ||
+						strings.HasPrefix(content, `{"type":"candidate"`)
+					isError := strings.HasPrefix(content, "[Error:")
+					if isSignaling || isError {
+						logger.Debug().Str("hash", msgHash).Msg("Mailbox fetch: skipping re-dispatch of signaling/error content")
+					} else {
+						ts := time.Now().Format("02/01 15:04:05")
+						if MessageCallback != nil {
+							var groupID string
+							if msgType == "group" {
+								groupID = recipient
+							}
+							MessageCallback(MessageEvent{
+								Type:      msgType,
+								Timestamp: ts,
+								Sender:    sender,
+								GroupID:   groupID,
+								Content:   content,
+								MsgID:     msgID,
+							})
+						}
 					}
-					MessageCallback(MessageEvent{
-						Type:      msgType,
-						Timestamp: ts,
-						Sender:    sender,
-						GroupID:   groupID,
-						Content:   content,
-						MsgID:     msgID,
-					})
-				}
-			} else {
-				logger.Warn().Str("hash", msgHash).Msg("Mailbox fetch: message by hash in DB has empty msgID")
+				} else {
+					logger.Warn().Str("hash", msgHash).Msg("Mailbox fetch: message by hash in DB has empty msgID")
 			}
 			continue
 		}

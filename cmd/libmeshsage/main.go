@@ -987,6 +987,16 @@ func ImportLegacyMessage(senderVal, recipientVal, contentVal, msgIDVal, msgTypeV
 		return C.CString("Error: database not initialized")
 	}
 
+	// Skip WebRTC signaling and decryption error messages — these must never be stored in SQLite
+	if strings.Contains(content, `"msg_type":"call_signal"`) ||
+		strings.HasPrefix(content, "[Error:") ||
+		strings.HasPrefix(content, `{"type":"offer"`) ||
+		strings.HasPrefix(content, `{"type":"answer"`) ||
+		strings.HasPrefix(content, `{"type":"candidate"`) {
+		logger.Debug().Str("msgID", msgID).Msg("ImportLegacyMessage: skipping signaling/error content")
+		return nil // silently skip, not an error
+	}
+
 	t := time.Unix(int64(timestampMs)/1000, (int64(timestampMs)%1000)*1000000)
 	timestampStr := t.UTC().Format("2006-01-02 15:04:05")
 

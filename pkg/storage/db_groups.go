@@ -78,49 +78,6 @@ func DeleteGroupMetadata(groupID string) error {
 	return err2
 }
 
-// AddGroupMember adds a peer to the legacy group_members table.
-func AddGroupMember(groupID, peerID string) error {
-	_, err := DB.Exec(`INSERT OR IGNORE INTO group_members (group_id, peer_id) VALUES (?, ?)`,
-		groupID, peerID)
-	return err
-}
-
-// GetGroupMembers retrieves all peers in a group from the legacy group_members table.
-func GetGroupMembers(groupID string) ([]string, error) {
-	rows, err := DB.Query(`SELECT peer_id FROM group_members WHERE group_id = ?`, groupID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var members []string
-	for rows.Next() {
-		var pid string
-		if err := rows.Scan(&pid); err == nil {
-			members = append(members, pid)
-		}
-	}
-	return members, nil
-}
-
-// GetGroupMemberships returns all group IDs that a peer belongs to.
-func GetGroupMemberships(peerID string) ([]string, error) {
-	rows, err := DB.Query(`SELECT group_id FROM group_members WHERE peer_id = ?`, peerID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var groups []string
-	for rows.Next() {
-		var gid string
-		if err := rows.Scan(&gid); err == nil {
-			groups = append(groups, gid)
-		}
-	}
-	return groups, nil
-}
-
 // AddGroupMemberV2 inserts or updates a group member with their role.
 func AddGroupMemberV2(groupID, peerID, role string) error {
 	if DB == nil {
