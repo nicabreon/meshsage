@@ -4,8 +4,16 @@ import "fmt"
 
 // SavePreKey stores a signed one-time public key in the relay or local DB.
 func SavePreKey(ownerID, keyID, pubKey, privKey, sig string) error {
-	_, err := DB.Exec("INSERT OR REPLACE INTO prekeys (owner_id, key_id, public_key, private_key, signature) VALUES (?, ?, ?, ?, ?)",
-		ownerID, keyID, pubKey, privKey, sig)
+	var valToSave string
+	var err error
+	if privKey != "" {
+		valToSave, err = EncryptColumn(privKey)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = DB.Exec("INSERT OR REPLACE INTO prekeys (owner_id, key_id, public_key, private_key, signature) VALUES (?, ?, ?, ?, ?)",
+		ownerID, keyID, pubKey, valToSave, sig)
 	return err
 }
 
@@ -49,9 +57,12 @@ func DeletePublicPreKeyByID(keyID string) error {
 
 // FindPrivateKeyByID retrieves the private key associated with a KeyID (for receivers).
 func FindPrivateKeyByID(keyID string) (string, error) {
-	var privKey string
-	err := DB.QueryRow("SELECT private_key FROM prekeys WHERE key_id = ?", keyID).Scan(&privKey)
-	return privKey, err
+	var encryptedPriv string
+	err := DB.QueryRow("SELECT private_key FROM prekeys WHERE key_id = ?", keyID).Scan(&encryptedPriv)
+	if err != nil {
+		return "", err
+	}
+	return DecryptColumn(encryptedPriv)
 }
 
 // FetchOnePreKey retrieves one pre-key. If it belongs to someone else, it's DELETED (one-time use).

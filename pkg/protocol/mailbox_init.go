@@ -98,7 +98,8 @@ func handleNotifyStream(s network.Stream) {
 		logger.Debug().Str("coord", coord).Msg("Notification stream established")
 
 		go func() {
-			for scanner.Scan() {}
+			for scanner.Scan() {
+			}
 			notifyMutex.Lock()
 			if notifyRegistry[coord] == s {
 				delete(notifyRegistry, coord)
@@ -172,4 +173,19 @@ func NotifyRecipient(coord string) {
 			}
 		}()
 	}
+}
+
+// ResetMailboxRateLimiter clears the mailbox request rate limiting state (mainly for testing).
+func ResetMailboxRateLimiter() {
+	rateLimitMutex.Lock()
+	rateLimitMap = make(map[string]time.Time)
+	rateLimitMutex.Unlock()
+}
+
+// ResetProcessedMailboxMessages clears the processed mailbox messages cache.
+func ResetProcessedMailboxMessages() {
+	processedMailboxMessages.Range(func(key, value interface{}) bool {
+		processedMailboxMessages.Delete(key)
+		return true
+	})
 }

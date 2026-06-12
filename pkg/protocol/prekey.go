@@ -19,9 +19,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
+	"github.com/nicabreon/meshsage/pkg/logger"
 	corenet "github.com/nicabreon/meshsage/pkg/network"
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
-	"github.com/nicabreon/meshsage/pkg/logger"
 )
 
 const PreKeyProtocolID = "/p2p-core/prekey/1.0.0"
@@ -32,11 +32,9 @@ var (
 )
 
 type PreKeyBatch struct {
-	OwnerID   string        `json:"owner_id"`
+	OwnerID   string       `json:"owner_id"`
 	Keys      []OneTimeKey `json:"keys"`
-	Signature string        `json:"signature"`
-	ZkpX      string        `json:"zkp_x,omitempty"`
-	ZkpY      string        `json:"zkp_y,omitempty"`
+	Signature string       `json:"signature"`
 }
 
 type OneTimeKey struct {
@@ -62,14 +60,18 @@ func SetupPreKeyService(h host.Host) {
 func handlePreKeyStream(s network.Stream) {
 	peerID := s.Conn().RemotePeer().String()
 	logger.Debug().Str("peerID", peerID).Msg("Incoming pre-key stream")
-	
+
 	defer s.Close()
 	buf := bufio.NewReader(s)
 	line, err := buf.ReadString('\n')
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 
 	parts := strings.SplitN(strings.TrimSpace(line), " ", 2)
-	if len(parts) < 2 { return }
+	if len(parts) < 2 {
+		return
+	}
 
 	isRelay := corenet.ShouldActAsRelay()
 
@@ -82,7 +84,9 @@ func handlePreKeyStream(s network.Stream) {
 		}
 		size := 0
 		fmt.Sscanf(parts[1], "%d", &size)
-		if size <= 0 { return }
+		if size <= 0 {
+			return
+		}
 		logger.Debug().Str("peerID", s.Conn().RemotePeer().String()).Msg("Received compressed pre-key UPLOAD")
 
 		compressedData := make([]byte, size)
@@ -93,7 +97,9 @@ func handlePreKeyStream(s network.Stream) {
 		}
 
 		zr, err := gzip.NewReader(bytes.NewReader(compressedData))
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		defer zr.Close()
 
 		var batch PreKeyBatch
@@ -111,13 +117,10 @@ func handlePreKeyStream(s network.Stream) {
 		// Safe: relay only stores public keys (private_key=NULL), client private keys are protected
 		// by DeletePublicPreKeysByOwner in the PREKEY_CLEAR cluster event handler.
 		_ = corestore.DeletePreKeysByOwner(batch.OwnerID)
-		if batch.ZkpX != "" && batch.ZkpY != "" {
-			_ = corestore.SaveZKPMember(batch.OwnerID, batch.ZkpX, batch.ZkpY)
-		}
 		BroadcastClusterEvent(context.Background(), ClusterEvent{
 			Type:    "PREKEY_CLEAR",
 			OwnerID: batch.OwnerID,
-			Payload: batch.ZkpX + ":" + batch.ZkpY,
+			Payload: "",
 		})
 
 		for _, k := range batch.Keys {
@@ -139,7 +142,7 @@ func handlePreKeyStream(s network.Stream) {
 			s.Write([]byte("ERROR: Invalid JSON\n"))
 			return
 		}
-		
+
 		if err := verifyBatchSignature(batch); err != nil {
 			s.Write([]byte("ERROR: Unauthorized upload\n"))
 			return
@@ -147,13 +150,10 @@ func handlePreKeyStream(s network.Stream) {
 
 		// Clear old public keys for this owner so stale pre-DB-reset keys don't linger.
 		_ = corestore.DeletePreKeysByOwner(batch.OwnerID)
-		if batch.ZkpX != "" && batch.ZkpY != "" {
-			_ = corestore.SaveZKPMember(batch.OwnerID, batch.ZkpX, batch.ZkpY)
-		}
 		BroadcastClusterEvent(context.Background(), ClusterEvent{
 			Type:    "PREKEY_CLEAR",
 			OwnerID: batch.OwnerID,
-			Payload: batch.ZkpX + ":" + batch.ZkpY,
+			Payload: "",
 		})
 
 		for _, k := range batch.Keys {
@@ -201,7 +201,7 @@ func handlePreKeyStream(s network.Stream) {
 				OwnerID: targetID,
 			})
 		}
-		
+
 		resp, _ := json.Marshal(map[string]string{
 			"key_id":     keyID,
 			"public_key": pubKey,
@@ -224,11 +224,17 @@ func handlePreKeyStream(s network.Stream) {
 }
 
 func verifyBatchSignature(batch PreKeyBatch) error {
-	if batch.Signature == "" { return fmt.Errorf("missing signature") }
+	if batch.Signature == "" {
+		return fmt.Errorf("missing signature")
+	}
 	ownerID, err := peer.Decode(batch.OwnerID)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	pubKey, err := ownerID.ExtractPublicKey()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	var buf bytes.Buffer
 	buf.WriteString(batch.OwnerID)
@@ -238,10 +244,14 @@ func verifyBatchSignature(batch PreKeyBatch) error {
 	}
 
 	sigBytes, err := base64.StdEncoding.DecodeString(batch.Signature)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	valid, err := pubKey.Verify(buf.Bytes(), sigBytes)
-	if !valid || err != nil { return fmt.Errorf("invalid signature") }
+	if !valid || err != nil {
+		return fmt.Errorf("invalid signature")
+	}
 	return nil
 }
 
@@ -249,7 +259,9 @@ func UploadPreKeys(ctx context.Context, h host.Host, relayID peer.ID, batch PreK
 	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	s, err := h.NewStream(dialCtx, relayID, PreKeyProtocolID)
 	cancel()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer s.Close()
 
 	_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
@@ -261,7 +273,9 @@ func UploadPreKeys(ctx context.Context, h host.Host, relayID peer.ID, batch PreK
 	compressedData := buf.Bytes()
 
 	_, err = s.Write([]byte(fmt.Sprintf("UPLOAD_GZIP %d\n", len(compressedData))))
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	_, err = s.Write(compressedData)
 	return err
 }
@@ -270,18 +284,24 @@ func FetchPreKey(ctx context.Context, h host.Host, relayID peer.ID, targetID str
 	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	s, err := h.NewStream(dialCtx, relayID, PreKeyProtocolID)
 	cancel()
-	if err != nil { return "", "", "", err }
+	if err != nil {
+		return "", "", "", err
+	}
 	defer s.Close()
 
 	_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = s.Write([]byte(fmt.Sprintf("FETCH %s\n", targetID)))
-	if err != nil { return "", "", "", err }
+	if err != nil {
+		return "", "", "", err
+	}
 
 	_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := bufio.NewReader(s)
 	resp, err := buf.ReadString('\n')
-	if err != nil { return "", "", "", err }
-	
+	if err != nil {
+		return "", "", "", err
+	}
+
 	logger.Debug().Str("peerID", relayID.String()).Str("resp", strings.TrimSpace(resp)).Msg("Pre-key relay response")
 
 	if strings.HasPrefix(resp, "ERROR") {
@@ -296,11 +316,15 @@ func FetchPreKey(ctx context.Context, h host.Host, relayID peer.ID, targetID str
 }
 
 func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKey crypto.PrivKey) error {
-	if relayID == h.ID() { return nil }
+	if relayID == h.ID() {
+		return nil
+	}
 
 	protos, err := h.Peerstore().GetProtocols(relayID)
-	if err != nil { return err }
-	
+	if err != nil {
+		return err
+	}
+
 	isInfra := false
 	for _, p := range protos {
 		if string(p) == "/p2p-core/infra/1.1.0" {
@@ -308,44 +332,45 @@ func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKe
 			break
 		}
 	}
-	if !isInfra { return nil }
+	if !isInfra {
+		return nil
+	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	s, err := h.NewStream(dialCtx, relayID, PreKeyProtocolID)
 	cancel()
-	if err != nil { return err }
-	
+	if err != nil {
+		return err
+	}
+
 	_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = s.Write([]byte(fmt.Sprintf("COUNT %s\n", h.ID().String())))
-	if err != nil { s.Reset(); return err }
+	if err != nil {
+		s.Reset()
+		return err
+	}
 
 	_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := bufio.NewReader(s)
 	resp, err := buf.ReadString('\n')
 	s.Close()
-	
-	if err != nil { return err }
+
+	if err != nil {
+		return err
+	}
 	count := 0
 	fmt.Sscanf(strings.TrimSpace(resp), "%d", &count)
 
 	localCount := corestore.GetPreKeyCount(h.ID().String())
 	// Only refill if relay stock or local stock is low — never wipe existing keys on startup
-	if localCount >= 10 && count >= 10 { return nil }
+	if localCount >= 10 && count >= 10 {
+		return nil
+	}
 
 	logger.Info().Int("relay_count", count).Int("local_count", localCount).Str("peerID", relayID.String()).Msg("Pre-keys stock low, refilling without clearing existing keys")
-	
-	_, zkpX, zkpY, errDerive := corecrypto.DeriveZKPKeypair(privKey)
-	var zkpXB64, zkpYB64 string
-	if errDerive == nil {
-		zkpXB64 = base64.StdEncoding.EncodeToString(zkpX.Bytes())
-		zkpYB64 = base64.StdEncoding.EncodeToString(zkpY.Bytes())
-		_ = corestore.SaveZKPMember(h.ID().String(), zkpXB64, zkpYB64)
-	}
 
 	batch := PreKeyBatch{
 		OwnerID: h.ID().String(),
-		ZkpX:    zkpXB64,
-		ZkpY:    zkpYB64,
 	}
 	var sigBuf bytes.Buffer
 	sigBuf.WriteString(batch.OwnerID)
@@ -354,17 +379,17 @@ func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKe
 		priv, pub, _ := corecrypto.GenerateEphemeralKeypair()
 		pubB64 := base64.StdEncoding.EncodeToString(pub)
 		privB64 := base64.StdEncoding.EncodeToString(priv)
-		
+
 		sig, _ := corecrypto.Sign(privKey, pub)
 		sigB64 := base64.StdEncoding.EncodeToString(sig)
 		keyID := fmt.Sprintf("%x", sha256.Sum256(pub))[:12]
-		
+
 		corestore.SavePreKey(h.ID().String(), keyID, pubB64, privB64, sigB64)
 		batch.Keys = append(batch.Keys, OneTimeKey{KeyID: keyID, PublicKey: pubB64, Signature: sigB64})
 		sigBuf.WriteString(keyID)
 		sigBuf.WriteString(pubB64)
 	}
-	
+
 	batchSig, _ := privKey.Sign(sigBuf.Bytes())
 	batch.Signature = base64.StdEncoding.EncodeToString(batchSig)
 

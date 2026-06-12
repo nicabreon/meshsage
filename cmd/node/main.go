@@ -128,6 +128,11 @@ func main() {
 	if err := corestore.InitDatabase(*dbFile); err != nil {
 		logger.Fatal().Err(err).Msg("Failed to initialize database")
 	}
+	if priv != nil {
+		if rawKeyBytes, err := priv.Raw(); err == nil {
+			corestore.SetDBEncryptionKey(rawKeyBytes)
+		}
+	}
 
 	// Inject database check callback to networking package to break import cycle
 	corenet.HasActiveSessionFn = func(peerID string) bool {

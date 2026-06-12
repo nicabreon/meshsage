@@ -29,9 +29,9 @@ type MessageEvent struct {
 
 // StatusEvent represents a delivery status update for a previously sent message
 type StatusEvent struct {
-	RefID  string `json:"ref_id"`  // ID of the original sent message
-	Status string `json:"status"`  // e.g. "delivered"
-	Sender string `json:"sender"`  // peer who acknowledged
+	RefID  string `json:"ref_id"` // ID of the original sent message
+	Status string `json:"status"` // e.g. "delivered"
+	Sender string `json:"sender"` // peer who acknowledged
 }
 
 // MessageCallback is a global hook invoked when new direct or group messages are decrypted
@@ -48,7 +48,6 @@ type SubscriptionStatusEvent struct {
 
 // SubscriptionStatusCallback is a global hook invoked when push notification subscription status changes
 var SubscriptionStatusCallback func(event SubscriptionStatusEvent)
-
 
 // FormatSender returns a human-friendly sender label:
 //   - "@alias" if the peer has a known alias registered locally

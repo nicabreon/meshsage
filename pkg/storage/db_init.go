@@ -106,13 +106,14 @@ func InitDatabase(dbPath string) error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
-	-- Create skipped_keys table for out-of-order messages
-	CREATE TABLE IF NOT EXISTS skipped_keys (
+	-- Create skipped_keys_v2 table for out-of-order messages (isolated by ratchet epoch)
+	CREATE TABLE IF NOT EXISTS skipped_keys_v2 (
 		peer_id TEXT,
+		ratchet_pub TEXT,
 		counter INTEGER,
 		msg_key TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		PRIMARY KEY (peer_id, counter)
+		PRIMARY KEY (peer_id, ratchet_pub, counter)
 	);
 
 	-- 7. Group Sender Keys (Keys received from others)
@@ -181,14 +182,6 @@ func InitDatabase(dbPath string) error {
 		role TEXT CHECK(role IN ('CREATOR', 'MEMBER')) DEFAULT 'MEMBER',
 		joined_at INTEGER NOT NULL,
 		PRIMARY KEY (group_id, peer_id)
-	);
-
-	-- Create zkp_members table for ZKP public keys of active members
-	CREATE TABLE IF NOT EXISTS zkp_members (
-		peer_id TEXT PRIMARY KEY,
-		zkp_x TEXT NOT NULL,
-		zkp_y TEXT NOT NULL,
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
 	-- 10. Network stats (cumulative data usage, persisted across sessions)

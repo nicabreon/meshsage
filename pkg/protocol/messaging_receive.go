@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -203,7 +202,8 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			defer sessionMu.Unlock()
 
 			// A. Cek Skipped Keys dulu
-			skippedKey, skippedErr := corestore.GetSkippedKey(senderID.String(), uint32(counter))
+			remoteRatchetPub, _ := base64.StdEncoding.DecodeString(headerParts[0])
+			skippedKey, skippedErr := corestore.GetSkippedKey(senderID.String(), remoteRatchetPub, uint32(counter))
 			if skippedErr == nil {
 				logger.Info().Str("peerID", senderID.String()).Uint32("counter", uint32(counter)).Msg("DR: Using skipped message key")
 				// BUG-02 FIX: Gunakan DecryptMessage (bukan DecryptMessageRaw) karena
@@ -230,14 +230,15 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				// Do NOT send RESET here (we have nothing to reset).
 				// Instead, ask the sender to start fresh X3DH.
 				go sendRequestX3DH(ctx, h, senderID)
-				pushDecryptionErrorToUI(senderID, "No E2EE session found for decryption (requires X3DH handshake)")
+				pushDecryptionErrorToUI(h, senderID, "No E2EE session found for decryption (requires X3DH handshake)")
 				return
 			}
 
 			rootKey, _ := base64.StdEncoding.DecodeString(rootB64)
 			sendChain, _ := base64.StdEncoding.DecodeString(sendB64)
 			recvChain, _ := base64.StdEncoding.DecodeString(recvB64)
-			remoteRatchetPub, _ := base64.StdEncoding.DecodeString(remoteRatchetB64)
+			remoteRatchetPub = nil
+			remoteRatchetPub, _ = base64.StdEncoding.DecodeString(remoteRatchetB64)
 			localRatchetPriv, _ := base64.StdEncoding.DecodeString(localRatchetPrivB64)
 			localRatchetPub, _ := base64.StdEncoding.DecodeString(localRatchetPubB64)
 
@@ -265,22 +266,14 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				_ = corestore.DeleteSession(senderID.String())
 				_ = corestore.ClearSkippedKeys(senderID.String())
 				go sendRequestX3DH(ctx, h, senderID)
-				pushDecryptionErrorToUI(senderID, "Double Ratchet decryption failed: "+err.Error())
+				pushDecryptionErrorToUI(h, senderID, "Double Ratchet decryption failed: "+err.Error())
 				return
 			}
 
 			// Berhasil dekripsi! Simpan state baru
-			// BUG-1 FIX: If the session.RemoteRatchetPubkey changed during DecryptWithRatchet,
-			// a DH ratchet step occurred. Clear ALL old skipped keys — they belong to the old
-			// epoch and will permanently fail decryption.
-			oldRemoteRatchet, _ := base64.StdEncoding.DecodeString(remoteRatchetB64)
-			if !bytes.Equal(oldRemoteRatchet, session.RemoteRatchetPubkey) {
-				if clearErr := corestore.ClearSkippedKeys(senderID.String()); clearErr != nil {
-					logger.Warn().Err(clearErr).Str("peerID", senderID.String()).Msg("DR: Failed to clear stale skipped keys after DH step")
-				} else {
-					logger.Debug().Str("peerID", senderID.String()).Msg("DR: DH ratchet step detected — cleared stale skipped keys")
-				}
-			}
+			// We no longer clear skipped keys on DH ratchet step because skipped keys are now
+			// correctly isolated by ratchet epoch (ratchet_pub) in the database.
+			// Old epoch keys are kept so out-of-order messages from the old epoch can still be decrypted.
 			corestore.SaveSession(senderID.String(), remoteIdentityB64,
 				base64.StdEncoding.EncodeToString(session.RootKey),
 				base64.StdEncoding.EncodeToString(session.SendChainKey),
@@ -291,8 +284,8 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 				session.N, session.M, session.PN, session.OutboundMessagesSinceRatchet)
 
 			// Simpan skipped keys
-			for c, k := range skipped {
-				corestore.SaveSkippedKey(senderID.String(), c, k)
+			for _, sk := range skipped {
+				corestore.SaveSkippedKey(senderID.String(), sk.RatchetPub, sk.Counter, sk.MsgKey)
 			}
 
 			logger.Info().Str("senderID", senderID.String()).Msg("ProcessSecureEnvelope: Double Ratchet envelope decrypted successfully")
@@ -332,7 +325,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			logger.Error().Str("keyID", keyID).Str("senderID", senderID.String()).Msg("Receiver's Pre-Key not found (expired or rotated). Requesting fresh X3DH from sender.")
 			// Tell sender to fetch a fresh pre-key and retry with a new X3DH handshake.
 			go sendRequestX3DH(ctx, h, senderID)
-			pushDecryptionErrorToUI(senderID, "Receiver's pre-key not found in local DB (expired or rotated)")
+			pushDecryptionErrorToUI(h, senderID, "Receiver's pre-key not found in local DB (expired or rotated)")
 			return
 		}
 		privKeyBytes, _ := base64.StdEncoding.DecodeString(privKeyB64)
@@ -412,7 +405,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			snippet = snippet[:50] + "..."
 		}
 		logger.Warn().Str("senderID", senderID.String()).Str("envelope", snippet).Msg("ProcessSecureEnvelope: unknown or unhandled envelope type")
-		pushDecryptionErrorToUI(senderID, "Unknown envelope prefix (envelope: "+snippet+")")
+		pushDecryptionErrorToUI(h, senderID, "Unknown envelope prefix (envelope: "+snippet+")")
 		return
 	}
 
@@ -426,7 +419,7 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 		_ = corestore.ClearSkippedKeys(senderID.String())
 		// Ask sender to restart with a new X3DH
 		go sendRequestX3DH(ctx, h, senderID)
-		pushDecryptionErrorToUI(senderID, "X3DH decryption failed: "+err.Error())
+		pushDecryptionErrorToUI(h, senderID, "X3DH decryption failed: "+err.Error())
 		return
 	}
 
@@ -457,7 +450,7 @@ func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID,
 	var env MessageEnvelope
 	if err := json.Unmarshal(plaintextBytes, &env); err != nil {
 		logger.Error().Err(err).Str("plaintext", string(plaintextBytes)).Msg("processDecryptedPayload: failed to unmarshal decrypted JSON payload")
-		pushDecryptionErrorToUI(senderID, "Failed to parse decrypted message JSON: "+err.Error())
+		pushDecryptionErrorToUI(h, senderID, "Failed to parse decrypted message JSON: "+err.Error())
 		return false
 	}
 	logger.Info().Str("msgID", env.ID).Str("type", env.Type).Msg("processDecryptedPayload: successfully unmarshaled decrypted JSON envelope")
@@ -482,15 +475,15 @@ func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID,
 	return handleIncomingPayload(ctx, h, senderID, env, msgHash)
 }
 
-func pushDecryptionErrorToUI(senderID peer.ID, errStr string) {
+func pushDecryptionErrorToUI(h host.Host, senderID peer.ID, errStr string) {
 	if MessageCallback != nil {
 		ts := time.Now().Format("02/01 15:04:05")
 		errID := fmt.Sprintf("err-%x", sha256.Sum256([]byte(errStr+time.Now().String())))[:8]
 		content := "[Error: Failed to decrypt message: " + errStr + "]"
 
 		// Simpan error ini ke SQLite database lokal agar tersimpan di chat history
-		if localHost != nil {
-			_ = corestore.SaveMessage(senderID.String(), localHost.ID().String(), content, "", "", "direct")
+		if h != nil {
+			_ = corestore.SaveMessage(senderID.String(), h.ID().String(), content, "", "", "direct")
 		}
 
 		MessageCallback(MessageEvent{
@@ -524,19 +517,19 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 		avatarKey := env.Content
 		if avatarKey != "" {
 			name, cid, _, path, err := corestore.GetPeerProfile(senderID.String())
-			if err == nil && name != "" {
-				_ = corestore.SavePeerProfile(senderID.String(), name, cid, avatarKey, path)
-				if cid != "" {
-					TriggerAvatarDownload(senderID.String(), cid, avatarKey)
-				}
+			if err != nil {
+				name = ""
+				cid = ""
+				path = ""
+			}
+			_ = corestore.SavePeerProfile(senderID.String(), name, cid, avatarKey, path)
+			if cid != "" {
+				TriggerAvatarDownload(senderID.String(), cid, avatarKey)
 			}
 		}
 		// Notify Dart UI of profile update
-		if MessageCallback != nil {
-			MessageCallback(MessageEvent{
-				Type:   "profile_updated",
-				Sender: senderID.String(),
-			})
+		if ProfileUpdateCallback != nil {
+			ProfileUpdateCallback(senderID.String())
 		}
 		return true
 
@@ -555,11 +548,8 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 			}
 		}
 		// Notify Dart UI of profile update
-		if MessageCallback != nil {
-			MessageCallback(MessageEvent{
-				Type:   "profile_updated",
-				Sender: senderID.String(),
-			})
+		if ProfileUpdateCallback != nil {
+			ProfileUpdateCallback(senderID.String())
 		}
 		return true
 

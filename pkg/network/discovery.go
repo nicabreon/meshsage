@@ -4,12 +4,12 @@ import (
 	"context"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/discovery"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	"github.com/libp2p/go-libp2p/core/discovery"
 	"github.com/nicabreon/meshsage/pkg/logger"
 )
 
@@ -27,9 +27,11 @@ type mdnsNotifee struct {
 
 // HandlePeerFound connects to peers discovered via mDNS
 func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	if pi.ID == n.h.ID() { return }
+	if pi.ID == n.h.ID() {
+		return
+	}
 	logger.Debug().Str("peerID", pi.ID.String()).Msg("mDNS: Found local peer")
-	
+
 	// Automatically connect to the discovered peer
 	err := n.h.Connect(context.Background(), pi)
 	if err != nil {
@@ -77,11 +79,11 @@ func SetupDiscovery(ctx context.Context, h host.Host) error {
 
 			if GlobalDHT != nil {
 				routingDisc := routing.NewRoutingDiscovery(GlobalDHT)
-				
+
 				// A. Advertise our presence on the DHT
 				logger.Debug().Msg("DHT Discovery: Advertising our presence to the swarm...")
 				routingDisc.Advertise(ctx, DiscoveryServiceTag, discovery.TTL(10*time.Minute))
-				
+
 				// B. Find other peers advertising on the DHT
 				peerChan, err := routingDisc.FindPeers(ctx, DiscoveryServiceTag, discovery.Limit(15))
 				if err == nil {
@@ -89,7 +91,7 @@ func SetupDiscovery(ctx context.Context, h host.Host) error {
 						if pinfo.ID == h.ID() {
 							continue
 						}
-						
+
 						// Connect if not already connected
 						if h.Network().Connectedness(pinfo.ID) != network.Connected {
 							// Khusus Dedicated Relay: Hanya lakukan dial keluar ke peer yang memiliki alamat IP publik valid (Relay/Hybrid).
@@ -100,12 +102,12 @@ func SetupDiscovery(ctx context.Context, h host.Host) error {
 							}
 
 							logger.Info().Str("peerID", pinfo.ID.String()).Msg("DHT Discovery: Attempting connection to discovered peer")
-							
+
 							// Run dial in a separate goroutine so it doesn't block the channel reader
 							go func(pi peer.AddrInfo) {
 								dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 								defer cancel()
-								
+
 								errDial := h.Connect(dialCtx, pi)
 								if errDial == nil {
 									logger.Info().Str("peerID", pi.ID.String()).Msg("DHT Discovery: Successfully connected")
@@ -117,7 +119,7 @@ func SetupDiscovery(ctx context.Context, h host.Host) error {
 					}
 				}
 			}
-			
+
 			// Poll peer discovery every 2 minutes, with cancellation check
 			select {
 			case <-time.After(2 * time.Minute):

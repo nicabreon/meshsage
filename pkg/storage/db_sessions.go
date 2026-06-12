@@ -10,10 +10,27 @@ func SaveSession(peerID, remoteIdentityKey, rootKey, sendChainKey, recvChainKey,
 	if DB == nil {
 		return fmt.Errorf("database not initialized")
 	}
-	_, err := DB.Exec(`INSERT OR REPLACE INTO sessions 
+	encRoot, err := EncryptColumn(rootKey)
+	if err != nil {
+		return err
+	}
+	encSend, err := EncryptColumn(sendChainKey)
+	if err != nil {
+		return err
+	}
+	encRecv, err := EncryptColumn(recvChainKey)
+	if err != nil {
+		return err
+	}
+	encLocalRatchet, err := EncryptColumn(localRatchetPriv)
+	if err != nil {
+		return err
+	}
+
+	_, err = DB.Exec(`INSERT OR REPLACE INTO sessions 
 		(peer_id, remote_identity_key, root_key, send_chain_key, recv_chain_key, remote_ratchet_pubkey, local_ratchet_privkey, local_ratchet_pubkey, n, m, pn, outbound_msgs_since_ratchet, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		peerID, remoteIdentityKey, rootKey, sendChainKey, recvChainKey, remoteRatchetPub, localRatchetPriv, localRatchetPub, n, m, pn, outboundMsgsSinceRatchet)
+		peerID, remoteIdentityKey, encRoot, encSend, encRecv, remoteRatchetPub, encLocalRatchet, localRatchetPub, n, m, pn, outboundMsgsSinceRatchet)
 	return err
 }
 
@@ -22,44 +39,62 @@ func LoadSession(peerID string) (remoteIdentityKey, rootKey, sendChainKey, recvC
 	if DB == nil {
 		return "", "", "", "", "", "", "", 0, 0, 0, 0, fmt.Errorf("database not initialized")
 	}
+	var encRoot, encSend, encRecv, encLocalRatchet string
 	row := DB.QueryRow(`SELECT remote_identity_key, root_key, send_chain_key, recv_chain_key, remote_ratchet_pubkey, local_ratchet_privkey, local_ratchet_pubkey, n, m, pn, outbound_msgs_since_ratchet FROM sessions WHERE peer_id = ?`, peerID)
-	err = row.Scan(&remoteIdentityKey, &rootKey, &sendChainKey, &recvChainKey, &remoteRatchetPub, &localRatchetPriv, &localRatchetPub, &n, &m, &pn, &outboundMsgsSinceRatchet)
+	err = row.Scan(&remoteIdentityKey, &encRoot, &encSend, &encRecv, &remoteRatchetPub, &encLocalRatchet, &localRatchetPub, &n, &m, &pn, &outboundMsgsSinceRatchet)
+	if err != nil {
+		return
+	}
+	rootKey, err = DecryptColumn(encRoot)
+	if err != nil {
+		return
+	}
+	sendChainKey, err = DecryptColumn(encSend)
+	if err != nil {
+		return
+	}
+	recvChainKey, err = DecryptColumn(encRecv)
+	if err != nil {
+		return
+	}
+	localRatchetPriv, err = DecryptColumn(encLocalRatchet)
 	return
 }
 
 // SaveSkippedKey stores a message key for an out-of-order message.
-func SaveSkippedKey(peerID string, counter uint32, key []byte) error {
+func SaveSkippedKey(peerID string, ratchetPub []byte, counter uint32, key []byte) error {
 	if DB == nil {
 		return fmt.Errorf("database not initialized")
 	}
-	_, err := DB.Exec(`INSERT OR REPLACE INTO skipped_keys (peer_id, counter, msg_key) VALUES (?, ?, ?)`,
-		peerID, counter, base64.StdEncoding.EncodeToString(key))
+	ratchetPubB64 := base64.StdEncoding.EncodeToString(ratchetPub)
+	_, err := DB.Exec(`INSERT OR REPLACE INTO skipped_keys_v2 (peer_id, ratchet_pub, counter, msg_key) VALUES (?, ?, ?, ?)`,
+		peerID, ratchetPubB64, counter, base64.StdEncoding.EncodeToString(key))
 	return err
 }
 
 // GetSkippedKey retrieves and DELETES a message key for an out-of-order message.
-func GetSkippedKey(peerID string, counter uint32) ([]byte, error) {
+func GetSkippedKey(peerID string, ratchetPub []byte, counter uint32) ([]byte, error) {
 	if DB == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
 	var keyStr string
-	err := DB.QueryRow(`SELECT msg_key FROM skipped_keys WHERE peer_id = ? AND counter = ?`, peerID, counter).Scan(&keyStr)
+	ratchetPubB64 := base64.StdEncoding.EncodeToString(ratchetPub)
+	err := DB.QueryRow(`SELECT msg_key FROM skipped_keys_v2 WHERE peer_id = ? AND ratchet_pub = ? AND counter = ?`, peerID, ratchetPubB64, counter).Scan(&keyStr)
 	if err != nil {
 		return nil, err
 	}
 	// Delete after retrieval (one-time use)
-	DB.Exec(`DELETE FROM skipped_keys WHERE peer_id = ? AND counter = ?`, peerID, counter)
+	DB.Exec(`DELETE FROM skipped_keys_v2 WHERE peer_id = ? AND ratchet_pub = ? AND counter = ?`, peerID, ratchetPubB64, counter)
 	return base64.StdEncoding.DecodeString(keyStr)
 }
 
 // ClearSkippedKeys removes ALL skipped keys for a peer.
-// Must be called whenever a DH Ratchet step occurs or a new X3DH session is established,
-// because old epoch keys are permanently invalid.
+// Used when resetting sessions or destroying stale states.
 func ClearSkippedKeys(peerID string) error {
 	if DB == nil {
 		return fmt.Errorf("database not initialized")
 	}
-	_, err := DB.Exec(`DELETE FROM skipped_keys WHERE peer_id = ?`, peerID)
+	_, err := DB.Exec(`DELETE FROM skipped_keys_v2 WHERE peer_id = ?`, peerID)
 	return err
 }
 

@@ -110,6 +110,7 @@ extern char* JoinGroup(char* groupIDStr, char* membersStr);
 extern char* CreateGroup(char* membersStr);
 extern char* SetAlias(char* peerIDStr, char* aliasStr);
 extern char* GetAliasByPeerID(char* peerIDStr);
+extern char* SearchLocalAliases(char* queryStr);
 extern char* ResolveAlias(char* aliasStr);
 extern char* GetLocalPeerID(void);
 extern char* PollEvent(void);
@@ -136,6 +137,7 @@ extern char* GetIceServers(void);
 extern void SetLocalProfile(char* displayNameVal, char* avatarCIDVal, char* avatarKeyVal);
 extern char* GetPeerProfile(char* peerIDVal);
 extern void ResolveOfflineProfile(char* peerIDVal);
+extern char* DownloadPeerAvatar(char* peerIDVal);
 extern char* SendProfileKeyShare(char* peerIDVal);
 extern void BroadcastProfileUpdate(char* targetsCSV, char* displayNameVal, char* avatarCIDVal, char* avatarKeyVal);
 

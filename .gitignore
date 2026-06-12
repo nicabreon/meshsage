@@ -45,3 +45,6 @@ test_run/
 *.db
 *.db-shm
 *.db-wal
+
+# Native build outputs
+build/

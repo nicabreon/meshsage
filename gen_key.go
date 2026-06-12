@@ -1,11 +1,13 @@
 package main
+
 import (
+	"encoding/base64"
 	"fmt"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"encoding/base64"
 	"os"
 )
+
 func main() {
 	priv, _, _ := crypto.GenerateKeyPair(crypto.Ed25519, -1)
 	bytes, _ := crypto.MarshalPrivateKey(priv)

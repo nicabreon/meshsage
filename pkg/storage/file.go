@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
-	"github.com/ipfs/go-cid"
 	blocks "github.com/ipfs/go-block-format"
+	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	corecrypto "github.com/nicabreon/meshsage/pkg/crypto"
+	"github.com/nicabreon/meshsage/pkg/logger"
 	corenet "github.com/nicabreon/meshsage/pkg/network"
 )
 
@@ -37,7 +39,7 @@ func createBlock(ctx context.Context, data []byte) (cid.Cid, error) {
 	if err != nil {
 		return cid.Undef, err
 	}
-	
+
 	c := cid.NewCidV1(cid.Raw, hash)
 	blk, err := blocks.NewBlockWithCid(data, c)
 	if err != nil {
@@ -55,7 +57,7 @@ func createBlock(ctx context.Context, data []byte) (cid.Cid, error) {
 	// Important: Tell the DHT that we are providing this block
 	// so other nodes in different networks can find us via the Relay/DHT.
 	_ = corenet.GlobalDHT.Provide(ctx, c, true)
-	
+
 	return c, nil
 }
 
@@ -63,23 +65,31 @@ func createBlock(ctx context.Context, data []byte) (cid.Cid, error) {
 func UploadFile(ctx context.Context, data []byte, filename string) (string, string, string, error) {
 	// 1. Generate single-use symmetric key
 	fileKey, err := GenerateRandomKey()
-	if err != nil { return "", "", "", err }
+	if err != nil {
+		return "", "", "", err
+	}
 
 	// 2. Encrypt the entire file content
 	encryptedStr, err := corecrypto.EncryptMessage(fileKey, string(data))
-	if err != nil { return "", "", "", err }
-	
+	if err != nil {
+		return "", "", "", err
+	}
+
 	encBytes := []byte(encryptedStr)
 	totalSize := len(encBytes)
-	
+
 	// 3. Chunk and seed to Bitswap
 	var chunkCIDs []string
 	for i := 0; i < totalSize; i += chunkSize {
 		end := i + chunkSize
-		if end > totalSize { end = totalSize }
-		
+		if end > totalSize {
+			end = totalSize
+		}
+
 		c, err := createBlock(ctx, encBytes[i:end])
-		if err != nil { return "", "", "", err }
+		if err != nil {
+			return "", "", "", err
+		}
 		chunkCIDs = append(chunkCIDs, c.String())
 	}
 
@@ -92,7 +102,9 @@ func UploadFile(ctx context.Context, data []byte, filename string) (string, stri
 	}
 	manifestBytes, _ := json.Marshal(manifest)
 	manifestCID, err := createBlock(ctx, manifestBytes)
-	if err != nil { return "", "", "", err }
+	if err != nil {
+		return "", "", "", err
+	}
 
 	keyB64 := base64.StdEncoding.EncodeToString(fileKey)
 	return manifestCID.String(), keyB64, manifest.Thumbnail, nil
@@ -106,7 +118,7 @@ func generateMockThumbnail(filename string) string {
 	if len(parts) > 1 {
 		ext = strings.ToUpper(parts[len(parts)-1])
 	}
-	
+
 	if ext == "JPG" || ext == "PNG" || ext == "JPEG" {
 		return "BASE64_IMAGE_PREVIEW_DATA_STUB"
 	}
@@ -117,10 +129,40 @@ func generateMockThumbnail(filename string) string {
 func DownloadFile(ctx context.Context, manifestCIDStr, keyB64 string) ([]byte, string, error) {
 	// 1. Fetch Manifest
 	mCID, err := cid.Decode(manifestCIDStr)
-	if err != nil { return nil, "", err }
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Proactive Provider Search & Connection
+	if corenet.GlobalDHT != nil && corenet.GlobalHost != nil {
+		logger.Info().Str("cid", manifestCIDStr).Msg("DownloadFile: Proactively searching DHT for providers...")
+		findCtx, findCancel := context.WithTimeout(ctx, 10*time.Second)
+		providers, findErr := corenet.GlobalDHT.FindProviders(findCtx, mCID)
+		findCancel()
+		if findErr == nil {
+			logger.Info().Str("cid", manifestCIDStr).Int("providers", len(providers)).Msg("DownloadFile: Found providers in DHT")
+			for _, provider := range providers {
+				if provider.ID == corenet.GlobalHost.ID() {
+					continue
+				}
+				logger.Info().Str("peerID", provider.ID.String()).Msg("DownloadFile: Proactively connecting to provider...")
+				dialCtx, dialCancel := context.WithTimeout(ctx, 3*time.Second)
+				if connectErr := corenet.GlobalHost.Connect(dialCtx, provider); connectErr != nil {
+					logger.Debug().Err(connectErr).Str("peer", provider.ID.String()).Msg("DownloadFile: failed to connect to provider")
+				} else {
+					logger.Info().Str("peer", provider.ID.String()).Msg("DownloadFile: connected successfully")
+				}
+				dialCancel()
+			}
+		} else {
+			logger.Warn().Err(findErr).Str("cid", manifestCIDStr).Msg("DownloadFile: DHT provider search failed")
+		}
+	}
 
 	mBlock, err := corenet.GlobalBlockService.GetBlock(ctx, mCID)
-	if err != nil { return nil, "", err }
+	if err != nil {
+		return nil, "", err
+	}
 
 	var manifest FileManifest
 	if err := json.Unmarshal(mBlock.RawData(), &manifest); err != nil {
@@ -136,7 +178,7 @@ func DownloadFile(ctx context.Context, manifestCIDStr, keyB64 string) ([]byte, s
 
 	// This triggers Kademlia Provider Search + Bitswap Swarm Downloads automatically!
 	blockChan := corenet.GlobalBlockService.GetBlocks(ctx, cids)
-	
+
 	blocksMap := make(map[string][]byte)
 	for b := range blockChan {
 		blocksMap[b.Cid().String()] = b.RawData()
@@ -153,10 +195,14 @@ func DownloadFile(ctx context.Context, manifestCIDStr, keyB64 string) ([]byte, s
 
 	// 3. Decrypt
 	fileKey, err := base64.StdEncoding.DecodeString(keyB64)
-	if err != nil { return nil, "", err }
+	if err != nil {
+		return nil, "", err
+	}
 
 	decryptedStr, err := corecrypto.DecryptMessage(fileKey, string(assembled))
-	if err != nil { return nil, "", err }
+	if err != nil {
+		return nil, "", err
+	}
 
 	return []byte(decryptedStr), manifest.Name, nil
 }

@@ -1,13 +1,5 @@
 package storage
 
-import (
-	"encoding/base64"
-	"fmt"
-	"math/big"
-
-	"github.com/nicabreon/meshsage/pkg/crypto"
-)
-
 // TrackBlock records when a block was added for later GC.
 func TrackBlock(cidStr string) error {
 	if DB == nil {
@@ -65,47 +57,5 @@ func SaveNetworkStats(totalSent, totalRecv, msgSent, msgRecv, handshakes, fileSe
 			(id, total_sent, total_recv, msg_sent, msg_recv, handshakes, file_sent, file_recv, last_updated)
 		VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		totalSent, totalRecv, msgSent, msgRecv, handshakes, fileSent, fileRecv)
-	return err
-}
-
-// SaveZKPMember stores a ZKP public key for a member.
-func SaveZKPMember(peerID string, xB64 string, yB64 string) error {
-	if DB == nil {
-		return fmt.Errorf("database not initialized")
-	}
-	_, err := DB.Exec("INSERT OR REPLACE INTO zkp_members (peer_id, zkp_x, zkp_y) VALUES (?, ?, ?)", peerID, xB64, yB64)
-	return err
-}
-
-// GetZKPMembers retrieves all active ZKP member public keys.
-func GetZKPMembers() (map[string]crypto.PubKeyPoint, error) {
-	if DB == nil {
-		return nil, fmt.Errorf("database not initialized")
-	}
-	rows, err := DB.Query("SELECT peer_id, zkp_x, zkp_y FROM zkp_members")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	members := make(map[string]crypto.PubKeyPoint)
-	for rows.Next() {
-		var peerID, xB64, yB64 string
-		if err := rows.Scan(&peerID, &xB64, &yB64); err != nil {
-			return nil, err
-		}
-		xBytes, _ := base64.StdEncoding.DecodeString(xB64)
-		yBytes, _ := base64.StdEncoding.DecodeString(yB64)
-		members[peerID] = crypto.PubKeyPoint{
-			X: new(big.Int).SetBytes(xBytes),
-			Y: new(big.Int).SetBytes(yBytes),
-		}
-	}
-	return members, nil
-}
-
-// CleanZKPMembersExceptOwner deletes all ZKP members except the specified owner ID.
-func CleanZKPMembersExceptOwner(ownerID string) error {
-	_, err := DB.Exec(`DELETE FROM zkp_members WHERE peer_id != ?`, ownerID)
 	return err
 }

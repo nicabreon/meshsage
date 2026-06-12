@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -83,13 +82,13 @@ func SetupReplicationHandler(h host.Host) {
 		manifestCIDStr := string(buf)
 		logger.Info().Str("manifestCID", manifestCIDStr).Msg("Received request to cache file")
 
-		go replicateFile(manifestCIDStr)
+		go ReplicateFile(h, manifestCIDStr)
 	})
 	logger.Info().Msg("Relay is ready to Auto-Cache files.")
 }
 
-// replicateFile is run by the Relay to proactively fetch and store chunks
-func replicateFile(manifestCIDStr string) {
+// ReplicateFile is run by the Relay to proactively search DHT, connect to providers, and store chunks
+func ReplicateFile(h host.Host, manifestCIDStr string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -97,6 +96,32 @@ func replicateFile(manifestCIDStr string) {
 	if err != nil {
 		logger.Error().Err(err).Str("manifestCID", manifestCIDStr).Msg("Invalid CID")
 		return
+	}
+
+	// Proactive Provider Search & Connection
+	if corenet.GlobalDHT != nil {
+		logger.Info().Str("cid", manifestCIDStr).Msg("Relay proactively searching DHT for providers...")
+		findCtx, findCancel := context.WithTimeout(ctx, 10*time.Second)
+		providers, findErr := corenet.GlobalDHT.FindProviders(findCtx, mCID)
+		findCancel()
+		if findErr == nil {
+			logger.Info().Str("cid", manifestCIDStr).Int("providers", len(providers)).Msg("Relay found providers in DHT")
+			for _, provider := range providers {
+				if provider.ID == h.ID() {
+					continue
+				}
+				logger.Info().Str("peerID", provider.ID.String()).Msg("Relay proactively connecting to file provider...")
+				dialCtx, dialCancel := context.WithTimeout(ctx, 3*time.Second)
+				if connectErr := h.Connect(dialCtx, provider); connectErr != nil {
+					logger.Debug().Err(connectErr).Str("peer", provider.ID.String()).Msg("Failed connecting to provider")
+				} else {
+					logger.Info().Str("peer", provider.ID.String()).Msg("Connected to provider successfully")
+				}
+				dialCancel()
+			}
+		} else {
+			logger.Warn().Err(findErr).Str("cid", manifestCIDStr).Msg("Relay failed to find providers in DHT")
+		}
 	}
 
 	// 1. Fetch Manifest
@@ -121,14 +146,16 @@ func replicateFile(manifestCIDStr string) {
 	}
 
 	blockChan := corenet.GlobalBlockService.GetBlocks(ctx, cids)
-	
+
 	fetched := 0
 	for b := range blockChan {
 		// Just by receiving it, GlobalBlockService (Bitswap) has cached it!
 		_ = corestore.TrackBlock(b.Cid().String())
-		
+
 		// We also want to explicitly Provide it to the DHT
-		_ = corenet.GlobalDHT.Provide(ctx, b.Cid(), true)
+		if corenet.GlobalDHT != nil {
+			_ = corenet.GlobalDHT.Provide(ctx, b.Cid(), true)
+		}
 		fetched++
 	}
 
@@ -138,18 +165,28 @@ func replicateFile(manifestCIDStr string) {
 // SetupClusterSync joins the gossip topic for metadata replication
 func SetupClusterSync(ctx context.Context, h host.Host) {
 	topic, err := corenet.GlobalPubSub.Join(ClusterSyncTopic)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	sub, err := topic.Subscribe()
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 
 	go func() {
 		for {
 			msg, err := sub.Next(ctx)
-			if err != nil { return }
-			if msg.ReceivedFrom == h.ID() { continue }
+			if err != nil {
+				return
+			}
+			if msg.ReceivedFrom == h.ID() {
+				continue
+			}
 
 			var event ClusterEvent
-			if err := json.Unmarshal(msg.Data, &event); err != nil { continue }
+			if err := json.Unmarshal(msg.Data, &event); err != nil {
+				continue
+			}
 
 			// DESIGN-07 FIX: Verifikasi signature HMAC-SHA256 untuk cluster event
 			if !VerifyClusterHMAC(event, ClusterSecretKey) {
@@ -178,13 +215,6 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 					// Only delete public-key-only entries (relay cache), preserve our own private keys
 					_ = corestore.DeletePublicPreKeysByOwner(event.OwnerID)
 					logger.Info().Str("ownerID", event.OwnerID[:8]).Msg("Synced pre-keys clear from cluster (preserved private keys)")
-					if event.Payload != "" && strings.Contains(event.Payload, ":") {
-						parts := strings.Split(event.Payload, ":")
-						if len(parts) == 2 {
-							_ = corestore.SaveZKPMember(event.OwnerID, parts[0], parts[1])
-							logger.Info().Str("ownerID", event.OwnerID[:8]).Msg("Synced ZKP public key from cluster")
-						}
-					}
 				}
 			case "PREKEY_DELETE":
 				if event.Hash != "" {
@@ -198,12 +228,17 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 
 // BroadcastClusterEvent sends a metadata event to the entire cluster
 func BroadcastClusterEvent(ctx context.Context, event ClusterEvent) {
+	if corenet.GlobalPubSub == nil {
+		return
+	}
 	topic, err := corenet.GlobalPubSub.Join(ClusterSyncTopic)
-	if err != nil { return }
-	
+	if err != nil {
+		return
+	}
+
 	// DESIGN-07 FIX: Tambahkan signature HMAC sebelum melakukan broadcast
 	event.Signature = GenerateClusterHMAC(event, ClusterSecretKey)
-	
+
 	data, _ := json.Marshal(event)
 	topic.Publish(ctx, data)
 }

@@ -21,14 +21,14 @@ var (
 func SetupBitswap(ctx context.Context, h host.Host, dhtRouting *dht.IpfsDHT) error {
 	ds := datastore.NewMapDatastore()
 	GlobalBlockStore = blockstore.NewBlockstore(ds)
-	
+
 	networkAdapter := bsnet.NewFromIpfsHost(h)
-	
+
 	// Correct order for boxo/bitswap: New(ctx, network, routing, blockstore)
 	exchange := bitswap.New(ctx, networkAdapter, dhtRouting, GlobalBlockStore)
-	
+
 	GlobalBlockService = blockservice.New(GlobalBlockStore, exchange)
-	
+
 	logger.Debug().Msg("Distributed Cluster Storage Engine (Bitswap) initialized")
 	return nil
 }

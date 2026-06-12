@@ -59,26 +59,26 @@ const (
 )
 
 type model struct {
-	ctx          context.Context
-	host         host.Host
-	processCmd   func(string)
+	ctx        context.Context
+	host       host.Host
+	processCmd func(string)
 
-	logs         []string
-	chats        []string
-	statusText   string
+	logs       []string
+	chats      []string
+	statusText string
 
 	logViewport  viewport.Model
 	chatViewport viewport.Model
 	input        textinput.Model
 
-	focus        focusState
-	width        int
-	height       int
+	focus  focusState
+	width  int
+	height int
 
 	// Command history support
-	history      []string
-	historyIdx   int
-	tempInput    string
+	history    []string
+	historyIdx int
+	tempInput  string
 }
 
 func initialModel(ctx context.Context, h host.Host, processCmd func(string)) model {

@@ -314,14 +314,14 @@ func TestDeleteSession(t *testing.T) {
 	defer corestore.DB.Close()
 
 	peerID := "12D3KooWTestDeleteSession"
-	
+
 	// 1. Simpan session dan skipped keys
 	err = corestore.SaveSession(peerID, "identity", "root", "send", "recv", "remoteRatchet", "localPriv", "localPub", 1, 2, 3, 0)
 	require.NoError(t, err)
 
-	err = corestore.SaveSkippedKey(peerID, 0, []byte("key0"))
+	err = corestore.SaveSkippedKey(peerID, []byte("dummyPub"), 0, []byte("key0"))
 	require.NoError(t, err)
-	err = corestore.SaveSkippedKey(peerID, 1, []byte("key1"))
+	err = corestore.SaveSkippedKey(peerID, []byte("dummyPub"), 1, []byte("key1"))
 	require.NoError(t, err)
 
 	// Verifikasi data masuk
@@ -329,7 +329,7 @@ func TestDeleteSession(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "root", rootB64)
 
-	skippedKey, err := corestore.GetSkippedKey(peerID, 0)
+	skippedKey, err := corestore.GetSkippedKey(peerID, []byte("dummyPub"), 0)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("key0"), skippedKey)
 
@@ -342,7 +342,7 @@ func TestDeleteSession(t *testing.T) {
 	assert.Error(t, err, "Session harusnya terhapus dan mengembalikan error")
 
 	// Verifikasi skipped keys juga terhapus
-	_, err = corestore.GetSkippedKey(peerID, 1)
+	_, err = corestore.GetSkippedKey(peerID, []byte("dummyPub"), 1)
 	assert.Error(t, err, "Skipped keys harusnya terhapus")
 }
 
@@ -513,6 +513,3 @@ func TestSignedEnvelopeVerification(t *testing.T) {
 	_, err2 := VerifySignedEnvelope(sigWrapped, pub2)
 	assert.Error(t, err2, "Signature verification should fail with wrong public key")
 }
-
-
-

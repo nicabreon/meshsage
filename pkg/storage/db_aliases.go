@@ -47,3 +47,37 @@ func DeleteAliasByHash(aliasHash string) error {
 	_, err := DB.Exec(`DELETE FROM alias_store WHERE alias_hash = ?`, aliasHash)
 	return err
 }
+
+// AliasSearchResult represents an alias search match.
+type AliasSearchResult struct {
+	AliasName string `json:"alias_name"`
+	PeerID    string `json:"peer_id"`
+}
+
+// SearchAliases searches the local alias store for aliases or peer IDs matching the query.
+func SearchAliases(query string) ([]AliasSearchResult, error) {
+	if DB == nil {
+		return nil, fmt.Errorf("database not initialized")
+	}
+	queryParam := "%" + query + "%"
+	rows, err := DB.Query(`
+		SELECT alias_name, peer_id FROM alias_store 
+		WHERE alias_name LIKE ? OR peer_id LIKE ? 
+		ORDER BY updated_at DESC 
+		LIMIT 20`, queryParam, queryParam)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []AliasSearchResult
+	for rows.Next() {
+		var name, pid string
+		if err := rows.Scan(&name, &pid); err != nil {
+			continue
+		}
+		results = append(results, AliasSearchResult{AliasName: name, PeerID: pid})
+	}
+	return results, nil
+}
+

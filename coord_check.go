@@ -1,9 +1,10 @@
-
 package main
+
 import (
 	"crypto/sha256"
 	"fmt"
 )
+
 func main() {
 	id := "12D3KooWN499RqNMPndYFwZ9WDYQW23UXHUj9fi7mWcntSSUXJiZ"
 	data := id + "mailbox"

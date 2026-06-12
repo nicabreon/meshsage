@@ -4,12 +4,12 @@ import "fmt"
 
 // MailboxMessage represents a pending offline message stored on a relay.
 type MailboxMessage struct {
-	ID          int    `json:"id"`
-	MsgHash     string `json:"msg_hash"`
-	RecipientID string `json:"recipient_id"`
+	ID           int    `json:"id"`
+	MsgHash      string `json:"msg_hash"`
+	RecipientID  string `json:"recipient_id"`
 	SenderPubkey string `json:"sender_pubkey"`
-	Payload     string `json:"payload"`
-	Timestamp   string `json:"timestamp"`
+	Payload      string `json:"payload"`
+	Timestamp    string `json:"timestamp"`
 }
 
 // SaveMailboxMessage stores an encrypted offline message for a recipient.

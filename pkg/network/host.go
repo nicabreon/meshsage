@@ -40,13 +40,14 @@ type Config struct {
 	ForcePublic    bool   // Paksa status keterjangkauan publik (khusus Relay)
 	IsDedicated    bool
 	IsClientOnly   bool
-	EnableRelay    bool   // Mengaktifkan libp2p relay client & AutoRelay
+	EnableRelay    bool // Mengaktifkan libp2p relay client & AutoRelay
 }
 
 // discoveredPublicIP holds the external IP discovered via STUN (thread-safe).
 var (
 	discoveredPublicIPMu sync.RWMutex
 	discoveredPublicIP   net.IP
+	GlobalHost           host.Host
 )
 
 // discoverPublicIPAsync queries a STUN server asynchronously to find our external/NAT-mapped IP.
@@ -54,7 +55,7 @@ var (
 func discoverPublicIPAsync(h host.Host) {
 	// List of public STUN servers to try in order
 	stunServers := []string{
-		"103.127.138.103:3478",      // Custom STUN server (priority)
+		"103.127.138.103:3478", // Custom STUN server (priority)
 		"stun.l.google.com:19302",
 		"stun1.l.google.com:19302",
 		"stun.cloudflare.com:3478",
@@ -293,8 +294,8 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	//                        Always enabled on all platforms including Android.
 	if !isAndroid {
 		opts = append(opts,
-			libp2p.NATPortMap(),        // UPnP/NAT-PMP (requires netlink — desktop only)
-			libp2p.EnableNATService(),  // AutoNAT probe (requires netlink — desktop only)
+			libp2p.NATPortMap(),       // UPnP/NAT-PMP (requires netlink — desktop only)
+			libp2p.EnableNATService(), // AutoNAT probe (requires netlink — desktop only)
 		)
 	}
 	// DCUtR Hole Punching: relay-based, safe on Android — always enabled
@@ -354,6 +355,7 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
+	GlobalHost = h
 
 	gater.Start(h)
 
@@ -711,8 +713,8 @@ func HasPublicAddr(addrs []multiaddr.Multiaddr) bool {
 		ip := extractIP(addr)
 		if ip == nil {
 			// Jika alamat berbasis DNS (seperti /dns4/example.com), anggap publik kecuali localhost/.local
-			if strings.Contains(addrStr, "/dns") && 
-				!strings.Contains(addrStr, "localhost") && 
+			if strings.Contains(addrStr, "/dns") &&
+				!strings.Contains(addrStr, "localhost") &&
 				!strings.Contains(addrStr, ".local") {
 				return true
 			}
@@ -727,5 +729,3 @@ func HasPublicAddr(addrs []multiaddr.Multiaddr) bool {
 	}
 	return false
 }
-
-

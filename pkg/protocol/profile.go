@@ -31,11 +31,20 @@ var (
 		avatarCID   string
 		avatarKey   string
 	}
+	ProfileUpdateCallback func(peerID string)
 )
+
+var ongoingDownloads sync.Map
+
+// completedDownloads tracks avatar CIDs that were already successfully downloaded
+// keyed by "peerID:cid" to avoid re-triggering on every widget rebuild.
+var completedDownloads sync.Map
 
 // SetupProfileService configures the host to handle profile requests
 func SetupProfileService(h host.Host) {
-	h.SetStreamHandler(ProfileProtocolID, handleProfileStream)
+	h.SetStreamHandler(ProfileProtocolID, func(s network.Stream) {
+		handleProfileStream(h, s)
+	})
 }
 
 // SetLocalProfileInfo sets our own profile info in memory (for responding to direct queries)
@@ -54,7 +63,7 @@ func GetProfileCoordinate(peerID string) string {
 	return fmt.Sprintf("%x", hasher.Sum(nil))
 }
 
-func handleProfileStream(s network.Stream) {
+func handleProfileStream(h host.Host, s network.Stream) {
 	remoteID := s.Conn().RemotePeer().String()
 	defer s.Close()
 
@@ -152,8 +161,8 @@ func handleProfileStream(s network.Stream) {
 
 				// Create signed record for Bob
 				var privKey crypto.PrivKey
-				if localHost != nil {
-					privKey = localHost.Peerstore().PrivKey(localHost.ID())
+				if h != nil {
+					privKey = h.Peerstore().PrivKey(h.ID())
 				}
 
 				if privKey != nil {
@@ -423,13 +432,60 @@ func ResolveProfile(ctx context.Context, h host.Host, targetPeerID string) (disp
 	return "", "", fmt.Errorf("profile not found in network")
 }
 
+// HasAttemptedAvatarDownload returns true if a download for this peerID+CID pair
+// has already been attempted (or completed) in this session.
+// Callers can use this to avoid redundant log lines and TriggerAvatarDownload calls.
+func HasAttemptedAvatarDownload(peerID, avatarCID string) bool {
+	dedupeKey := peerID + ":" + avatarCID
+	_, done := completedDownloads.Load(dedupeKey)
+	return done
+}
+
+// ClearAvatarDownloadAttempt removes the dedup entry for a peerID so that
+// a subsequent TriggerAvatarDownload call is allowed to retry.
+// Used for user-triggered manual refresh to bypass the permanent dedup guard.
+func ClearAvatarDownloadAttempt(peerID string) {
+	// Remove all keys prefixed with peerID — handles CID changes across sessions.
+	completedDownloads.Range(func(k, _ any) bool {
+		if key, ok := k.(string); ok {
+			if len(key) > len(peerID) && key[:len(peerID)] == peerID {
+				completedDownloads.Delete(key)
+			}
+		}
+		return true
+	})
+	// Also clear any ongoing download guard so it can be re-tried immediately.
+	ongoingDownloads.Delete(peerID)
+}
+
 // TriggerAvatarDownload downloads a peer's avatar image asynchronously in Go,
 // saves it to a local path under the profiles directory, and updates profile_store.
+// Uses two-level deduplication:
+//  1. ongoingDownloads: prevents concurrent parallel downloads for the same peer
+//  2. completedDownloads: permanently prevents re-downloading an already-fetched CID
 func TriggerAvatarDownload(peerID, avatarCID, avatarKey string) {
 	if avatarCID == "" || avatarKey == "" {
 		return
 	}
+
+	// Check if this exact CID was already downloaded successfully — skip permanently
+	dedupeKey := peerID + ":" + avatarCID
+	if _, done := completedDownloads.Load(dedupeKey); done {
+		return
+	}
+
+	// Prevent concurrent downloads for the same peer
+	if _, loaded := ongoingDownloads.LoadOrStore(peerID, true); loaded {
+		return
+	}
+
+	// Mark as "in-progress" immediately so HasAttemptedAvatarDownload returns true
+	// for all subsequent GetPeerProfile calls while the download is in-flight.
+	// The goroutine will overwrite this with the final result (success/failure).
+	completedDownloads.Store(dedupeKey, true)
+
 	go func() {
+		defer ongoingDownloads.Delete(peerID)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
@@ -439,11 +495,15 @@ func TriggerAvatarDownload(peerID, avatarCID, avatarKey string) {
 		data, _, err := corestore.DownloadFile(ctx, avatarCID, avatarKey)
 		if err != nil {
 			logger.Warn().Err(err).Str("peerID", peerID).Msg("PROFILE: Failed to download avatar image")
+			// Mark as "attempted" to avoid hammering a failing download on every frame.
+			// Will be retried on next app restart if still missing.
+			completedDownloads.Store(dedupeKey, true)
 			return
 		}
 
 		if len(data) == 0 {
 			logger.Warn().Str("peerID", peerID).Msg("PROFILE: Avatar download returned empty bytes")
+			completedDownloads.Store(dedupeKey, true)
 			return
 		}
 
@@ -474,7 +534,13 @@ func TriggerAvatarDownload(peerID, avatarCID, avatarKey string) {
 			return
 		}
 
+		// Mark as permanently completed so we never re-download this CID
+		completedDownloads.Store(dedupeKey, true)
+
 		logger.Info().Str("peerID", peerID).Str("path", savePath).Msg("PROFILE: Successfully downloaded and saved peer avatar locally")
+		if ProfileUpdateCallback != nil {
+			ProfileUpdateCallback(peerID)
+		}
 	}()
 }
 

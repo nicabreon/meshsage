@@ -270,13 +270,21 @@ func TestProactiveRatchetRotation(t *testing.T) {
 
 	// Verifikasi skipped keys bisa digunakan untuk mendekripsi pesan 1-5
 	for i := 0; i < 5; i++ {
-		msgKey, exists := skipped[uint32(i)]
+		var msgKey []byte
+		var exists bool
+		for _, sk := range skipped {
+			if sk.Counter == uint32(i) {
+				msgKey = sk.MsgKey
+				exists = true
+				break
+			}
+		}
 		require.True(t, exists, "Kunci pesan ke-%d harus di-skip", i+1)
-		
+
 		// ciphertext berformat: header|ciphertext. Header-nya dipisah dulu.
 		parts := strings.SplitN(ciphertexts[i], "|", 4)
 		require.Len(t, parts, 4)
-		
+
 		plain, err := DecryptMessage(msgKey, parts[3])
 		require.NoError(t, err)
 		assert.Equal(t, fmt.Sprintf("Pesan ke-%d", i+1), plain)

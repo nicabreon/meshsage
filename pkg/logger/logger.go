@@ -19,7 +19,7 @@ var DisplayWriter io.Writer = os.Stdout
 func init() {
 	// Default to Info level
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	
+
 	// Default output to pretty console
 	L = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
 }
@@ -60,9 +60,8 @@ func Displayln(args ...interface{}) {
 }
 
 // Shortcut functions for convenience
-func Info() *zerolog.Event { return L.Info() }
+func Info() *zerolog.Event  { return L.Info() }
 func Debug() *zerolog.Event { return L.Debug() }
-func Warn() *zerolog.Event { return L.Warn() }
+func Warn() *zerolog.Event  { return L.Warn() }
 func Error() *zerolog.Event { return L.Error() }
 func Fatal() *zerolog.Event { return L.Fatal() }
-

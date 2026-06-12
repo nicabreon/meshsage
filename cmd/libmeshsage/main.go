@@ -201,6 +201,10 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 		time.Sleep(100 * time.Millisecond) // Give the OS a brief moment to yield
 	}
 
+	// Reset the globalPortID so pending startup events are queued until Dart registers its new Port ID.
+	// This prevents Go from pushing events to the dead port ID from the pre-restart Dart VM session.
+	atomic.StoreInt64(&globalPortID, 0)
+
 	dbPath := C.GoString(dbPathStr)
 	idPath := C.GoString(idPathStr)
 	isClientOnly := isClientOnlyVal != 0
@@ -335,9 +339,15 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 	if err != nil {
 		return C.CString("Failed to init DHT: " + err.Error())
 	}
-	_ = corenet.SetupBitswap(globalCtx, host, dhtRouting)
-	_ = corenet.SetupPubSub(globalCtx, host)
-	_ = corenet.SetupDiscovery(globalCtx, host)
+	if errBitswap := corenet.SetupBitswap(globalCtx, host, dhtRouting); errBitswap != nil {
+		logger.Error().Err(errBitswap).Msg("Failed to setup Bitswap")
+	}
+	if errPubSub := corenet.SetupPubSub(globalCtx, host); errPubSub != nil {
+		logger.Error().Err(errPubSub).Msg("Failed to setup PubSub")
+	}
+	if errDiscovery := corenet.SetupDiscovery(globalCtx, host); errDiscovery != nil {
+		logger.Error().Err(errDiscovery).Msg("Failed to setup Discovery")
+	}
 
 	coreproto.SetupMessaging(host)
 	coreproto.SetupMailbox(host, isClientOnly)
@@ -361,6 +371,18 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 			"content":   event.Content,
 			"unix_time": event.UnixTime,
 		})
+		if err == nil {
+			eventQueue.Push(string(data))
+		}
+	}
+
+	// Hook the profile update callback to forward profile notifications to Flutter
+	coreproto.ProfileUpdateCallback = func(peerID string) {
+		event := map[string]string{
+			"type":   "profile_updated",
+			"sender": peerID,
+		}
+		data, err := json.Marshal(event)
 		if err == nil {
 			eventQueue.Push(string(data))
 		}
@@ -391,7 +413,6 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 		}
 	}
 
-
 	// Background group restoration on startup once connected to at least one peer
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
@@ -403,7 +424,9 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 			case <-ticker.C:
 				if len(host.Network().Peers()) > 0 {
 					logger.Info().Msg("Connected to at least one peer. Starting background group restoration...")
-					_ = coreproto.RestoreGroups(globalCtx, host, priv)
+					if errRestore := coreproto.RestoreGroups(globalCtx, host, priv); errRestore != nil {
+						logger.Error().Err(errRestore).Msg("Background group restoration failed")
+					}
 					return
 				}
 			}
@@ -464,6 +487,25 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 				} else {
 					// Proactive session warm-up disabled.
 					logger.Debug().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure)")
+
+					// Hybrid avatar download: peer is online now — best time to download their avatar.
+					// Only triggers if we have their CID in DB but the local file is missing.
+					go func(pid string) {
+						_, avatarCID, avatarKey, localPath, err := corestore.GetPeerProfile(pid)
+						if err != nil || avatarCID == "" || avatarKey == "" {
+							return // No avatar CID known yet — resolve will happen via DHT later
+						}
+						fileMissing := localPath == ""
+						if !fileMissing {
+							if _, statErr := os.Stat(localPath); statErr != nil {
+								fileMissing = true
+							}
+						}
+						if fileMissing {
+							logger.Info().Str("peerID", pid).Msg("peer_connected: peer is online, triggering avatar download")
+							coreproto.TriggerAvatarDownload(pid, avatarCID, avatarKey)
+						}
+					}(remoteID.String())
 				}
 			}()
 		},
@@ -617,7 +659,9 @@ func InitiateSession(targetStr *C.char) *C.char {
 	}
 
 	// Whitelist the peer ID in Connection Gater by saving a blank profile
-	_ = corestore.SavePeerProfile(targetID.String(), "", "", "", "")
+	if errProfile := corestore.SavePeerProfile(targetID.String(), "", "", "", ""); errProfile != nil {
+		logger.Error().Err(errProfile).Str("peerID", targetID.String()).Msg("Failed to whitelist peer profile")
+	}
 
 	err = coreproto.InitiateSession(globalCtx, globalHost, globalPriv, targetID)
 	if err != nil {
@@ -678,8 +722,6 @@ func ResetPeerSession(peerIDStr *C.char) *C.char {
 	}
 	return nil
 }
-
-
 
 //export SendGroupChat
 func SendGroupChat(groupIDStr, contentStr *C.char) *C.char {
@@ -759,6 +801,20 @@ func GetAliasByPeerID(peerIDStr *C.char) *C.char {
 	return C.CString(alias)
 }
 
+//export SearchLocalAliases
+func SearchLocalAliases(queryStr *C.char) *C.char {
+	query := C.GoString(queryStr)
+	results, err := corestore.SearchAliases(query)
+	if err != nil {
+		return C.CString("[]")
+	}
+	data, err := json.Marshal(results)
+	if err != nil {
+		return C.CString("[]")
+	}
+	return C.CString(string(data))
+}
+
 //export ResolveAlias
 func ResolveAlias(aliasStr *C.char) *C.char {
 	alias := C.GoString(aliasStr)
@@ -830,7 +886,6 @@ func RegisterPort(portID C.int64_t) {
 func GetNetworkStats() *C.char {
 	return C.CString(coreproto.GetNetworkStatsJSON())
 }
-
 
 //export CreateGroupProper
 func CreateGroupProper(aliasStr, groupTypeStr, membersStr *C.char) *C.char {
@@ -918,7 +973,9 @@ func CreateGroupProper(aliasStr, groupTypeStr, membersStr *C.char) *C.char {
 			targetID, errDec := peer.Decode(m)
 			if errDec == nil {
 				go func(t peer.ID) {
-					_, _ = coreproto.SendMessage(globalCtx, globalHost, privKey, t, inviteMsg)
+					if _, errSend := coreproto.SendMessage(globalCtx, globalHost, privKey, t, inviteMsg); errSend != nil {
+						logger.Error().Err(errSend).Str("targetID", t.String()).Msg("Failed to send group invite")
+					}
 				}(targetID)
 			}
 		}
@@ -1028,7 +1085,9 @@ func GroupAddMember(aliasOrIDStr, memberStr *C.char) *C.char {
 	}
 
 	go func() {
-		_, _ = coreproto.SendMessage(globalCtx, globalHost, privKey, targetID, inviteMsg)
+		if _, errSend := coreproto.SendMessage(globalCtx, globalHost, privKey, targetID, inviteMsg); errSend != nil {
+			logger.Error().Err(errSend).Str("targetID", targetID.String()).Msg("Failed to send group invite to new member")
+		}
 	}()
 
 	// Broadcast GCMD:ADD to existing members
@@ -1525,7 +1584,7 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 		coreproto.PrefetchMailboxCoords(peerID)
 
 		connected := false
-		
+
 		// 1. Try to connect using cached addresses first if we have them
 		cachedAddrs := globalHost.Peerstore().Addrs(peerID)
 		logger.Info().Str("target", peerID.String()).Int("cached_count", len(cachedAddrs)).Msg("ConnectPeer: Checked cached addresses")
@@ -1555,7 +1614,7 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 			if err == nil {
 				logger.Info().Str("target", peerID.String()).Int("addrs", len(pinfo.Addrs)).Msg("ConnectPeer: Found fresh addresses via DHT")
 				globalHost.Peerstore().AddAddrs(peerID, pinfo.Addrs, 5*time.Minute)
-				
+
 				dialCtx2, cancel2 := context.WithTimeout(globalCtx, 5*time.Second)
 				defer cancel2()
 				if errConnect := globalHost.Connect(dialCtx2, pinfo); errConnect != nil {
@@ -1723,7 +1782,9 @@ func SetLocalProfile(displayNameVal, avatarCIDVal, avatarKeyVal *C.char) {
 			existingPath = checkPath
 		}
 	}
-	_ = corestore.SavePeerProfile(myPeerID, displayName, avatarCID, avatarKey, existingPath)
+	if errSave := corestore.SavePeerProfile(myPeerID, displayName, avatarCID, avatarKey, existingPath); errSave != nil {
+		logger.Error().Err(errSave).Str("peerID", myPeerID).Msg("Failed to save local peer profile")
+	}
 
 	// Publish our new profile metadata to the DHT
 	go func() {
@@ -1734,6 +1795,12 @@ func SetLocalProfile(displayNameVal, avatarCIDVal, avatarKeyVal *C.char) {
 			logger.Warn().Err(err).Msg("FFI: Failed to publish local profile update to DHT")
 		}
 	}()
+
+	// Replicate avatar image blocks to Dedicated Relays so other peers can
+	// download the avatar even when we are offline (same as media files).
+	if avatarCID != "" {
+		go coreproto.ReplicateFileToRelays(globalCtx, globalHost, avatarCID)
+	}
 
 	// Broadcast profile update to all peers with active E2EE sessions
 	go func() {
@@ -1769,6 +1836,12 @@ func GetPeerProfile(peerIDVal *C.char) *C.char {
 	if err != nil {
 		return C.CString("{}")
 	}
+
+	// NOTE: Avatar download is intentionally NOT triggered here.
+	// Downloads are triggered either:
+	//   (a) automatically when the peer connects (peer_connected handler) — peer is guaranteed online
+	//   (b) explicitly by the user via DownloadPeerAvatar FFI — for manual retry
+	// This avoids silent background failures and battery drain.
 
 	result := struct {
 		DisplayName string `json:"display_name"`
@@ -1818,6 +1891,53 @@ func ResolveOfflineProfile(peerIDVal *C.char) {
 	}()
 }
 
+//export DownloadPeerAvatar
+// DownloadPeerAvatar is the user-triggered avatar download.
+// It clears the dedup cache (allowing retry), looks up the peer's CID from DB,
+// and triggers a fresh download. Returns immediately; result fires as profile_updated event.
+// Returns: "ok" if download started, "no_cid" if no avatar CID known, "error:<msg>" on failure.
+func DownloadPeerAvatar(peerIDVal *C.char) *C.char {
+	if globalHost == nil {
+		return C.CString("error:node not running")
+	}
+	peerID := C.GoString(peerIDVal)
+
+	// Clear dedup cache so this re-download is not blocked.
+	coreproto.ClearAvatarDownloadAttempt(peerID)
+
+	// Look up avatar CID from DB.
+	_, avatarCID, avatarKey, _, err := corestore.GetPeerProfile(peerID)
+	if err != nil || avatarCID == "" || avatarKey == "" {
+		// No CID in DB yet — try resolving from DHT first, then download.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			name, _, resolveErr := coreproto.ResolveProfile(ctx, globalHost, peerID)
+			if resolveErr != nil {
+				logger.Warn().Err(resolveErr).Str("peerID", peerID).Msg("DownloadPeerAvatar: DHT resolve failed")
+				// Fire profile_updated so Dart can show error state.
+				event := map[string]string{"type": "profile_updated", "sender": peerID, "status": "error"}
+				data, _ := json.Marshal(event)
+				eventQueue.Push(string(data))
+				return
+			}
+			logger.Info().Str("peerID", peerID).Str("name", name).Msg("DownloadPeerAvatar: resolved from DHT, now downloading avatar")
+			// Re-read CID from DB after DHT resolve.
+			_, cid2, key2, _, _ := corestore.GetPeerProfile(peerID)
+			if cid2 != "" && key2 != "" {
+				coreproto.TriggerAvatarDownload(peerID, cid2, key2)
+			}
+			// profile_updated fires internally when download completes.
+		}()
+		return C.CString("ok:resolving")
+	}
+
+	// CID is known — trigger download directly.
+	logger.Info().Str("peerID", peerID).Str("cid", avatarCID).Msg("DownloadPeerAvatar: user-triggered download started")
+	coreproto.TriggerAvatarDownload(peerID, avatarCID, avatarKey)
+	return C.CString("ok:downloading")
+}
+
 //export SendProfileKeyShare
 func SendProfileKeyShare(peerIDVal *C.char) *C.char {
 	if globalHost == nil {
@@ -1856,4 +1976,3 @@ func BroadcastProfileUpdate(targetsCSV, displayNameVal, avatarCIDVal, avatarKeyV
 func main() {
 	// Mandatory main for C-shared libraries, but unused
 }
-

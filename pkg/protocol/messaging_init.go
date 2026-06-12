@@ -20,7 +20,6 @@ const MessagingProtocolID = "/p2p-core/msg/1.0.0"
 // sessionLocks menyimpan mutex per-peer untuk mencegah race condition
 // saat concurrent goroutine mengakses Double Ratchet session state.
 var (
-	localHost           host.Host
 	sessionLocks        sync.Map // map[peerID string]*sync.Mutex
 	x3dhRequestCooldown sync.Map // map[peerID string]time.Time
 )
@@ -137,11 +136,12 @@ func getSessionLock(peerID string) *sync.Mutex {
 }
 
 func SetupMessaging(h host.Host) {
-	localHost = h
-	h.SetStreamHandler(MessagingProtocolID, handleStream)
+	h.SetStreamHandler(MessagingProtocolID, func(s network.Stream) {
+		handleStream(h, s)
+	})
 }
 
-func handleStream(s network.Stream) {
+func handleStream(h host.Host, s network.Stream) {
 	defer s.Close()
 	senderID := s.Conn().RemotePeer()
 
@@ -161,7 +161,7 @@ func handleStream(s network.Stream) {
 	// Track incoming bytes (4-byte length prefix + envelope payload)
 	AddBytesRecv(4 + len(envelopeBytes))
 
-	ProcessSecureEnvelope(context.Background(), localHost, senderID, string(envelopeBytes), "")
+	ProcessSecureEnvelope(context.Background(), h, senderID, string(envelopeBytes), "")
 
 	// Kirim balik "OK\n" sebagai tanda terima (ACK)
 	_, _ = s.Write([]byte("OK\n"))

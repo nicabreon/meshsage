@@ -1,8 +1,8 @@
 package protocol
 
 import (
-	"sync"
 	"fmt"
+	"sync"
 )
 
 var (
@@ -34,4 +34,12 @@ func ReportViolation(peerID string, reason string) {
 		blacklist[peerID] = true
 		fmt.Printf("[Reputation] Peer %s has been BLACKLISTED due to excessive violations.\n", peerID[:8])
 	}
+}
+
+// ResetReputationSystem clears all violations and blocks (mainly for testing).
+func ResetReputationSystem() {
+	reputationMu.Lock()
+	blacklist = make(map[string]bool)
+	violationCounter = make(map[string]int)
+	reputationMu.Unlock()
 }

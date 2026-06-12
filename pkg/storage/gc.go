@@ -63,4 +63,3 @@ func runGC(maxAgeDays int) {
 
 	logger.Info().Msgf("Cleaned up %d expired blocks from local storage.", deletedCount)
 }
-

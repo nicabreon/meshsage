@@ -4,12 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -144,39 +142,7 @@ func handleMailboxStream(h host.Host, s network.Stream) {
 			return
 		}
 		manifestCIDStr := parts[1]
-		go func(cidStr string) {
-			logger.Info().Str("cid", cidStr).Msg("Relay received REPLICATE request for media file")
-			mCID, err := cid.Decode(cidStr)
-			if err != nil {
-				logger.Warn().Err(err).Str("cid", cidStr).Msg("Invalid replication CID")
-				return
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			mBlock, err := corenet.GlobalBlockService.GetBlock(ctx, mCID)
-			if err != nil {
-				logger.Warn().Err(err).Str("cid", cidStr).Msg("Failed to fetch manifest block for replication")
-				return
-			}
-			var manifest corestore.FileManifest
-			if err := json.Unmarshal(mBlock.RawData(), &manifest); err != nil {
-				logger.Warn().Err(err).Msg("Failed to unmarshal manifest for replication")
-				return
-			}
-			var cids []cid.Cid
-			for _, cStr := range manifest.Chunks {
-				c, _ := cid.Decode(cStr)
-				cids = append(cids, c)
-			}
-			logger.Info().Str("file", manifest.Name).Int("chunks", len(cids)).Msg("Relay fetching chunks for replication...")
-			blockChan := corenet.GlobalBlockService.GetBlocks(ctx, cids)
-			fetchedCount := 0
-			for b := range blockChan {
-				_ = b
-				fetchedCount++
-			}
-			logger.Info().Str("file", manifest.Name).Int("fetched", fetchedCount).Msg("Relay successfully replicated and cached media file blocks!")
-		}(manifestCIDStr)
+		go ReplicateFile(h, manifestCIDStr)
 		s.Write([]byte("OK\n"))
 	case "FETCH":
 		coord := parts[1]

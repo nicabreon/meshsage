@@ -23,8 +23,9 @@ import (
 )
 
 var (
-	customDialTimeouts sync.Map // map[string]time.Duration
-	customDialRTTs     sync.Map // map[string]time.Duration
+	customDialTimeouts   sync.Map // map[string]time.Duration
+	customDialRTTs       sync.Map // map[string]time.Duration
+	x3dhInitiateCooldown sync.Map // map[string]time.Time
 )
 
 func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target peer.ID, msg string) (string, error) {
@@ -53,10 +54,10 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 	return msgID, sendSecureEnvelope(ctx, h, priv, target, env)
 }
 
-func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID, jsonPayload []byte) (string, error) {
+func PrepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID, jsonPayload []byte) (string, error) {
 	startPrep := time.Now()
 	defer func() {
-		logger.Info().Str("target", targetID.String()).Dur("elapsed", time.Since(startPrep)).Msg("LOG_STEP: prepareSecureEnvelope completed")
+		logger.Info().Str("target", targetID.String()).Dur("elapsed", time.Since(startPrep)).Msg("LOG_STEP: PrepareSecureEnvelope completed")
 	}()
 
 	// BUG-03: Lock per-peer agar tidak ada race condition pada session state
@@ -112,6 +113,15 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 	}
 
 	// 2. Jika tidak ada sesi, lakukan alur X3DH
+	now := time.Now()
+	if lastVal, ok := x3dhInitiateCooldown.Load(targetID.String()); ok {
+		if lastTime, ok := lastVal.(time.Time); ok && now.Sub(lastTime) < 5*time.Second {
+			logger.Debug().Str("target", targetID.String()).Msg("X3DH handshake skipped (cooldown active to prevent spam)")
+			return "", fmt.Errorf("X3DH handshake cooldown active")
+		}
+	}
+	x3dhInitiateCooldown.Store(targetID.String(), now)
+
 	var keyID, pubKeyB64 string
 	preKeyFound := false
 	connectedPeers := h.Network().Peers()
@@ -223,7 +233,7 @@ func prepareSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey
 
 func sendSecureEnvelope(ctx context.Context, h host.Host, priv crypto.PrivKey, targetID peer.ID, env MessageEnvelope) error {
 	jsonPayload, _ := json.Marshal(env)
-	finalWireEnvelope, err := prepareSecureEnvelope(ctx, h, priv, targetID, jsonPayload)
+	finalWireEnvelope, err := PrepareSecureEnvelope(ctx, h, priv, targetID, jsonPayload)
 	if err != nil {
 		return err
 	}

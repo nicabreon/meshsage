@@ -165,13 +165,19 @@ func RatchetStep(chainKey []byte) (messageKey []byte, nextChainKey []byte, err e
 // EncryptMessageRaw encrypts plaintext using AES-GCM and returns raw bytes
 func EncryptMessageRaw(key, plaintext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 
 	gcm, err := cipher.NewGCM(block)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 
 	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil { return nil, err }
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
 
 	return gcm.Seal(nonce, nonce, plaintext, nil), nil
 }
@@ -179,10 +185,14 @@ func EncryptMessageRaw(key, plaintext []byte) ([]byte, error) {
 // DecryptMessageRaw decrypts raw ciphertext using AES-GCM
 func DecryptMessageRaw(key, ciphertext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 
 	gcm, err := cipher.NewGCM(block)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 
 	nonceSize := gcm.NonceSize()
 	if len(ciphertext) < nonceSize {
@@ -192,4 +202,3 @@ func DecryptMessageRaw(key, ciphertext []byte) ([]byte, error) {
 	nonce, actualCiphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
 	return gcm.Open(nil, nonce, actualCiphertext, nil)
 }
-

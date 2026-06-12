@@ -86,7 +86,7 @@ func RunDetailedPeerMonitor(ctx context.Context, h host.Host, relaySource chan<-
 			return
 		case <-ticker.C:
 			peers := h.Network().Peers()
-			
+
 			selfRole := "Hybrid"
 			if IsDedicated {
 				selfRole = "Dedicated Relay"
@@ -102,10 +102,10 @@ func RunDetailedPeerMonitor(ctx context.Context, h host.Host, relaySource chan<-
 			for _, p := range peers {
 				role := "Client Only"
 				protos, _ := h.Peerstore().GetProtocols(p)
-				
+
 				hasInfra := false
 				hasDedicated := false
-				
+
 				for _, proto := range protos {
 					pStr := string(proto)
 					if pStr == "/p2p-core/infra/1.1.0" {
