@@ -173,6 +173,26 @@ func (ew *EventWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
+func isKnownChatPeer(peerID string) bool {
+	// 1. Check if they have an alias
+	if _, err := corestore.FindAliasByPeerID(peerID); err == nil {
+		return true
+	}
+	// 2. Check if they have a profile
+	if disp, _, _, _, err := corestore.GetPeerProfile(peerID); err == nil && disp != "" {
+		return true
+	}
+	// 3. Check if there are messages with this peer in messages table
+	if corestore.DB != nil {
+		var count int
+		err := corestore.DB.QueryRow(`SELECT COUNT(1) FROM messages WHERE sender_id = ? OR recipient_id = ? LIMIT 1`, peerID, peerID).Scan(&count)
+		if err == nil && count > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // -----------------------------------------------------------------------------
 // EXPORTED C FUNCTIONS
 // -----------------------------------------------------------------------------
@@ -486,8 +506,20 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 					logger.Info().Str("peerID", remoteID.String()).Msg("IDENTIFIED INFRASTRUCTURE: Triggering Mailbox Sync Manager")
 					go coreproto.StartMailboxSync(globalCtx, host, remoteID, priv)
 				} else {
-					// Proactive session warm-up disabled.
-					logger.Debug().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure)")
+					logger.Info().Str("peerID", remoteID.String()).Msg("Peer is a standard node (not infrastructure), checking if session setup is needed")
+					go func(targetID peer.ID) {
+						if isKnownChatPeer(targetID.String()) {
+							if corestore.HasSession(targetID.String()) {
+								logger.Info().Str("peerID", targetID.String()).Msg("Session exists, warming up session...")
+								coreproto.ProbeSessionWarmup(globalCtx, host, priv, targetID)
+							} else {
+								logger.Info().Str("peerID", targetID.String()).Msg("No session exists, initiating session...")
+								_ = coreproto.InitiateSession(globalCtx, host, priv, targetID)
+							}
+						} else {
+							logger.Debug().Str("peerID", targetID.String()).Msg("Peer is standard node but not a known contact, skipping session setup")
+						}
+					}(remoteID)
 
 					// Hybrid avatar download: peer is online now — best time to download their avatar.
 					// Only triggers if we have their CID in DB but the local file is missing.
@@ -664,10 +696,15 @@ func InitiateSession(targetStr *C.char) *C.char {
 		logger.Error().Err(errProfile).Str("peerID", targetID.String()).Msg("Failed to whitelist peer profile")
 	}
 
-	err = coreproto.InitiateSession(globalCtx, globalHost, globalPriv, targetID)
-	if err != nil {
-		return C.CString("Failed to initiate session: " + err.Error())
-	}
+	// Run session initiation / warmup in background to avoid blocking Dart UI thread
+	go func() {
+		err = coreproto.InitiateSession(globalCtx, globalHost, globalPriv, targetID)
+		if err != nil {
+			logger.Warn().Err(err).Str("targetID", targetID.String()).Msg("Proactive InitiateSession failed in background")
+		} else {
+			logger.Info().Str("targetID", targetID.String()).Msg("Proactive InitiateSession succeeded in background")
+		}
+	}()
 
 	return nil
 }
