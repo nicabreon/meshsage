@@ -232,6 +232,17 @@ func InitDatabase(dbPath string) error {
 	_ = EnsureColumn("messages", "status", "TEXT DEFAULT 'unread'")
 	_, _ = DB.Exec("ALTER TABLE sessions ADD COLUMN outbound_msgs_since_ratchet INTEGER DEFAULT 0;")
 
+	// Clean up legacy/corrupted signaling and decryption error messages from SQLite DB.
+	// This handles data saved by older versions of the app before filtering was added.
+	_, _ = DB.Exec(`DELETE FROM messages WHERE 
+		content LIKE '%"msg_type":"call_signal"%'
+		OR content LIKE '[Error: Failed to decrypt%'
+		OR content LIKE '[Error:%decrypt%'
+		OR content LIKE '{"type":"offer"%'
+		OR content LIKE '{"type":"answer"%'
+		OR content LIKE '{"type":"candidate"%'
+	`)
+
 	// Database versioning & migration runner
 	var currentVersion int
 	err = DB.QueryRow("PRAGMA user_version;").Scan(&currentVersion)

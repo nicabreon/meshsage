@@ -93,16 +93,23 @@ func GetChatMessages(myID, targetID string, isGroup bool, limit, offset int) ([]
 	var query string
 	var args []interface{}
 
+	// Common filter to exclude WebRTC signaling messages and decryption error messages
+	signalFilter := `AND content NOT LIKE '%"msg_type":"call_signal"%'
+	         AND content NOT LIKE '[Error: Failed to decrypt%'
+	         AND content NOT LIKE '{"type":"offer"%'
+	         AND content NOT LIKE '{"type":"answer"%'
+	         AND content NOT LIKE '{"type":"candidate"%'`
+
 	if isGroup {
 		query = `SELECT id, sender_id, recipient_id, content, COALESCE(msg_id, ''), COALESCE(msg_hash, ''), COALESCE(msg_type, ''), COALESCE(status, 'unread'), timestamp 
 		         FROM messages 
-		         WHERE recipient_id = ? 
+		         WHERE recipient_id = ? ` + signalFilter + `
 		         ORDER BY timestamp DESC, id DESC`
 		args = []interface{}{targetID}
 	} else {
 		query = `SELECT id, sender_id, recipient_id, content, COALESCE(msg_id, ''), COALESCE(msg_hash, ''), COALESCE(msg_type, ''), COALESCE(status, 'unread'), timestamp 
 		         FROM messages 
-		         WHERE (sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?) 
+		         WHERE ((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)) ` + signalFilter + `
 		         ORDER BY timestamp DESC, id DESC`
 		args = []interface{}{myID, targetID, targetID, myID}
 	}
@@ -140,14 +147,26 @@ func GetChatMetadataList(myID string) ([]ChatMetadata, error) {
 		return nil, fmt.Errorf("database not initialized")
 	}
 
-	// 1. Get unique room IDs and types
+	// Common filter to exclude WebRTC signaling messages and decryption error messages
+	signalFilter := `AND content NOT LIKE '%"msg_type":"call_signal"%'
+	                AND content NOT LIKE '[Error: Failed to decrypt%'
+	                AND content NOT LIKE '{"type":"offer"%'
+	                AND content NOT LIKE '{"type":"answer"%'
+	                AND content NOT LIKE '{"type":"candidate"%'`
+
+	// 1. Get unique room IDs and types (only from user-visible messages)
 	roomQuery := `SELECT DISTINCT 
 	                CASE WHEN msg_type = 'group' THEN recipient_id
 	                     WHEN sender_id = ? THEN recipient_id
 	                     ELSE sender_id 
 	                END as room_id,
 	                CASE WHEN msg_type = 'group' THEN 1 ELSE 0 END as is_group
-	              FROM messages`
+	              FROM messages
+	              WHERE content NOT LIKE '%"msg_type":"call_signal"%'
+	                AND content NOT LIKE '[Error: Failed to decrypt%'
+	                AND content NOT LIKE '{"type":"offer"%'
+	                AND content NOT LIKE '{"type":"answer"%'
+	                AND content NOT LIKE '{"type":"candidate"%'`
 	
 	rows, err := DB.Query(roomQuery, myID)
 	if err != nil {
@@ -186,20 +205,20 @@ func GetChatMetadataList(myID string) ([]ChatMetadata, error) {
 			unreadCount = 0
 		}
 
-		// 3. Query last message
+		// 3. Query last message (excluding signaling and error content)
 		var lastMsg ChatMessageResult
 		var lastQuery string
 		var lastArgs []interface{}
 		if rm.isGroup {
 			lastQuery = `SELECT id, sender_id, recipient_id, content, COALESCE(msg_id, ''), COALESCE(msg_hash, ''), COALESCE(msg_type, ''), COALESCE(status, 'unread'), timestamp 
 			             FROM messages 
-			             WHERE recipient_id = ? 
+			             WHERE recipient_id = ? ` + signalFilter + `
 			             ORDER BY timestamp DESC, id DESC LIMIT 1`
 			lastArgs = []interface{}{rm.id}
 		} else {
 			lastQuery = `SELECT id, sender_id, recipient_id, content, COALESCE(msg_id, ''), COALESCE(msg_hash, ''), COALESCE(msg_type, ''), COALESCE(status, 'unread'), timestamp 
 			             FROM messages 
-			             WHERE (sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?) 
+			             WHERE ((sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)) ` + signalFilter + `
 			             ORDER BY timestamp DESC, id DESC LIMIT 1`
 			lastArgs = []interface{}{myID, rm.id, rm.id, myID}
 		}
