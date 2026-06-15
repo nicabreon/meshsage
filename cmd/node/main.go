@@ -155,7 +155,7 @@ func main() {
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Failed to setup DHT")
 	}
-	_ = corenet.SetupBitswap(ctx, host, dhtRouting)
+	_ = corenet.SetupBitswap(ctx, host, dhtRouting, filepath.Dir(*dbFile))
 	_ = corenet.SetupPubSub(ctx, host)
 	_ = corenet.SetupDiscovery(ctx, host)
 

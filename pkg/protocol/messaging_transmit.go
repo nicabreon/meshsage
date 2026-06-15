@@ -33,6 +33,90 @@ var (
 	x3dhInitiateCooldown sync.Map // map[string]time.Time
 )
 
+// pendingDirectQueue holds envelopes that failed direct delivery due to
+// a stale or transitioning connection (e.g. WiFi → mobile data switch).
+// They are retried via DrainPendingDirectQueue when the peer reconnects.
+type pendingDirectEntry struct {
+	envelope  string    // finalWireEnvelope ready to transmit
+	enqueuedAt time.Time
+}
+
+const (
+	pendingDirectTTL     = 5 * time.Minute // max age before dropping
+	pendingDirectMaxPeer = 20              // max queued entries per peer
+)
+
+var (
+	pendingDirectMu    sync.Mutex
+	pendingDirectQueue = make(map[string][]pendingDirectEntry) // peerID → []entry
+)
+
+// enqueuePendingDirect adds an envelope to the per-peer retry queue.
+func enqueuePendingDirect(peerID string, envelope string) {
+	pendingDirectMu.Lock()
+	defer pendingDirectMu.Unlock()
+	list := pendingDirectQueue[peerID]
+	now := time.Now()
+	// Prune expired entries
+	filtered := list[:0]
+	for _, e := range list {
+		if now.Sub(e.enqueuedAt) < pendingDirectTTL {
+			filtered = append(filtered, e)
+		}
+	}
+	// Cap the queue size
+	if len(filtered) >= pendingDirectMaxPeer {
+		filtered = filtered[1:]
+	}
+	filtered = append(filtered, pendingDirectEntry{envelope: envelope, enqueuedAt: now})
+	pendingDirectQueue[peerID] = filtered
+}
+
+// DrainPendingDirectQueue is called when a peer reconnects.
+// It attempts to re-deliver all envelopes that previously failed for that peer.
+func DrainPendingDirectQueue(ctx context.Context, h host.Host, targetID peer.ID) {
+	peerID := targetID.String()
+	pendingDirectMu.Lock()
+	list, ok := pendingDirectQueue[peerID]
+	if !ok || len(list) == 0 {
+		pendingDirectMu.Unlock()
+		return
+	}
+	now := time.Now()
+	toSend := make([]string, 0, len(list))
+	for _, e := range list {
+		if now.Sub(e.enqueuedAt) < pendingDirectTTL {
+			toSend = append(toSend, e.envelope)
+		}
+	}
+	delete(pendingDirectQueue, peerID)
+	pendingDirectMu.Unlock()
+
+	if len(toSend) == 0 {
+		return
+	}
+
+	logger.Info().
+		Str("peerID", FormatPeerID(peerID)).
+		Int("count", len(toSend)).
+		Msg("DrainPendingDirectQueue: retrying failed direct-send envelopes after reconnect")
+
+	for _, env := range toSend {
+		// Small delay between retries to let the new connection stabilise
+		time.Sleep(100 * time.Millisecond)
+		if err := transmitEnvelope(ctx, h, targetID, env); err != nil {
+			logger.Warn().
+				Err(err).
+				Str("peerID", FormatPeerID(peerID)).
+				Msg("DrainPendingDirectQueue: retry failed, envelope dropped")
+		} else {
+			logger.Info().
+				Str("peerID", FormatPeerID(peerID)).
+				Msg("DrainPendingDirectQueue: envelope re-delivered successfully")
+		}
+	}
+}
+
 func init() {
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -474,6 +558,11 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 	// Cek apakah ada koneksi aktif ke peer tersebut (direct maupun via relay)
 	isConnected := len(h.Network().ConnsToPeer(target)) > 0
 
+	// FIX: Network switch — save the original (pre-signature-wrap) envelope
+	// so we can retry direct delivery if the send fails on a stale connection.
+	originalEnvelope := finalWireEnvelope
+	directSendFailed := false
+
 	var s network.Stream
 	var err error
 
@@ -552,11 +641,24 @@ func transmitEnvelope(ctx context.Context, h host.Host, target peer.ID, finalWir
 			}
 			logger.Warn().Err(errWrite).Str("target", target.String()).Msg("transmitEnvelope: Direct write failed, falling back to mailbox")
 			err = errWrite
+			directSendFailed = true
 		} else {
 			logger.Warn().Err(err).Str("target", target.String()).Msg("transmitEnvelope: Dial stream failed, falling back to mailbox")
+			directSendFailed = true
 		}
 	} else {
 		logger.Info().Str("target", target.String()).Msg("transmitEnvelope: No active connection found, skipping dial and sending via offline mailbox")
+	}
+
+	// FIX: Network switch — if a connected peer's direct send failed (stale QUIC
+	// connection during WiFi→mobile transition), store the original envelope in
+	// the pending queue so it can be retried when the peer reconnects, instead
+	// of being permanently lost if the mailbox also fails (e.g. no relay reachable).
+	if isConnected && directSendFailed {
+		enqueuePendingDirect(target.String(), originalEnvelope)
+		logger.Info().
+			Str("peerID", FormatPeerID(target.String())).
+			Msg("transmitEnvelope: Stale-connection failure — envelope queued for reconnect retry")
 	}
 
 	// Wrap envelope with standard signature for spam-proof mailbox storage

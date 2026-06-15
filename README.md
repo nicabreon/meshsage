@@ -1,6 +1,6 @@
-# **Meshsage: Distributed P2P Messaging Platform**
+# **Meshsage Runtime**
 
-**Meshsage** is a peer-to-peer (P2P) communication platform focused on privacy, security, and network resilience. Built on top of the **libp2p** protocol, Meshsage enables secure messaging without relying on any central server, featuring industry-standard encryption and a robust offline delivery system.
+**Meshsage Runtime** is the core peer-to-peer (P2P) engine for the Meshsage platform, focused on privacy, security, and network resilience. Built on top of the **libp2p** protocol in Go, it handles all cryptographic protocols, SQLite storage, and distributed network routing. It includes an interactive Bubble Tea terminal user interface (TUI) and compiles into a C-shared library via Dart FFI to power the mobile client application interface (**Meshsage App**).
 
 ![Meshsage TUI](assets/tui_screenshot.png)
 

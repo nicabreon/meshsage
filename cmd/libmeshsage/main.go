@@ -359,7 +359,7 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 	if err != nil {
 		return C.CString("Failed to init DHT: " + err.Error())
 	}
-	if errBitswap := corenet.SetupBitswap(globalCtx, host, dhtRouting); errBitswap != nil {
+	if errBitswap := corenet.SetupBitswap(globalCtx, host, dhtRouting, filepath.Dir(dbPath)); errBitswap != nil {
 		logger.Error().Err(errBitswap).Msg("Failed to setup Bitswap")
 	}
 	if errPubSub := corenet.SetupPubSub(globalCtx, host); errPubSub != nil {
@@ -479,6 +479,14 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 
 			// Measure and record the peer's custom dial timeout
 			coreproto.MeasureAndRecordDialTimeout(globalCtx, host, remoteID)
+
+			// FIX: Network switch — retry any envelopes that failed direct delivery
+			// on this peer's previous (stale) connection, e.g. during a WiFi→mobile
+			// handover. We wait 2s for the new connection to fully stabilise first.
+			go func(peerID peer.ID) {
+				time.Sleep(2 * time.Second)
+				coreproto.DrainPendingDirectQueue(globalCtx, host, peerID)
+			}(remoteID)
 
 			go func() {
 				var protos []protocol.ID
@@ -1624,8 +1632,9 @@ func DownloadFile(manifestCIDStr, keyB64Str, savePathStr *C.char) *C.char {
 //export GetPeerConnInfo
 func GetPeerConnInfo(peerIDStr *C.char) *C.char {
 	type PeerConnInfoResult struct {
-		Type     string `json:"type"` // "direct_quic", "direct_webrtc", "relay", "offline"
-		RelayVia string `json:"relay_via,omitempty"`
+		Type      string `json:"type"` // "direct_quic", "direct_webrtc", "relay", "offline"
+		RelayVia  string `json:"relay_via,omitempty"`
+		IPAddress string `json:"ip_address,omitempty"`
 	}
 
 	peerIDRaw := C.GoString(peerIDStr)
@@ -1643,6 +1652,8 @@ func GetPeerConnInfo(peerIDStr *C.char) *C.char {
 	conns := globalHost.Network().ConnsToPeer(peerID)
 	if len(conns) == 0 {
 		if act, found := coreproto.GetPeerActivity(peerIDRaw); found && time.Since(act.LastSeen) < 5*time.Second {
+			// Note: We don't store IP in PeerActivityInfo yet, so it won't be in the fallback cache.
+			// But that's okay, it will show up when connection is active.
 			b, _ := json.Marshal(PeerConnInfoResult{
 				Type:     act.Type,
 				RelayVia: act.RelayVia,
@@ -1659,11 +1670,16 @@ func GetPeerConnInfo(peerIDStr *C.char) *C.char {
 	result := PeerConnInfoResult{Type: "relay"}
 	for _, conn := range conns {
 		addrStr := conn.RemoteMultiaddr().String()
+		
+		// Extract IP address from multiaddr (e.g. /ip4/192.168.1.5/udp/...)
+		parts := strings.Split(addrStr, "/")
+		var ipAddr string
+		if len(parts) >= 3 && (parts[1] == "ip4" || parts[1] == "ip6") {
+			ipAddr = parts[2]
+		}
 
 		if strings.Contains(addrStr, "p2p-circuit") {
 			// Circuit relay connection - extract relay peer ID
-			// Format: /ip4/.../p2p/<relayID>/p2p-circuit/p2p/<targetID>
-			parts := strings.Split(addrStr, "/")
 			for i, part := range parts {
 				if part == "p2p-circuit" && i >= 2 {
 					for j := i - 1; j >= 0; j-- {
@@ -1675,19 +1691,22 @@ func GetPeerConnInfo(peerIDStr *C.char) *C.char {
 					break
 				}
 			}
-			result.Type = "relay"
+			if result.Type == "relay" {
+				result.Type = "relay"
+				result.IPAddress = ipAddr
+			}
 			// Don't break - keep scanning for a direct connection
 
 		} else if strings.Contains(addrStr, "webrtc-direct") {
-			// WebRTC Direct - ICE host candidates only (no STUN)
 			result.Type = "direct_webrtc"
 			result.RelayVia = ""
+			result.IPAddress = ipAddr
 			break // direct wins
 
 		} else {
-			// QUIC or other direct transport
 			result.Type = "direct_quic"
 			result.RelayVia = ""
+			result.IPAddress = ipAddr
 			break // direct wins
 		}
 	}
@@ -2089,6 +2108,17 @@ func DownloadPeerAvatar(peerIDVal *C.char) *C.char {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
+			
+			// If peer is connected, send a session warmup probe so they send us their profile key share
+			pid, decodeErr := peer.Decode(peerID)
+			if decodeErr == nil && globalHost != nil && len(globalHost.Network().ConnsToPeer(pid)) > 0 {
+				logger.Info().Str("peerID", peerID).Msg("DownloadPeerAvatar: peer is online but key is missing, sending warmup probe to request key")
+				priv := globalHost.Peerstore().PrivKey(globalHost.ID())
+				if priv != nil {
+					coreproto.ProbeSessionWarmup(ctx, globalHost, priv, pid)
+				}
+			}
+
 			name, _, resolveErr := coreproto.ResolveProfile(ctx, globalHost, peerID)
 			if resolveErr != nil {
 				logger.Warn().Err(resolveErr).Str("peerID", peerID).Msg("DownloadPeerAvatar: DHT resolve failed")

@@ -100,6 +100,13 @@ func ProbeSessionWarmup(ctx context.Context, h host.Host, priv crypto.PrivKey, t
 		logger.Debug().Err(err).Str("targetID", targetID.String()).Msg("ProbeSessionWarmup: failed to send probe (peer might have gone offline)")
 	} else {
 		logger.Info().Str("targetID", targetID.String()).Msg("ProbeSessionWarmup: session warm-up probe successfully sent")
+		// Proactively share our E2EE profile key whenever we warm up the session
+		go func() {
+			time.Sleep(200 * time.Millisecond) // Let it settle
+			if err := SendProfileKeyShare(ctx, h, targetID); err != nil {
+				logger.Warn().Err(err).Str("targetID", targetID.String()).Msg("Failed to auto-send profile key share on warm-up probe success")
+			}
+		}()
 	}
 }
 

@@ -226,11 +226,19 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 			// Dicapai saat: (1) tidak ada skipped key, atau (2) skipped key stale/gagal decrypt.
 			remoteIdentityB64, rootB64, sendB64, recvB64, remoteRatchetB64, localRatchetPrivB64, localRatchetPubB64, n, m, pn, outboundMsgsSinceRatchet, err := corestore.LoadSession(senderID.String())
 			if err != nil || rootB64 == "" {
-				logger.Error().Str("peerID", senderID.String()).Msg("No session found for E2EE decryption. Sending REQUEST_X3DH to sender.")
-				// Do NOT send RESET here (we have nothing to reset).
-				// Instead, ask the sender to start fresh X3DH.
-				go sendRequestX3DH(ctx, h, senderID)
-				pushDecryptionErrorToUI(h, senderID, "No E2EE session found for decryption (requires X3DH handshake)")
+				logger.Warn().Str("peerID", senderID.String()).Msg("No session found for DR. Retrying in background after 3s in case X3DH is arriving...")
+				go func() {
+					time.Sleep(3 * time.Second)
+					_, rootB64Retry, _, _, _, _, _, _, _, _, _, _ := corestore.LoadSession(senderID.String())
+					if rootB64Retry != "" {
+						ProcessSecureEnvelope(ctx, h, senderID, actualEnvelope, msgHash)
+					} else {
+						logger.Error().Str("peerID", senderID.String()).Msg("No session found for E2EE decryption after wait. Sending REQUEST_X3DH.")
+						go sendRequestX3DH(ctx, h, senderID)
+						pushDecryptionErrorToUI(h, senderID, "No E2EE session found for decryption (requires X3DH handshake)")
+					}
+				}()
+				success = false
 				return
 			}
 
@@ -262,11 +270,21 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 
 			plaintext, skipped, err := session.DecryptWithRatchet(payloadStr)
 			if err != nil {
-				logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR Decryption failed. Clearing session and requesting fresh X3DH.")
-				_ = corestore.DeleteSession(senderID.String())
-				_ = corestore.ClearSkippedKeys(senderID.String())
-				go sendRequestX3DH(ctx, h, senderID)
-				pushDecryptionErrorToUI(h, senderID, "Double Ratchet decryption failed: "+err.Error())
+				logger.Warn().Str("peerID", senderID.String()).Err(err).Msg("DR Decryption failed. Retrying in background after 3s in case X3DH is arriving...")
+				go func() {
+					time.Sleep(3 * time.Second)
+					_, rootB64Retry, _, _, _, _, _, _, _, _, _, _ := corestore.LoadSession(senderID.String())
+					if rootB64Retry != rootB64 { // Session has been updated!
+						ProcessSecureEnvelope(ctx, h, senderID, actualEnvelope, msgHash)
+					} else {
+						logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR Decryption still failing after wait. Clearing session and requesting fresh X3DH.")
+						_ = corestore.DeleteSession(senderID.String())
+						_ = corestore.ClearSkippedKeys(senderID.String())
+						go sendRequestX3DH(ctx, h, senderID)
+						pushDecryptionErrorToUI(h, senderID, "Double Ratchet decryption failed: "+err.Error())
+					}
+				}()
+				success = false
 				return
 			}
 

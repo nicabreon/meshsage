@@ -97,7 +97,7 @@ func InitNode(port C.int, dataDir *C.char) *C.char {
 		return cString(err.Error())
 	}
 
-	_ = corenet.SetupBitswap(ctx, h, dhtRouting)
+	_ = corenet.SetupBitswap(ctx, h, dhtRouting, path)
 	_ = corenet.SetupPubSub(ctx, h)
 	_ = corestore.InitDatabase(dbFile)
 	if priv != nil {
