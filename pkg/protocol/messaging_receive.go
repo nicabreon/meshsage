@@ -277,11 +277,30 @@ func ProcessSecureEnvelope(ctx context.Context, h host.Host, senderID peer.ID, e
 					if rootB64Retry != rootB64 { // Session has been updated!
 						ProcessSecureEnvelope(ctx, h, senderID, actualEnvelope, msgHash)
 					} else {
-						logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR Decryption still failing after wait. Clearing session and requesting fresh X3DH.")
-						_ = corestore.DeleteSession(senderID.String())
-						_ = corestore.ClearSkippedKeys(senderID.String())
-						go sendRequestX3DH(ctx, h, senderID)
-						pushDecryptionErrorToUI(h, senderID, "Double Ratchet decryption failed: "+err.Error())
+						// Check if session was updated very recently (e.g. within 15 seconds)
+						updatedAtStr, updateErr := corestore.GetSessionUpdateTime(senderID.String())
+						isFresh := false
+						if updateErr == nil && updatedAtStr != "" {
+							// SQLite CURRENT_TIMESTAMP is in "2006-01-02 15:04:05" UTC layout
+							t, parseErr := time.Parse("2006-01-02 15:04:05", updatedAtStr)
+							if parseErr == nil {
+								diff := time.Now().UTC().Sub(t)
+								if diff < 15*time.Second && diff > -15*time.Second {
+									isFresh = true
+								}
+							}
+						}
+
+						if isFresh {
+							logger.Warn().Str("peerID", senderID.String()).Err(err).Msg("DR Decryption failed but session was updated recently. Skipping session deletion to avoid disruption.")
+							pushDecryptionErrorToUI(h, senderID, "Double Ratchet decryption failed (legacy message): "+err.Error())
+						} else {
+							logger.Error().Str("peerID", senderID.String()).Err(err).Msg("DR Decryption still failing after wait. Clearing session and requesting fresh X3DH.")
+							_ = corestore.DeleteSession(senderID.String())
+							_ = corestore.ClearSkippedKeys(senderID.String())
+							go sendRequestX3DH(ctx, h, senderID)
+							pushDecryptionErrorToUI(h, senderID, "Double Ratchet decryption failed: "+err.Error())
+						}
 					}
 				}()
 				success = false

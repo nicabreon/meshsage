@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -203,8 +202,9 @@ func TestHKDFExpand_Deterministic(t *testing.T) {
 	assert.False(t, bytes.Equal(out1, out3), "HKDF dengan info berbeda harus menghasilkan output berbeda")
 }
 
-// TestProactiveRatchetRotation memverifikasi logika rotasi kunci DH proaktif.
-func TestProactiveRatchetRotation(t *testing.T) {
+// TestDoubleRatchetAlternatingRotation memverifikasi bahwa rotasi kunci DH tidak terjadi secara proaktif
+// (hanya dengan mengirim pesan), melainkan secara reaktif saat menerima balasan dengan kunci DH baru.
+func TestDoubleRatchetAlternatingRotation(t *testing.T) {
 	alicePriv, alicePub, err := GenerateEphemeralKeypair()
 	require.NoError(t, err)
 	bobPriv, bobPub, err := GenerateEphemeralKeypair()
@@ -235,67 +235,63 @@ func TestProactiveRatchetRotation(t *testing.T) {
 		RemoteRatchetPubkey: alicePub,
 	}
 
-	// 1. Simpan public key awal Alice
-	initialPubkey := aliceSession.LocalRatchetPubkey
+	initialAlicePubkey := aliceSession.LocalRatchetPubkey
+	initialBobPubkey := bobSession.LocalRatchetPubkey
 
-	// 2. Alice mengirim 5 pesan tanpa balasan
-	ciphertexts := make([]string, 7)
-	for i := 0; i < 5; i++ {
-		msg := fmt.Sprintf("Pesan ke-%d", i+1)
-		ciphertexts[i], err = aliceSession.EncryptWithRatchet(msg)
+	// 1. Alice mengirim 10 pesan beruntun tanpa balasan
+	// Kunci publik Alice tidak boleh berubah (tidak ada rotasi proaktif)
+	for i := 0; i < 10; i++ {
+		msg := fmt.Sprintf("Alice Msg %d", i+1)
+		cipher, err := aliceSession.EncryptWithRatchet(msg)
 		require.NoError(t, err)
-		assert.Equal(t, initialPubkey, aliceSession.LocalRatchetPubkey, "Kunci publik tidak boleh berubah selama 5 pesan pertama")
-		assert.Equal(t, uint32(i+1), aliceSession.OutboundMessagesSinceRatchet)
+		assert.True(t, bytes.Equal(initialAlicePubkey, aliceSession.LocalRatchetPubkey), "Kunci publik tidak boleh berputar secara proaktif")
+
+		// Bob menerima dan mendekripsi
+		plain, _, err := bobSession.DecryptWithRatchet(cipher)
+		require.NoError(t, err)
+		assert.Equal(t, msg, plain)
 	}
 
-	// 3. Pesan ke-6: harus memicu rotasi proaktif
-	ciphertexts[5], err = aliceSession.EncryptWithRatchet("Pesan ke-6 (Rotasi)")
+	// 2. Bob sekarang membalas. Karena Bob menerima pesan dengan AlicePubkey (yang sama dengan initialAlicePubkey),
+	// Bob tidak mendeteksi perubahan kunci pada dekripsi, sehingga Bob membalas menggunakan initialBobPubkey.
+	bobCipher, err := bobSession.EncryptWithRatchet("Bob Msg 1")
 	require.NoError(t, err)
-	rotatedPubkey := aliceSession.LocalRatchetPubkey
-	assert.False(t, bytes.Equal(initialPubkey, rotatedPubkey), "Kunci publik harus berubah (rotasi proaktif) pada pesan ke-6")
-	assert.Equal(t, uint32(6), aliceSession.OutboundMessagesSinceRatchet, "Counter harus diset ke 6 (marker)")
+	assert.True(t, bytes.Equal(initialBobPubkey, bobSession.LocalRatchetPubkey))
 
-	// 4. Pesan ke-7: kunci publik tidak boleh berputar lagi
-	ciphertexts[6], err = aliceSession.EncryptWithRatchet("Pesan ke-7")
+	// 3. Alice mendekripsi balasan Bob
+	plain, _, err := aliceSession.DecryptWithRatchet(bobCipher)
 	require.NoError(t, err)
-	assert.True(t, bytes.Equal(rotatedPubkey, aliceSession.LocalRatchetPubkey), "Kunci publik tidak boleh berputar lebih dari sekali")
-	assert.Equal(t, uint32(6), aliceSession.OutboundMessagesSinceRatchet, "Counter harus tetap 6")
+	assert.Equal(t, "Bob Msg 1", plain)
 
-	// 5. Bob memproses pesan ke-6 terlebih dahulu (simulasi out-of-order)
-	// Bob harus secara otomatis melompati (skip) kunci untuk pesan 1-5
-	plaintext6, skipped, err := bobSession.DecryptWithRatchet(ciphertexts[5])
+	// Sekarang kita simulasikan rotasi reaktif:
+	// A. Alice secara manual memutar kunci ratchet lokalnya (seperti saat menerima kunci baru)
+	// Kita buat key pair baru untuk Alice dan kirim ke Bob.
+	aliceNewPriv, aliceNewPub, err := GenerateEphemeralKeypair()
 	require.NoError(t, err)
-	assert.Equal(t, "Pesan ke-6 (Rotasi)", plaintext6)
-	assert.Len(t, skipped, 5, "Bob harus men-skip 5 kunci pesan sebelumnya")
-
-	// Verifikasi skipped keys bisa digunakan untuk mendekripsi pesan 1-5
-	for i := 0; i < 5; i++ {
-		var msgKey []byte
-		var exists bool
-		for _, sk := range skipped {
-			if sk.Counter == uint32(i) {
-				msgKey = sk.MsgKey
-				exists = true
-				break
-			}
-		}
-		require.True(t, exists, "Kunci pesan ke-%d harus di-skip", i+1)
-
-		// ciphertext berformat: header|ciphertext. Header-nya dipisah dulu.
-		parts := strings.SplitN(ciphertexts[i], "|", 4)
-		require.Len(t, parts, 4)
-
-		plain, err := DecryptMessage(msgKey, parts[3])
-		require.NoError(t, err)
-		assert.Equal(t, fmt.Sprintf("Pesan ke-%d", i+1), plain)
-	}
-
-	// 6. Bob mengirim balasan ke Alice
-	bobReplyCipher, err := bobSession.EncryptWithRatchet("Balasan dari Bob")
+	
+	// Kita buat session state baru secara manual di mana Alice menggunakan key pair baru
+	aliceSession.LocalRatchetPrivkey = aliceNewPriv
+	aliceSession.LocalRatchetPubkey = aliceNewPub
+	sharedSecretSend, err := DeriveSharedSecret(aliceNewPriv, aliceSession.RemoteRatchetPubkey)
 	require.NoError(t, err)
-
-	// Alice mendekripsi balasan Bob -> OutboundMessagesSinceRatchet harus reset ke 0
-	_, _, err = aliceSession.DecryptWithRatchet(bobReplyCipher)
+	resSend, err := HKDFExpand(sharedSecretSend, "p2p-core-dh-ratchet", 64)
 	require.NoError(t, err)
-	assert.Equal(t, uint32(0), aliceSession.OutboundMessagesSinceRatchet, "Counter harus di-reset setelah sukses dekripsi balasan")
+	aliceSession.RootKey = resSend[:32]
+	aliceSession.SendChainKey = resSend[32:]
+	aliceSession.PN = aliceSession.N
+	aliceSession.N = 0
+
+	// Alice mengirim pesan baru dengan kunci baru
+	aliceCipherNew, err := aliceSession.EncryptWithRatchet("Alice Msg New Key")
+	require.NoError(t, err)
+	assert.True(t, bytes.Equal(aliceNewPub, aliceSession.LocalRatchetPubkey))
+
+	// Bob menerima pesan ini. Karena aliceNewPub != initialAlicePubkey, Bob mendeteksi perubahan kunci!
+	// Ini memicu rotasi DH reaktif di BobSession.
+	plainNew, _, err := bobSession.DecryptWithRatchet(aliceCipherNew)
+	require.NoError(t, err)
+	assert.Equal(t, "Alice Msg New Key", plainNew)
+
+	// Verifikasi Bob telah memutar kunci lokalnya secara reaktif
+	assert.False(t, bytes.Equal(initialBobPubkey, bobSession.LocalRatchetPubkey), "Bob harus memutar kunci lokalnya secara reaktif setelah menerima kunci baru dari Alice")
 }

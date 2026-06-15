@@ -34,28 +34,6 @@ type SkippedKey struct {
 // EncryptWithRatchet advances the send chain and returns an encrypted message.
 // In a full implementation, this would also include the current Ratchet Public Key in the header.
 func (s *SessionState) EncryptWithRatchet(plaintext string) (string, error) {
-	// Proactive DH Ratchet Key Rotation if sender has sent exactly 5 messages without a reply.
-	// We rotate at most once before receiving a reply to prevent out-of-sync/decryption failures
-	// if the recipient is offline and receives multiple proactive rotations.
-	if s.OutboundMessagesSinceRatchet == 5 {
-		newPriv, newPub, err := GenerateEphemeralKeypair()
-		if err == nil {
-			sharedSecretSend, errSecret := DeriveSharedSecret(newPriv, s.RemoteRatchetPubkey)
-			if errSecret == nil {
-				resSend, errHKDF := HKDFExpand(sharedSecretSend, "p2p-core-dh-ratchet", 64)
-				if errHKDF == nil {
-					s.LocalRatchetPrivkey = newPriv
-					s.LocalRatchetPubkey = newPub
-					s.RootKey = resSend[:32]
-					s.SendChainKey = resSend[32:]
-					s.PN = s.N
-					s.N = 0
-					s.OutboundMessagesSinceRatchet = 6 // set to 6 (marker > 5) so we don't rotate again
-				}
-			}
-		}
-	}
-
 	msgKey, nextChainKey, err := RatchetStep(s.SendChainKey)
 	if err != nil {
 		return "", err

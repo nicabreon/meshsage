@@ -2180,6 +2180,132 @@ func BroadcastProfileUpdate(targetsCSV, displayNameVal, avatarCIDVal, avatarKeyV
 	coreproto.BroadcastProfileUpdate(ctx, globalHost, targets, displayName, avatarCID, avatarKey)
 }
 
+//export RegisterFCMToken
+func RegisterFCMToken(tokenStr, fcmServicePubKeyB64Str *C.char) *C.char {
+	if globalHost == nil {
+		return C.CString("Error: Node not started")
+	}
+
+	token := C.GoString(tokenStr)
+	pubKeyB64 := C.GoString(fcmServicePubKeyB64Str)
+
+	if token == "" || pubKeyB64 == "" {
+		return C.CString("Error: Empty token or public key")
+	}
+
+	// 1. Decode FCM Service Public Key
+	fcmPubBytes, err := base64.StdEncoding.DecodeString(pubKeyB64)
+	if err != nil {
+		return C.CString("Error: Invalid public key base64: " + err.Error())
+	}
+
+	// 2. Generate Ephemeral Keypair for ECIES
+	ephemeralPriv, ephemeralPub, err := corecrypto.GenerateEphemeralKeypair()
+	if err != nil {
+		return C.CString("Error: Failed to generate ephemeral keypair: " + err.Error())
+	}
+
+	// 3. Compute Shared Secret via ECDH
+	aesKey, err := corecrypto.DeriveSharedSecret(ephemeralPriv, fcmPubBytes)
+	if err != nil {
+		return C.CString("Error: Failed to derive shared secret: " + err.Error())
+	}
+
+	// 4. Encrypt FCM token using AES-GCM
+	ciphertext, err := corecrypto.EncryptMessage(aesKey, token)
+	if err != nil {
+		return C.CString("Error: Failed to encrypt token: " + err.Error())
+	}
+
+	// 5. Construct Signed Payload JSON (what the client signs)
+	signedPayload := struct {
+		EphemeralPub string `json:"ephemeral_pub"`
+		Ciphertext   string `json:"ciphertext"`
+	}{
+		EphemeralPub: base64.StdEncoding.EncodeToString(ephemeralPub),
+		Ciphertext:   ciphertext,
+	}
+
+	signedPayloadBytes, _ := json.Marshal(signedPayload)
+	signedPayloadStr := string(signedPayloadBytes)
+
+	// 6. Sign the payload using P2P Node Private Key to authenticate the register request
+	privKey := globalHost.Peerstore().PrivKey(globalHost.ID())
+	sigBytes, err := privKey.Sign([]byte(signedPayloadStr))
+	if err != nil {
+		return C.CString("Error: Failed to sign payload: " + err.Error())
+	}
+
+	senderPubBytes, err := crypto.MarshalPublicKey(privKey.GetPublic())
+	if err != nil {
+		return C.CString("Error: Failed to marshal sender public key: " + err.Error())
+	}
+
+	// 7. Construct Final Payload containing client_sig
+	finalPayload := struct {
+		EphemeralPub string `json:"ephemeral_pub"`
+		Ciphertext   string `json:"ciphertext"`
+		ClientSig    string `json:"client_sig"`
+	}{
+		EphemeralPub: base64.StdEncoding.EncodeToString(ephemeralPub),
+		Ciphertext:   ciphertext,
+		ClientSig:    base64.StdEncoding.EncodeToString(sigBytes),
+	}
+	finalPayloadBytes, _ := json.Marshal(finalPayload)
+	finalPayloadStr := string(finalPayloadBytes)
+
+	// 8. Construct P2P register request object
+	regRequest := struct {
+		OwnerID   string `json:"owner_id"`
+		Payload   string `json:"payload"`
+		Sender    string `json:"sender"`
+		Signature string `json:"signature"`
+	}{
+		OwnerID:   globalHost.ID().String(),
+		Payload:   finalPayloadStr,
+		Sender:    base64.StdEncoding.EncodeToString(senderPubBytes),
+		Signature: base64.StdEncoding.EncodeToString(sigBytes),
+	}
+
+	regRequestBytes, _ := json.Marshal(regRequest)
+
+	// 8. Open stream to all seed Dedicated Relays to broadcast registration
+	var succeededRelays []string
+
+	for _, s := range DefaultSeeds {
+		ma, err := multiaddr.NewMultiaddr(s)
+		if err != nil {
+			continue
+		}
+		pinfo, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			continue
+		}
+
+		dialCtx, cancel := context.WithTimeout(globalCtx, 4*time.Second)
+		// Ensure relay address is in the peerstore
+		globalHost.Peerstore().AddAddrs(pinfo.ID, pinfo.Addrs, 5*time.Minute)
+		corenet.AllowPeerExplicitly(pinfo.ID)
+
+		// Connect and send
+		if errConnect := globalHost.Connect(dialCtx, *pinfo); errConnect == nil {
+			sStream, errStream := globalHost.NewStream(dialCtx, pinfo.ID, protocol.ID(coreproto.FCMRegisterProtocolID))
+			if errStream == nil {
+				_, _ = sStream.Write(regRequestBytes)
+				sStream.Close()
+				succeededRelays = append(succeededRelays, pinfo.ID.String())
+			}
+		}
+		cancel()
+	}
+
+	if len(succeededRelays) == 0 {
+		return C.CString("Error: Failed to register with any active Dedicated Relay")
+	}
+
+	return C.CString("Success: Registered with relays: " + strings.Join(succeededRelays, ", "))
+}
+
 func main() {
 	// Mandatory main for C-shared libraries, but unused
 }

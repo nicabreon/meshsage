@@ -54,6 +54,9 @@ func SetupMailbox(h host.Host, isClientOnly bool) {
 			h.SetStreamHandler(protocol.ID(DedicatedProtocolID), func(s network.Stream) {
 				s.Close()
 			})
+
+			// Register FCM register handler
+			SetupFCMRegisterHandler(h)
 		}
 
 		logger.Debug().Str("protocol", NotifyProtocolID).Msg("Setting up notification handler")

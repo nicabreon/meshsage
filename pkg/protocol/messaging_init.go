@@ -117,14 +117,14 @@ func retrySentMessages(ctx context.Context, h host.Host, priv crypto.PrivKey, ta
 	if len(toResend) == 0 {
 		return
 	}
-	logger.Info().Str("peerID", peerID[:8]).Int("count", len(toResend)).Msg("Retrying sent messages after X3DH re-handshake")
+	logger.Info().Str("peerID", peerID).Int("count", len(toResend)).Msg("Retrying sent messages after X3DH re-handshake")
 	for _, env := range toResend {
 		// Jeda kecil agar session state sudah tersimpan ke DB
 		time.Sleep(80 * time.Millisecond)
 		if err := sendSecureEnvelope(ctx, h, priv, targetID, env); err != nil {
-			logger.Warn().Err(err).Str("peerID", peerID[:8]).Str("msgID", env.ID).Msg("Retry sent message failed")
+			logger.Warn().Err(err).Str("peerID", peerID).Str("msgID", env.ID).Msg("Retry sent message failed")
 		} else {
-			logger.Info().Str("peerID", peerID[:8]).Str("msgID", env.ID).Msg("Sent message retried successfully after X3DH")
+			logger.Info().Str("peerID", peerID).Str("msgID", env.ID).Msg("Sent message retried successfully after X3DH")
 		}
 	}
 }

@@ -1,6 +1,6 @@
 # Privacy Policy for Meshsage
 
-**Last Updated: June 9, 2026**
+**Last Updated: June 15, 2026**
 
 Meshsage is a decentralized, open-source, peer-to-peer (P2P) messaging application. This Privacy Policy explains how Meshsage processes data. Because Meshsage is built on a decentralized network topology, **we do not collect, store, or share any personal information on any central server.**
 
@@ -10,7 +10,7 @@ Meshsage is a decentralized, open-source, peer-to-peer (P2P) messaging applicati
 
 We believe in absolute privacy. 
 * **No Accounts**: You do not need to register an email address, phone number, or social media account to use Meshsage. Your identity is represented solely by a locally generated cryptographic keypair (PeerID).
-* **No Analytics or Tracking**: We do not use third-party analytics SDKs, trackers, or diagnostic reporting tools (such as Google Analytics or Firebase). 
+* **No Analytics or Tracking**: We do not use third-party analytics SDKs, trackers, or diagnostic reporting tools for user profiling. To support push notifications when the application is offline or minimized on mobile devices, we utilize Google Firebase Cloud Messaging (FCM). This is strictly used for notification delivery and not for user tracking.
 * **No Ads**: Meshsage does not serve any advertisements.
 
 ---
@@ -33,6 +33,10 @@ When you send a message, it is transmitted directly to the recipient over a secu
 * **Decentralized Offline Mailbox**: If the recipient is offline, the encrypted message payload (a secure envelope) is temporarily uploaded to decentralized infrastructure mailbox nodes. 
   * Mailbox nodes **cannot decrypt** the message contents or access any personal identifiers.
   * Mailbox nodes only hold the encrypted payload temporarily until the recipient comes online and fetches it, after which the message is delivered and stored locally on the recipient's device.
+* **Push Notifications (Firebase Cloud Messaging)**: On mobile platforms, because direct P2P connections cannot be sustained in the background indefinitely due to OS constraints, we use FCM to deliver "silent push" wake-up notifications.
+  * When the app initializes, it retrieves a push token from Firebase.
+  * This token is encrypted asymmetrically via **ECIES** with the public key of the FCM Push Service daemon and signed using your private key, ensuring only the daemon can decrypt it and verifying your ownership of the PeerID.
+  * When an offline message is stored in your mailbox, a secure event triggers the Push Service daemon to dispatch a push notification to wake up your device for retrieval. No personal data is attached to this notification.
 
 ---
 
@@ -52,11 +56,12 @@ Meshsage requires the following permissions on your device to function correctly
 ## 5. Data Safety Declaration (Google Play)
 
 For your Google Play Data Safety form, you can declare:
-* **Data Collected**: **No** personal data is collected.
-* **Data Shared**: **No** personal data is shared with third parties.
+* **Data Collected**: Yes, **Device or other IDs** (specifically the FCM Push Token) are collected strictly for App Functionality and Communications.
+* **Data Shared**: No personal data is shared with third parties (the FCM token is transmitted only to our own push service daemon and processed by Google FCM strictly to deliver notifications).
+* **Data Linkage**: The collected Device ID is **not linked** to your real-world identity (no name, email, or phone number is collected).
 * **Security Practices**:
-  * **Data Encrypted in Transit**: Yes, all P2P traffic and mailbox uploads are encrypted end-to-end.
-  * **Data Deletion**: Yes, users can request data deletion by uninstalling the application or clearing the database locally.
+  * **Data Encrypted in Transit**: Yes, all P2P traffic, mailbox uploads, and FCM token registrations are encrypted in transit.
+  * **Data Deletion**: Yes, users can request data deletion by uninstalling the application or clearing the database locally. The push service daemon automatically updates or replaces your token when a new registration event occurs.
 
 ---
 

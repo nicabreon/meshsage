@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/ipfs/go-cid"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/nicabreon/meshsage/pkg/logger"
@@ -162,10 +165,37 @@ func ReplicateFile(h host.Host, manifestCIDStr string) {
 	logger.Info().Msgf("Cached %d/%d chunks for %s!", fetched, len(manifest.Chunks), manifest.Name)
 }
 
-// SetupClusterSync joins the gossip topic for metadata replication
-func SetupClusterSync(ctx context.Context, h host.Host) {
+var (
+	clusterSyncTopic      *pubsub.Topic
+	clusterSyncTopicMutex sync.Mutex
+)
+
+func GetClusterSyncTopic() (*pubsub.Topic, error) {
+	clusterSyncTopicMutex.Lock()
+	defer clusterSyncTopicMutex.Unlock()
+
+	if clusterSyncTopic != nil {
+		return clusterSyncTopic, nil
+	}
+
+	if corenet.GlobalPubSub == nil {
+		return nil, fmt.Errorf("GossipSub not initialized")
+	}
+
 	topic, err := corenet.GlobalPubSub.Join(ClusterSyncTopic)
 	if err != nil {
+		return nil, err
+	}
+
+	clusterSyncTopic = topic
+	return topic, nil
+}
+
+// SetupClusterSync joins the gossip topic for metadata replication
+func SetupClusterSync(ctx context.Context, h host.Host) {
+	topic, err := GetClusterSyncTopic()
+	if err != nil {
+		logger.Error().Err(err).Msg("Failed to join cluster sync GossipSub topic")
 		return
 	}
 	sub, err := topic.Subscribe()
@@ -207,14 +237,14 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 					// event.Hash = KeyID, event.Payload = PublicKey, event.Sender = Signature
 					err := corestore.SavePreKey(event.OwnerID, event.Hash, event.Payload, "", event.Sender)
 					if err == nil {
-						logger.Info().Str("ownerID", event.OwnerID[:8]).Str("keyID", event.Hash[:8]).Msg("Synced pre-key from cluster")
+						logger.Info().Str("ownerID", event.OwnerID).Str("keyID", event.Hash[:8]).Msg("Synced pre-key from cluster")
 					}
 				}
 			case "PREKEY_CLEAR":
 				if event.OwnerID != "" {
 					// Only delete public-key-only entries (relay cache), preserve our own private keys
 					_ = corestore.DeletePublicPreKeysByOwner(event.OwnerID)
-					logger.Info().Str("ownerID", event.OwnerID[:8]).Msg("Synced pre-keys clear from cluster (preserved private keys)")
+					logger.Info().Str("ownerID", event.OwnerID).Msg("Synced pre-keys clear from cluster (preserved private keys)")
 				}
 			case "PREKEY_DELETE":
 				if event.Hash != "" {
@@ -228,11 +258,9 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 
 // BroadcastClusterEvent sends a metadata event to the entire cluster
 func BroadcastClusterEvent(ctx context.Context, event ClusterEvent) {
-	if corenet.GlobalPubSub == nil {
-		return
-	}
-	topic, err := corenet.GlobalPubSub.Join(ClusterSyncTopic)
+	topic, err := GetClusterSyncTopic()
 	if err != nil {
+		logger.Error().Err(err).Msg("Failed to get cluster sync topic for broadcast")
 		return
 	}
 

@@ -147,6 +147,7 @@ extern void ResolveOfflineProfile(char* peerIDVal);
 extern char* DownloadPeerAvatar(char* peerIDVal);
 extern char* SendProfileKeyShare(char* peerIDVal);
 extern void BroadcastProfileUpdate(char* targetsCSV, char* displayNameVal, char* avatarCIDVal, char* avatarKeyVal);
+extern char* RegisterFCMToken(char* tokenStr, char* fcmServicePubKeyB64Str);
 
 #ifdef __cplusplus
 }

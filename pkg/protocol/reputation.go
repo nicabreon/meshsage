@@ -28,11 +28,11 @@ func ReportViolation(peerID string, reason string) {
 	defer reputationMu.Unlock()
 
 	violationCounter[peerID]++
-	fmt.Printf("[Reputation] Violation reported for %s: %s (Count: %d)\n", peerID[:8], reason, violationCounter[peerID])
+	fmt.Printf("[Reputation] Violation reported for %s: %s (Count: %d)\n", peerID, reason, violationCounter[peerID])
 
 	if violationCounter[peerID] >= MaxViolations {
 		blacklist[peerID] = true
-		fmt.Printf("[Reputation] Peer %s has been BLACKLISTED due to excessive violations.\n", peerID[:8])
+		fmt.Printf("[Reputation] Peer %s has been BLACKLISTED due to excessive violations.\n", peerID)
 	}
 }
 

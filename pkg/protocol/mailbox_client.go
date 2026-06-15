@@ -181,28 +181,65 @@ func StoreOfflineMessage(ctx context.Context, h host.Host, targetID peer.ID, sen
 		go func(peerID peer.ID) {
 			defer wg.Done()
 
-			dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			s, err := h.NewStream(dialCtx, peerID, protocol.ID(MailboxProtocolID))
-			cancel()
-			if err != nil {
-				return
+			var success bool
+			maxAttempts := 3
+			for attempt := 1; attempt <= maxAttempts; attempt++ {
+				err := func() error {
+					dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					defer cancel()
+					s, err := h.NewStream(dialCtx, peerID, protocol.ID(MailboxProtocolID))
+					if err != nil {
+						return err
+					}
+					defer s.Close()
+
+					_ = s.SetWriteDeadline(time.Now().Add(3 * time.Second))
+					cmd := fmt.Sprintf("STORE %s %s %s %s\n", msgHash, coord, senderPubkeyB64, payloadB64)
+					_, err = s.Write([]byte(cmd))
+					if err != nil {
+						return err
+					}
+					AddBytesSent(len(cmd))
+
+					_ = s.SetReadDeadline(time.Now().Add(3 * time.Second))
+					respBuf := bufio.NewReader(s)
+					resp, err := respBuf.ReadString('\n')
+					if err != nil {
+						return err
+					}
+					AddBytesRecv(len(resp))
+
+					if strings.TrimSpace(resp) != "OK" {
+						return fmt.Errorf("unexpected response: %s", resp)
+					}
+					return nil
+				}()
+
+				if err == nil {
+					success = true
+					break
+				}
+
+				if attempt < maxAttempts {
+					logger.Debug().
+						Err(err).
+						Str("peerID", peerID.String()).
+						Int("attempt", attempt).
+						Msg("Failed to store message on mailbox relay, retrying...")
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(500 * time.Millisecond):
+					}
+				} else {
+					logger.Warn().
+						Err(err).
+						Str("peerID", peerID.String()).
+						Msg("Failed to store message on mailbox relay after all attempts")
+				}
 			}
-			defer s.Close()
 
-			_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			cmd := fmt.Sprintf("STORE %s %s %s %s\n", msgHash, coord, senderPubkeyB64, payloadB64)
-			_, err = s.Write([]byte(cmd))
-			if err != nil {
-				return
-			}
-			AddBytesSent(len(cmd))
-
-			_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
-			respBuf := bufio.NewReader(s)
-			resp, _ := respBuf.ReadString('\n')
-			AddBytesRecv(len(resp))
-
-			if strings.TrimSpace(resp) == "OK" {
+			if success {
 				mu.Lock()
 				successCount++
 				mu.Unlock()

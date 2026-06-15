@@ -117,11 +117,6 @@ func handlePreKeyStream(s network.Stream) {
 		// Safe: relay only stores public keys (private_key=NULL), client private keys are protected
 		// by DeletePublicPreKeysByOwner in the PREKEY_CLEAR cluster event handler.
 		_ = corestore.DeletePreKeysByOwner(batch.OwnerID)
-		BroadcastClusterEvent(context.Background(), ClusterEvent{
-			Type:    "PREKEY_CLEAR",
-			OwnerID: batch.OwnerID,
-			Payload: "",
-		})
 
 		for _, k := range batch.Keys {
 			corestore.SavePreKey(batch.OwnerID, k.KeyID, k.PublicKey, "", k.Signature)
@@ -150,11 +145,6 @@ func handlePreKeyStream(s network.Stream) {
 
 		// Clear old public keys for this owner so stale pre-DB-reset keys don't linger.
 		_ = corestore.DeletePreKeysByOwner(batch.OwnerID)
-		BroadcastClusterEvent(context.Background(), ClusterEvent{
-			Type:    "PREKEY_CLEAR",
-			OwnerID: batch.OwnerID,
-			Payload: "",
-		})
 
 		for _, k := range batch.Keys {
 			corestore.SavePreKey(batch.OwnerID, k.KeyID, k.PublicKey, "", k.Signature)
@@ -369,6 +359,14 @@ func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKe
 
 	logger.Info().Int("relay_count", count).Int("local_count", localCount).Str("peerID", relayID.String()).Msg("Pre-keys stock low, refilling without clearing existing keys")
 
+	type generatedPreKey struct {
+		keyID   string
+		pubB64  string
+		privB64 string
+		sigB64  string
+	}
+	var generatedKeys []generatedPreKey
+
 	batch := PreKeyBatch{
 		OwnerID: h.ID().String(),
 	}
@@ -384,7 +382,12 @@ func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKe
 		sigB64 := base64.StdEncoding.EncodeToString(sig)
 		keyID := fmt.Sprintf("%x", sha256.Sum256(pub))[:12]
 
-		corestore.SavePreKey(h.ID().String(), keyID, pubB64, privB64, sigB64)
+		generatedKeys = append(generatedKeys, generatedPreKey{
+			keyID:   keyID,
+			pubB64:  pubB64,
+			privB64: privB64,
+			sigB64:  sigB64,
+		})
 		batch.Keys = append(batch.Keys, OneTimeKey{KeyID: keyID, PublicKey: pubB64, Signature: sigB64})
 		sigBuf.WriteString(keyID)
 		sigBuf.WriteString(pubB64)
@@ -395,7 +398,12 @@ func AutoRefillPreKeys(ctx context.Context, h host.Host, relayID peer.ID, privKe
 
 	err = UploadPreKeys(ctx, h, relayID, batch)
 	if err == nil {
+		for _, gk := range generatedKeys {
+			corestore.SavePreKey(h.ID().String(), gk.keyID, gk.pubB64, gk.privB64, gk.sigB64)
+		}
 		logger.Info().Str("peerID", relayID.String()).Msg("Refilled 10 pre-keys successfully")
+	} else {
+		logger.Error().Err(err).Str("peerID", relayID.String()).Msg("Failed to upload refilled pre-keys to relay")
 	}
 	return err
 }

@@ -525,7 +525,7 @@ func TriggerAvatarDownload(peerID, avatarCID, avatarKey string) {
 		// 3. Update the SQLite database profile_store cache with the local path
 		name, _, _, _, err := corestore.GetPeerProfile(peerID)
 		if err != nil || name == "" {
-			name = peerID[:8] // fallback displayName
+			name = peerID // fallback displayName
 		}
 
 		err = corestore.SavePeerProfile(peerID, name, avatarCID, avatarKey, savePath)

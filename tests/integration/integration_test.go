@@ -522,3 +522,143 @@ func TestMailboxAntiSpamCheck(t *testing.T) {
 
 	assert.True(t, strings.Contains(resp, "ERROR_SENDER_UNREGISTERED"), "Pesan dari sender tanpa prekey harus ditolak dengan ERROR_SENDER_UNREGISTERED")
 }
+
+func TestFCMTokenRegistrationEnd2End(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 1. Create client and relay hosts
+	hClient, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	require.NoError(t, err)
+	defer hClient.Close()
+
+	hRelay, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	require.NoError(t, err)
+	defer hRelay.Close()
+
+	// Setup PubSub on relay
+	corenet.IsClientOnly = false
+	corenet.IsNetworkWeak = false
+	err = corenet.SetupPubSub(ctx, hRelay)
+	require.NoError(t, err)
+
+	// Join cluster sync GossipSub topic on relay
+	protocol.SetupClusterSync(ctx, hRelay)
+
+	// Setup FCM registration handler on Dedicated Relay (force acts as Dedicated)
+	corenet.IsDedicated = true
+	protocol.SetupMailbox(hRelay, false)
+
+	// Connect Client to Relay
+	hClient.Peerstore().AddAddrs(hRelay.ID(), hRelay.Addrs(), time.Hour)
+	err = hClient.Connect(ctx, peer.AddrInfo{ID: hRelay.ID()})
+	require.NoError(t, err)
+
+	// 2. Generate FCM Service Keypair for ECIES
+	fcmPriv, fcmPub, err := corecrypto.GenerateEphemeralKeypair()
+	require.NoError(t, err)
+
+	// 3. Client encrypts and signs dummy token
+	dummyToken := "sample_fcm_token_xyz_123"
+
+	// ECIES encryption
+	ephemeralPriv, ephemeralPub, err := corecrypto.GenerateEphemeralKeypair()
+	require.NoError(t, err)
+
+	aesKey, err := corecrypto.DeriveSharedSecret(ephemeralPriv, fcmPub)
+	require.NoError(t, err)
+
+	ciphertext, err := corecrypto.EncryptMessage(aesKey, dummyToken)
+	require.NoError(t, err)
+
+	payload := struct {
+		EphemeralPub string `json:"ephemeral_pub"`
+		Ciphertext   string `json:"ciphertext"`
+	}{
+		EphemeralPub: base64.StdEncoding.EncodeToString(ephemeralPub),
+		Ciphertext:   ciphertext,
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	payloadStr := string(payloadBytes)
+
+	// Sign payload using Client P2P Private Key
+	clientPrivKey := hClient.Peerstore().PrivKey(hClient.ID())
+	sigBytes, err := clientPrivKey.Sign([]byte(payloadStr))
+	require.NoError(t, err)
+
+	senderPubBytes, err := crypto.MarshalPublicKey(clientPrivKey.GetPublic())
+	require.NoError(t, err)
+
+	regRequest := protocol.FCMRegisterRequest{
+		OwnerID:   hClient.ID().String(),
+		Payload:   payloadStr,
+		Sender:    base64.StdEncoding.EncodeToString(senderPubBytes),
+		Signature: base64.StdEncoding.EncodeToString(sigBytes),
+	}
+	regRequestBytes, _ := json.Marshal(regRequest)
+
+	// 4. FCM Service starts listening on PubSub
+	// (Simulate GossipSub receiver in FCM Service daemon)
+	topic, err := protocol.GetClusterSyncTopic()
+	require.NoError(t, err)
+	sub, err := topic.Subscribe()
+	require.NoError(t, err)
+	defer sub.Cancel()
+
+	// 5. Client sends registration request to Relay via FCMRegisterProtocolID stream
+	s, err := hClient.NewStream(ctx, hRelay.ID(), libp2pproto.ID(protocol.FCMRegisterProtocolID))
+	require.NoError(t, err)
+	_, err = s.Write(regRequestBytes)
+	require.NoError(t, err)
+	s.Close()
+
+	// 6. FCM Service daemon intercepts GossipSub message
+	var receivedEvent protocol.ClusterEvent
+	received := make(chan bool, 1)
+
+	go func() {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			var ev protocol.ClusterEvent
+			if err := json.Unmarshal(msg.Data, &ev); err == nil && ev.Type == "FCM_REGISTER" {
+				// Verify HMAC cluster signature
+				if protocol.VerifyClusterHMAC(ev, protocol.ClusterSecretKey) {
+					receivedEvent = ev
+					received <- true
+					return
+				}
+			}
+		}
+	}()
+
+	select {
+	case <-received:
+		// Decrypt payload in simulated FCM service
+		var encPayload struct {
+			EphemeralPub string `json:"ephemeral_pub"`
+			Ciphertext   string `json:"ciphertext"`
+		}
+		err = json.Unmarshal([]byte(receivedEvent.Payload), &encPayload)
+		require.NoError(t, err)
+
+		ephPubBytes, err := base64.StdEncoding.DecodeString(encPayload.EphemeralPub)
+		require.NoError(t, err)
+
+		// Compute secret on receiver side (X25519 ECDH)
+		decAesKey, err := corecrypto.DeriveSharedSecret(fcmPriv, ephPubBytes)
+		require.NoError(t, err)
+
+		decryptedToken, err := corecrypto.DecryptMessage(decAesKey, encPayload.Ciphertext)
+		require.NoError(t, err)
+
+		// Assert token decrypts back to original dummy FCM token
+		assert.Equal(t, dummyToken, decryptedToken)
+		assert.Equal(t, hClient.ID().String(), receivedEvent.OwnerID)
+		t.Log("E2E FCM Token Registration Test passed successfully!")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for FCM registration GossipSub broadcast")
+	}
+}

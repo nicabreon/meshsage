@@ -121,3 +121,16 @@ func HasSession(peerID string) bool {
 	err := DB.QueryRow(`SELECT COUNT(1) FROM sessions WHERE peer_id = ? AND root_key != ''`, peerID).Scan(&count)
 	return err == nil && count > 0
 }
+
+// GetSessionUpdateTime returns the last updated time (in UTC) for the session of a peerID.
+func GetSessionUpdateTime(peerID string) (string, error) {
+	if DB == nil {
+		return "", fmt.Errorf("database not initialized")
+	}
+	var updatedAt string
+	err := DB.QueryRow(`SELECT updated_at FROM sessions WHERE peer_id = ?`, peerID).Scan(&updatedAt)
+	if err != nil {
+		return "", err
+	}
+	return updatedAt, nil
+}

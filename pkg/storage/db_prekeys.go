@@ -73,7 +73,7 @@ func FetchOnePreKey(targetOwnerID string, selfID string) (keyID string, pubKey s
 	if err == nil {
 		// Enforce One-Time Use ONLY if it's not our own key
 		if targetOwnerID != selfID {
-			DB.Exec("DELETE FROM prekeys WHERE key_id = ?", keyID)
+			DeletePublicPreKeyByID(keyID)
 		}
 	}
 	return
