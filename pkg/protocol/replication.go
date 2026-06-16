@@ -193,6 +193,11 @@ func GetClusterSyncTopic() (*pubsub.Topic, error) {
 
 // SetupClusterSync joins the gossip topic for metadata replication
 func SetupClusterSync(ctx context.Context, h host.Host) {
+	if corenet.IsClientOnly {
+		logger.Info().Msg("Client-only node: skipping ClusterSync setup")
+		return
+	}
+
 	topic, err := GetClusterSyncTopic()
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to join cluster sync GossipSub topic")
@@ -258,6 +263,9 @@ func SetupClusterSync(ctx context.Context, h host.Host) {
 
 // BroadcastClusterEvent sends a metadata event to the entire cluster
 func BroadcastClusterEvent(ctx context.Context, event ClusterEvent) {
+	if corenet.IsClientOnly {
+		return
+	}
 	topic, err := GetClusterSyncTopic()
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to get cluster sync topic for broadcast")

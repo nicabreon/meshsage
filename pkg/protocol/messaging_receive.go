@@ -719,13 +719,20 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 
 		// Persist to SQLite only for actual user-visible chat messages
 		if !isCallSignal(env.Content) {
-			corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "direct", "unread")
+			corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "direct", "unread", env.Timestamp)
 		}
 
 		logger.Info().Str("senderID", senderID.String()).Str("msgID", env.ID).Msg("Received standard text message successfully")
 		TrackMsgRecv() // Track incoming message
 
-		ts := time.Now().Format("02/01 15:04:05")
+		var sentTime time.Time
+		if env.Timestamp > 0 {
+			sentTime = time.Unix(env.Timestamp/1e9, env.Timestamp%1e9)
+		} else {
+			sentTime = time.Now()
+		}
+		ts := sentTime.Local().Format("02/01 15:04:05")
+
 		logger.Displayf("\033[92m[%s] [Message from %s]: %s\033[0m\n", ts, FormatSender(senderID.String()), env.Content)
 
 		if MessageCallback != nil {
@@ -746,11 +753,18 @@ func handleIncomingPayload(ctx context.Context, h host.Host, senderID peer.ID, e
 
 	case MsgTypeFile:
 		// Persist to SQLite
-		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "file", "unread")
+		corestore.SaveMessage(senderID.String(), h.ID().String(), env.Content, env.ID, msgHash, "file", "unread", env.Timestamp)
 
 		parts := strings.Split(env.Content, ":")
 		if len(parts) >= 4 {
-			ts := time.Now().Format("02/01 15:04:05")
+			var fileSentTime time.Time
+			if env.Timestamp > 0 {
+				fileSentTime = time.Unix(env.Timestamp/1e9, env.Timestamp%1e9)
+			} else {
+				fileSentTime = time.Now()
+			}
+			ts := fileSentTime.Local().Format("02/01 15:04:05")
+
 			logger.Displayf("\033[92m[%s] [FILE from %s]: %s (%s bytes)\033[0m\n", ts, FormatSender(senderID.String()), parts[2], parts[3])
 			logger.Displayf("\033[33m>> To download, use: /download %s %s\033[0m\n", parts[0], parts[1])
 			if MessageCallback != nil {

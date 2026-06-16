@@ -1065,7 +1065,7 @@ func SaveOutgoingMessage(senderIDVal, recipientIDVal, contentVal, msgIDVal, msgH
 	msgType := C.GoString(msgTypeVal)
 	status := C.GoString(statusVal)
 
-	err := corestore.SaveMessage(senderID, recipientID, content, msgID, msgHash, msgType, status)
+	err := corestore.SaveMessage(senderID, recipientID, content, msgID, msgHash, msgType, status, 0)
 	if err != nil {
 		return C.CString("Error: " + err.Error())
 	}

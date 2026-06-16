@@ -163,24 +163,25 @@ func TestMailboxRateLimiter(t *testing.T) {
 	err = hClient.Connect(ctx, peer.AddrInfo{ID: hRelay.ID()})
 	require.NoError(t, err)
 
-	// Reset rate limit untuk test bersih
-	protocol.ResetMailboxRateLimiter()
-
-	// 1. Kirim request FETCH pertama
+	// 1. Buka kedua stream terlebih dahulu untuk menghindari delay negosiasi protokol libp2p
 	s1, err := hClient.NewStream(ctx, hRelay.ID(), libp2pproto.ID(protocol.MailboxProtocolID))
 	require.NoError(t, err)
 	defer s1.Close()
 
+	s2, err := hClient.NewStream(ctx, hRelay.ID(), libp2pproto.ID(protocol.MailboxProtocolID))
+	require.NoError(t, err)
+	defer s2.Close()
+
+	// Reset rate limit untuk test bersih
+	protocol.ResetMailboxRateLimiter()
+
+	// 2. Kirim request FETCH pertama
 	coord := protocol.GetMailboxCoordinate(hClient.ID())
 	cmd1 := "FETCH " + coord + " ACK\n"
 	_, err = s1.Write([]byte(cmd1))
 	require.NoError(t, err)
 
-	// 2. Kirim request FETCH kedua dengan cepat secara paralel/konkuren
-	s2, err := hClient.NewStream(ctx, hRelay.ID(), libp2pproto.ID(protocol.MailboxProtocolID))
-	require.NoError(t, err)
-	defer s2.Close()
-
+	// 3. Kirim request FETCH kedua dengan sangat cepat
 	cmd2 := "FETCH " + coord + " ACK\n"
 	_, err = s2.Write([]byte(cmd2))
 	require.NoError(t, err)

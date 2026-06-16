@@ -464,7 +464,7 @@ func decryptAndDispatchGroupMsg(ctx context.Context, session *GroupSession, grou
 	if sigOrHash == "" {
 		sigOrHash = fmt.Sprintf("%x", sha256.Sum256([]byte(gMsg.Payload+gMsg.SenderID+ts)))
 	}
-	_ = corestore.SaveMessage(gMsg.SenderID, groupID, plaintext, msgID, sigOrHash, "group", "unread")
+	_ = corestore.SaveMessage(gMsg.SenderID, groupID, plaintext, msgID, sigOrHash, "group", "unread", 0)
 
 	if MessageCallback != nil {
 		MessageCallback(MessageEvent{
@@ -771,7 +771,7 @@ func ProcessGroupMessage(groupID string, msgBytes []byte, msgHash string) bool {
 
 	// Save to local SQLite messages database (for deduplication cache recovery)
 	if msgHash != "" {
-		_ = corestore.SaveMessage(gMsg.SenderID, groupID, plaintext, msgID, msgHash, "group", "unread")
+		_ = corestore.SaveMessage(gMsg.SenderID, groupID, plaintext, msgID, msgHash, "group", "unread", 0)
 	}
 
 	logger.Displayf("\033[92m[%s] [Group %s] %s (Offline): %s\033[0m\n", ts, meta.GroupAlias, FormatSender(gMsg.SenderID), plaintext)

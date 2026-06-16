@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 // ChatMessageResult represents a message returned for UI rendering
@@ -27,15 +28,21 @@ type ChatMetadata struct {
 }
 
 // SaveMessage stores a message in the local database with a delivery/read status.
-func SaveMessage(senderID, recipientID, content, msgID, msgHash, msgType, status string) error {
+func SaveMessage(senderID, recipientID, content, msgID, msgHash, msgType, status string, timestampUnixNs int64) error {
 	if DB == nil {
 		return fmt.Errorf("database not initialized")
 	}
 	if status == "" {
 		status = "unread"
 	}
-	query := `INSERT INTO messages (sender_id, recipient_id, content, msg_id, msg_hash, msg_type, status) VALUES (?, ?, ?, ?, ?, ?, ?)`
-	_, err := DB.Exec(query, senderID, recipientID, content, msgID, msgHash, msgType, status)
+	if timestampUnixNs == 0 {
+		timestampUnixNs = time.Now().UnixNano()
+	}
+	t := time.Unix(timestampUnixNs/1e9, timestampUnixNs%1e9)
+	timestampStr := t.UTC().Format("2006-01-02 15:04:05")
+
+	query := `INSERT INTO messages (sender_id, recipient_id, content, msg_id, msg_hash, msg_type, status, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := DB.Exec(query, senderID, recipientID, content, msgID, msgHash, msgType, status, timestampStr)
 	if err != nil {
 		return fmt.Errorf("failed to insert message: %w", err)
 	}
