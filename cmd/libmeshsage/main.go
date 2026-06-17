@@ -6,14 +6,14 @@ package main
 #include "dart_api_dl.h"
 
 // Helper function to post string messages via Dart_PostCObject_DL
-static bool post_string_to_dart(int64_t port_id, const char* str) {
+static int post_string_to_dart(int64_t port_id, const char* str) {
     if (Dart_PostCObject_DL == NULL) {
-        return false;
+        return 0;
     }
     Dart_CObject obj;
     obj.type = Dart_CObject_kString;
     obj.value.as_string = str;
-    return Dart_PostCObject_DL(port_id, &obj);
+    return Dart_PostCObject_DL(port_id, &obj) ? 1 : 0;
 }
 */
 import "C"
@@ -30,7 +30,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -58,7 +57,8 @@ var (
 )
 
 var (
-	globalPortID int64 // accessed atomically
+	globalPortIDs []int64
+	portMutex     sync.RWMutex
 )
 
 var DefaultSeeds = []string{
@@ -83,6 +83,26 @@ func NewQueue() *Queue {
 	return q
 }
 
+func removeFailedPorts(failed []int64) {
+	portMutex.Lock()
+	defer portMutex.Unlock()
+
+	var active []int64
+	for _, p := range globalPortIDs {
+		keep := true
+		for _, f := range failed {
+			if p == f {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			active = append(active, p)
+		}
+	}
+	globalPortIDs = active
+}
+
 func (q *Queue) Push(event string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -90,12 +110,25 @@ func (q *Queue) Push(event string) {
 		return
 	}
 
-	portID := atomic.LoadInt64(&globalPortID)
+	portMutex.RLock()
+	ports := make([]int64, len(globalPortIDs))
+	copy(ports, globalPortIDs)
+	portMutex.RUnlock()
 
-	if portID != 0 {
+	if len(ports) > 0 {
 		cStr := C.CString(event)
-		C.post_string_to_dart(C.int64_t(portID), cStr)
+		var failed []int64
+		for _, portID := range ports {
+			ok := C.post_string_to_dart(C.int64_t(portID), cStr)
+			if ok == 0 {
+				failed = append(failed, portID)
+			}
+		}
 		C.free(unsafe.Pointer(cStr))
+
+		if len(failed) > 0 {
+			go removeFailedPorts(failed)
+		}
 	} else {
 		q.events = append(q.events, event)
 		q.cond.Signal()
@@ -110,12 +143,23 @@ func (q *Queue) FlushPending(portID int64) {
 	}
 	// Use raw stdout print to avoid recursive logging deadlocks
 	fmt.Printf("[Go EventQueue] Flushing %d pending events to registered Dart Port %d\n", len(q.events), portID)
-	for _, event := range q.events {
-		cStr := C.CString(event)
-		C.post_string_to_dart(C.int64_t(portID), cStr)
+	cStrList := make([]*C.char, len(q.events))
+	for i, event := range q.events {
+		cStrList[i] = C.CString(event)
+	}
+
+	ok := 1
+	for _, cStr := range cStrList {
+		if ok == 1 {
+			ok = int(C.post_string_to_dart(C.int64_t(portID), cStr))
+		}
 		C.free(unsafe.Pointer(cStr))
 	}
 	q.events = nil
+
+	if ok == 0 {
+		go removeFailedPorts([]int64{portID})
+	}
 }
 
 // Close wakes up all blocked Pop() callers so they can exit cleanly.
@@ -221,9 +265,11 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 		time.Sleep(100 * time.Millisecond) // Give the OS a brief moment to yield
 	}
 
-	// Reset the globalPortID so pending startup events are queued until Dart registers its new Port ID.
+	// Reset the globalPortIDs so pending startup events are queued until Dart registers its new Port ID.
 	// This prevents Go from pushing events to the dead port ID from the pre-restart Dart VM session.
-	atomic.StoreInt64(&globalPortID, 0)
+	portMutex.Lock()
+	globalPortIDs = nil
+	portMutex.Unlock()
 
 	dbPath := C.GoString(dbPathStr)
 	idPath := C.GoString(idPathStr)
@@ -647,6 +693,9 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 
 //export SendDirectMessage
 func SendDirectMessage(targetStr, contentStr *C.char) *C.char {
+	if globalHost == nil {
+		return C.CString("Error: Go node not started yet")
+	}
 	target := C.GoString(targetStr)
 	content := C.GoString(contentStr)
 
@@ -684,6 +733,9 @@ func SendDirectMessage(targetStr, contentStr *C.char) *C.char {
 
 //export InitiateSession
 func InitiateSession(targetStr *C.char) *C.char {
+	if globalHost == nil {
+		return C.CString("Error: Go node not started yet")
+	}
 	target := C.GoString(targetStr)
 
 	if strings.HasPrefix(target, "@") {
@@ -719,6 +771,9 @@ func InitiateSession(targetStr *C.char) *C.char {
 
 //export SendReadReceipt
 func SendReadReceipt(targetStr, msgIDStr *C.char) *C.char {
+	if globalHost == nil {
+		return C.CString("Error: Go node not started yet")
+	}
 	target := C.GoString(targetStr)
 	msgID := C.GoString(msgIDStr)
 
@@ -771,6 +826,9 @@ func ResetPeerSession(peerIDStr *C.char) *C.char {
 
 //export SendGroupChat
 func SendGroupChat(groupIDStr, contentStr *C.char) *C.char {
+	if globalHost == nil {
+		return C.CString("Error: Go node not started yet")
+	}
 	groupID := C.GoString(groupIDStr)
 	content := C.GoString(contentStr)
 
@@ -784,6 +842,9 @@ func SendGroupChat(groupIDStr, contentStr *C.char) *C.char {
 
 //export JoinGroup
 func JoinGroup(groupIDStr, membersStr *C.char) *C.char {
+	if globalHost == nil {
+		return C.CString("Error: Go node not started yet")
+	}
 	groupID := C.GoString(groupIDStr)
 	membersCSV := C.GoString(membersStr)
 
@@ -908,11 +969,60 @@ func StopNode() {
 		}()
 		globalHost = nil
 
-		atomic.StoreInt64(&globalPortID, 0)
+		portMutex.Lock()
+		globalPortIDs = nil
+		portMutex.Unlock()
 
 		eventQueue.Close()
 		// Replace with fresh queue for future restarts
 		eventQueue = NewQueue()
+	}
+}
+
+//export ResumeNetwork
+func ResumeNetwork() {
+	if globalHost == nil {
+		logger.Warn().Msg("ResumeNetwork called but globalHost is nil")
+		return
+	}
+	logger.Info().Msg("Resuming network connections...")
+
+	s, isSwarm := globalHost.Network().(*swarm.Swarm)
+
+	for _, seedStr := range DefaultSeeds {
+		ma, err := multiaddr.NewMultiaddr(seedStr)
+		if err != nil {
+			logger.Error().Err(err).Str("addr", seedStr).Msg("Failed to parse seed address")
+			continue
+		}
+		pinfo, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			logger.Error().Err(err).Str("addr", seedStr).Msg("Failed to get peer info from seed address")
+			continue
+		}
+
+		if isSwarm {
+			s.Backoff().Clear(pinfo.ID)
+			logger.Debug().Str("peer", pinfo.ID.String()).Msg("Cleared swarm dial backoff for seed peer")
+		}
+
+		_ = globalHost.Network().ClosePeer(pinfo.ID)
+		logger.Info().Str("peer", pinfo.ID.String()).Msg("Closed connection to seed peer (dropping zombie sockets)")
+
+		go func(info peer.AddrInfo) {
+			ctx := globalCtx
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			logger.Info().Str("peer", info.ID.String()).Msg("Attempting fresh dial to seed peer...")
+			if err := globalHost.Connect(dialCtx, info); err != nil {
+				logger.Warn().Err(err).Str("peer", info.ID.String()).Msg("Failed to reconnect to seed peer on resume")
+			} else {
+				logger.Info().Str("peer", info.ID.String()).Msg("Successfully reconnected to seed peer on resume")
+			}
+		}(*pinfo)
 	}
 }
 
@@ -923,9 +1033,23 @@ func InitializeDartApi(data unsafe.Pointer) C.int {
 
 //export RegisterPort
 func RegisterPort(portID C.int64_t) {
-	atomic.StoreInt64(&globalPortID, int64(portID))
-	logger.Info().Int64("portID", int64(portID)).Msg("Registered Dart Native Port ID in Go")
-	eventQueue.FlushPending(int64(portID))
+	portMutex.Lock()
+	id := int64(portID)
+	found := false
+	for _, p := range globalPortIDs {
+		if p == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		globalPortIDs = append(globalPortIDs, id)
+	}
+	portCount := len(globalPortIDs)
+	portMutex.Unlock()
+
+	logger.Info().Int64("portID", id).Int("portCount", portCount).Msg("Registered Dart Native Port ID in Go")
+	eventQueue.FlushPending(id)
 }
 
 //export GetNetworkStats
