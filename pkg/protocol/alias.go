@@ -89,6 +89,27 @@ func handleAliasStream(h host.Host, s network.Stream) {
 	if len(parts) > 0 {
 		logger.Debug().Str("command", parts[0]).Str("peerID", remoteID).Msg("ALIAS SERVICE: Incoming stream")
 		switch parts[0] {
+		case "SUBMIT_TX":
+			txJSON := strings.TrimPrefix(cmdLine, "SUBMIT_TX ")
+			var tx Transaction
+			if err := json.Unmarshal([]byte(txJSON), &tx); err != nil {
+				logger.Error().Err(err).Msg("ALIAS SERVICE: Failed to parse SUBMIT_TX JSON")
+				s.Write([]byte("ERROR_INVALID_JSON\n"))
+				return
+			}
+			if !corenet.IsDedicated {
+				logger.Warn().Msg("ALIAS SERVICE: Received SUBMIT_TX but this node is not a Dedicated Relay (validator)")
+				s.Write([]byte("ERROR_NOT_VALIDATOR\n"))
+				return
+			}
+			if err := AddToMempool(tx); err != nil {
+				logger.Error().Err(err).Str("alias", tx.Alias).Msg("ALIAS SERVICE: Rejected SUBMIT_TX")
+				s.Write([]byte("ERROR_" + strings.ReplaceAll(err.Error(), " ", "_") + "\n"))
+				return
+			}
+			logger.Info().Str("alias", tx.Alias).Msg("ALIAS SERVICE: Accepted SUBMIT_TX and added to mempool")
+			s.Write([]byte("OK\n"))
+			return
 		case "REGISTER":
 			// REGISTER <alias_name> <peer_id> <pubkey_b64> <sig_b64>
 			if len(parts) == 5 {
@@ -189,7 +210,13 @@ func handleAliasStream(h host.Host, s network.Stream) {
 					logger.Info().Str("alias", aliasName).Str("peerID", record.PeerID).Msg("ALIAS SERVICE: Alias resolved from memory")
 					pubKeyBytes, _ := crypto.MarshalPublicKey(record.PubKey)
 					pubKeyB64 := base64.StdEncoding.EncodeToString(pubKeyBytes)
-					response := fmt.Sprintf("FOUND %s %s\n", record.PeerID, pubKeyB64)
+
+					height, errHeight := corestore.GetAliasRegistrationHeight(aliasName)
+					if errHeight != nil {
+						height = -1
+					}
+
+					response := fmt.Sprintf("FOUND %s %s %d\n", record.PeerID, pubKeyB64, height)
 					s.Write([]byte(response))
 				} else {
 					logger.Debug().Str("alias", aliasName).Msg("ALIAS SERVICE: Alias not found in local memory")
@@ -223,25 +250,65 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 		return fmt.Errorf("cannot register alias: not connected to any peers")
 	}
 
+	if !strings.HasPrefix(alias, "@") {
+		alias = "@" + alias
+	}
+
 	coord := GetAliasCoordinate(alias)
 
-	// 1. Persiapkan Tanda Tangan Digital (Proof of Ownership)
+	// 1. Prepare Keypair and serialization parameters
 	privKey := h.Peerstore().PrivKey(h.ID())
 	pubKey := h.Peerstore().PubKey(h.ID())
 	pubKeyBytes, _ := crypto.MarshalPublicKey(pubKey)
 	pubKeyB64 := base64.StdEncoding.EncodeToString(pubKeyBytes)
 
-	// Format harus sama dengan yang diverifikasi Relay: aliasName + targetPeerID + pubKeyB64
-	dataToSign := []byte(alias + myPeerID + pubKeyB64)
+	// 1b. Determine PoW difficulty (use lower difficulty 1 for fast unit tests)
+	isTestMode := flag.Lookup("test.v") != nil
+	difficulty := 16
+	if isTestMode {
+		difficulty = 1
+	}
+
+	vTime := GetVirtualTime()
+	var ts int64
+	if vTime.IsZero() {
+		ts = time.Now().UnixMilli()
+	} else {
+		ts = vTime.UnixMilli()
+	}
+
+	// 2. Build Transaction payload
+	tx := Transaction{
+		TxType:         TxTypeRegisterAlias,
+		Alias:          alias,
+		OwnerPeerID:    myPeerID,
+		PubKeyBytesB64: pubKeyB64,
+		Timestamp:      ts,
+		PoWDifficulty:  difficulty,
+	}
+
+	// 3. Solve cryptographic PoW puzzle
+	baseHash := CalculateTxBaseHash(tx.TxType, tx.Alias, tx.OwnerPeerID, tx.PubKeyBytesB64, tx.Timestamp)
+	logger.Info().Str("alias", alias).Int("difficulty", difficulty).Msg("Mining PoW for alias registration transaction...")
+	tx.PoWNonce = MinePoW(baseHash, tx.PoWDifficulty)
+	tx.TxID = CalculateTxID(&tx)
+
+	// 4. Digitally Sign the transaction payload
+	dataToSign := []byte(fmt.Sprintf("%s:%s:%s:%s:%d", tx.TxType, tx.Alias, tx.OwnerPeerID, tx.PubKeyBytesB64, tx.Timestamp))
 	signature, err := privKey.Sign(dataToSign)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to sign transaction: %w", err)
 	}
-	sigB64 := base64.StdEncoding.EncodeToString(signature)
+	tx.Signature = base64.StdEncoding.EncodeToString(signature)
 
-	// 1b. Check dedicated relays and public IP requirements in production
-	// We skip this check in Go test environment to prevent unit tests breaking.
-	isTestMode := flag.Lookup("test.v") != nil
+	// Serialize transaction to JSON
+	txJSONBytes, err := json.Marshal(tx)
+	if err != nil {
+		return fmt.Errorf("failed to marshal transaction: %w", err)
+	}
+	cmd := fmt.Sprintf("SUBMIT_TX %s\n", string(txJSONBytes))
+
+	// Check dedicated relays and public IP requirements in production
 	if len(h.Network().Peers()) > 0 && !isTestMode {
 		var hasDedicated bool
 		var hasPublicDedicated bool
@@ -280,7 +347,7 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 		}
 	}
 
-	// 2. Cari node terdekat di DHT dengan timeout 3 detik
+	// 5. Query closest nodes / relays
 	dhtCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	closestPeers, err := corenet.GlobalDHT.GetClosestPeers(dhtCtx, coord)
 	cancel()
@@ -288,7 +355,7 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 		closestPeers = h.Network().Peers()
 	}
 
-	// 2b. Prioritize dedicated relays by placing them at the beginning of the target list
+	// Prioritize Dedicated Relays by putting them at the beginning of the list
 	var targets []peer.ID
 	for _, p := range h.Network().Peers() {
 		protos, err := h.Peerstore().GetProtocols(p)
@@ -301,7 +368,6 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 			}
 		}
 	}
-	// Append remaining closest peers
 	for _, p := range closestPeers {
 		exists := false
 		for _, t := range targets {
@@ -319,7 +385,7 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 	var mu sync.Mutex
 	successCount := 0
 
-	logger.Debug().Int("peer_count", len(targets)).Str("alias", alias).Msg("CLIENT: Iterating peers for registration")
+	logger.Debug().Int("peer_count", len(targets)).Str("alias", alias).Msg("CLIENT: Iterating peers for blockchain alias registration")
 	for _, p := range targets {
 		if p == h.ID() {
 			continue
@@ -336,13 +402,10 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 
 			s, err := h.NewStream(dialCtx, peerID, AliasProtocolID)
 			if err != nil {
-				logger.Debug().Err(err).Str("peerID", peerID.String()).Msg("CLIENT: Failed to dial peer for alias registration")
 				return
 			}
 			defer s.Close()
 
-			// Format: REGISTER <alias_name> <peer_id> <pubkey_b64> <sig_b64>
-			cmd := fmt.Sprintf("REGISTER %s %s %s %s\n", alias, myPeerID, pubKeyB64, sigB64)
 			_ = s.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			_, err = s.Write([]byte(cmd))
 			if err != nil {
@@ -356,23 +419,24 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 				return
 			}
 
-			if strings.TrimSpace(resp) == "OK" {
-				logger.Info().Str("peerID", peerID.String()).Msg("CLIENT: Registration accepted by peer")
+			resp = strings.TrimSpace(resp)
+			if resp == "OK" {
+				logger.Info().Str("peerID", peerID.String()).Msg("CLIENT: Blockchain transaction accepted by peer")
 				mu.Lock()
 				successCount++
 				mu.Unlock()
 			} else {
-				logger.Warn().Str("peerID", peerID.String()).Str("response", strings.TrimSpace(resp)).Msg("CLIENT: Registration rejected by peer")
+				logger.Warn().Str("peerID", peerID.String()).Str("response", resp).Msg("CLIENT: Transaction rejected by peer")
 			}
 		}(p)
 	}
 	wg.Wait()
 
 	if successCount == 0 {
-		return fmt.Errorf("failed to register alias (maybe already owned by someone else?)")
+		return fmt.Errorf("failed to submit alias transaction (mempool rejected or no authorized validators reached)")
 	}
 
-	// Save to local database and memory
+	// Save to local database and memory optimistically
 	aliasHash := GetAliasCoordinate(alias)
 	pubKeyStr := base64.StdEncoding.EncodeToString(pubKeyBytes)
 
@@ -386,7 +450,7 @@ func RegisterAlias(ctx context.Context, h host.Host, alias string, myPeerID stri
 	ownerStore[pubKeyStr] = alias
 	aliasMutex.Unlock()
 
-	logger.Displayf("[Alias] Successfully registered '%s' on %d nodes with Digital Signature!\n", alias, successCount)
+	logger.Displayf("[Blockchain Alias] Transaction successfully submitted to %d validators! Alias registered optimistically.\n", successCount)
 	return nil
 }
 
@@ -455,18 +519,68 @@ func ResolveAlias(ctx context.Context, h host.Host, alias string) (string, error
 
 			resp = strings.TrimSpace(resp)
 			if strings.HasPrefix(resp, "FOUND ") {
-				parts := strings.SplitN(resp, " ", 3)
-				if len(parts) >= 2 && parts[1] != "" {
+				parts := strings.SplitN(resp, " ", 4)
+				if len(parts) >= 3 && parts[1] != "" && parts[2] != "" {
 					peerID := parts[1]
+					pubKeyB64 := parts[2]
+					var height int64 = -1
+					if len(parts) == 4 {
+						_, _ = fmt.Sscanf(parts[3], "%d", &height)
+					}
 
-					// Cache the resolved alias locally if public key is provided and matches the peer ID
-					if len(parts) == 3 && parts[2] != "" {
-						pubKeyBytes, err := base64.StdEncoding.DecodeString(parts[2])
+					pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyB64)
+					if err == nil {
+						pubKey, err := crypto.UnmarshalPublicKey(pubKeyBytes)
 						if err == nil {
-							pubKey, err := crypto.UnmarshalPublicKey(pubKeyBytes)
-							if err == nil {
-								derivedID, err := peer.IDFromPublicKey(pubKey)
-								if err == nil && derivedID.String() == peerID {
+							derivedID, err := peer.IDFromPublicKey(pubKey)
+							if err == nil && derivedID.String() == peerID {
+								verified := true
+								if height >= 0 {
+									// Fetch proof block on-demand
+									pID, errPid := peer.Decode(peerID)
+									if errPid != nil {
+										logger.Warn().Err(errPid).Msg("Light Client Resolve Audit: Failed to decode resolved Peer ID")
+										verified = false
+									} else {
+										block, errBlock := RequestSingleBlockFromPeer(dialCtx, h, pID, height)
+										if errBlock != nil {
+											logger.Warn().Err(errBlock).Str("alias", alias).Msg("Light Client Resolve Audit: Failed to fetch proof block from relay")
+											verified = false
+										} else {
+										// Load verified header hash
+										localHash, _, _, _, _, _, errDb := corestore.GetBlock(height)
+										if errDb != nil || localHash == "" {
+											logger.Warn().Int64("height", height).Msg("Light Client Resolve Audit: Local header not yet synced at height")
+										} else {
+											receivedHash := CalculateBlockHash(&block.Header)
+											if localHash != receivedHash {
+												logger.Error().
+													Str("local", localHash).
+													Str("received", receivedHash).
+													Int64("height", height).
+													Msg("⚠️ LIGHT CLIENT RESOLVE AUDIT: SECURITY ALERT! Relay returned block header that conflicts with locally verified consensus ledger!")
+												verified = false
+											} else {
+												foundTx := false
+												for _, tx := range block.Transactions {
+													if tx.Alias == alias && tx.OwnerPeerID == peerID {
+														foundTx = true
+														break
+													}
+												}
+												if !foundTx {
+													logger.Error().Str("alias", alias).Int64("height", height).Msg("⚠️ LIGHT CLIENT RESOLVE AUDIT: SECURITY ALERT! Alias transaction not found in proof block!")
+													verified = false
+												} else {
+													logger.Info().Str("alias", alias).Int64("height", height).Msg("✅ Light Client Resolve Audit: Authenticity proven by consensus ledger!")
+												}
+											}
+										}
+									}
+								}
+								}
+
+								if verified {
 									aliasHash := GetAliasCoordinate(alias)
 									aliasMutex.Lock()
 									pubKeyStr := base64.StdEncoding.EncodeToString(pubKeyBytes)
@@ -477,15 +591,14 @@ func ResolveAlias(ctx context.Context, h host.Host, alias string) (string, error
 									aliasMutex.Unlock()
 
 									logger.Debug().Str("alias", alias).Str("peerID", peerID).Msg("RESOLVE: Cached resolved alias locally")
+
+									select {
+									case resChan <- peerID:
+									default:
+									}
 								}
 							}
 						}
-					}
-
-					// Non-blocking send: channel is buffered so this won't block
-					select {
-					case resChan <- peerID:
-					default:
 					}
 				}
 			}

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"flag"
 	"io"
 	"strings"
 )
@@ -29,10 +30,14 @@ func getEncryptionKey() []byte {
 	if len(DBEncryptionKey) == 32 {
 		return DBEncryptionKey
 	}
-	// Fallback key derived from static string (ensures tests work out-of-the-box)
-	hasher := sha256.New()
-	hasher.Write([]byte("meshsage-default-sqlite-encrypt-key-stable-32bytes"))
-	return hasher.Sum(nil)
+	// Fallback key is ONLY allowed during unit tests to ensure they work out-of-the-box.
+	// In production, panic immediately to prevent saving data in cleartext/weak encryption.
+	if flag.Lookup("test.v") != nil {
+		hasher := sha256.New()
+		hasher.Write([]byte("meshsage-default-sqlite-encrypt-key-stable-32bytes"))
+		return hasher.Sum(nil)
+	}
+	panic("FATAL: Database encryption key is not initialized! Refusing to run in production without DB key.")
 }
 
 // EncryptColumn encrypts selective column data. Returns formatted ciphertext with "enc:" prefix.

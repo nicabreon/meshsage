@@ -316,6 +316,13 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 	}
 	globalPriv = priv
 
+	// Initialize SQLite encryption key before initializing database
+	if priv != nil {
+		if rawKeyBytes, err := priv.Raw(); err == nil {
+			corestore.SetDBEncryptionKey(rawKeyBytes)
+		}
+	}
+
 	// 4. Database Setup
 	if err := corestore.InitDatabase(dbPath); err != nil {
 		return C.CString("Failed to init SQLite: " + err.Error())
@@ -421,9 +428,22 @@ func StartNode(dbPathStr, idPathStr *C.char, port C.int, isClientOnlyVal C.int, 
 	coreproto.SetupAliasService(host)
 	coreproto.SetupProfileService(host)
 	coreproto.SetupClusterSync(globalCtx, host)
+	coreproto.SetupTimeService(host, !isClientOnly)
+	coreproto.InitializeBlockchain(globalCtx, host)
 
 	// Start the global sequential mailbox sync manager
 	go coreproto.StartGlobalMailboxSyncManager(globalCtx, host, priv)
+
+	// Synchronize virtual time with seed relays on startup
+	var seedIDs []peer.ID
+	for _, r := range staticRelays {
+		seedIDs = append(seedIDs, r.ID)
+	}
+	go func() {
+		// Wait a moment for connections to seeds to settle before querying time
+		time.Sleep(2 * time.Second)
+		coreproto.SyncTimeWithRelays(globalCtx, host, seedIDs)
+	}()
 
 	// Hook the structured message callback to send JSON events to the queue
 	coreproto.MessageCallback = func(event coreproto.MessageEvent) {
@@ -957,6 +977,7 @@ func FreeString(ptr *C.char) {
 //export StopNode
 func StopNode() {
 	coreproto.SaveStatsNow()
+	coreproto.ShutdownBlockchain()
 	if globalHost != nil {
 		logger.Warn().Msg("Stopping the Go node in background...")
 		if globalCancel != nil {
@@ -1055,6 +1076,32 @@ func RegisterPort(portID C.int64_t) {
 //export GetNetworkStats
 func GetNetworkStats() *C.char {
 	return C.CString(coreproto.GetNetworkStatsJSON())
+}
+
+//export GetVirtualTime
+func GetVirtualTime() C.int64_t {
+	return C.int64_t(coreproto.GetVirtualTime().UnixNano() / int64(time.Millisecond))
+}
+
+//export TriggerTimeSync
+func TriggerTimeSync() {
+	if globalHost == nil {
+		return
+	}
+	var seedIDs []peer.ID
+	for _, seedStr := range DefaultSeeds {
+		ma, err := multiaddr.NewMultiaddr(seedStr)
+		if err != nil {
+			continue
+		}
+		pinfo, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			continue
+		}
+		seedIDs = append(seedIDs, pinfo.ID)
+	}
+
+	go coreproto.SyncTimeWithRelays(globalCtx, globalHost, seedIDs)
 }
 
 //export GetChatHistory
@@ -1863,7 +1910,11 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 		go func() {
 			globalHost.Peerstore().AddAddrs(pinfo.ID, pinfo.Addrs, 5*time.Minute)
 			logger.Info().Str("target", pinfo.ID.String()).Str("addr", ma.String()).Msg("ConnectPeer: Attempting connection to explicit multiaddr")
-			dialCtx, cancel := context.WithTimeout(globalCtx, 5*time.Second)
+			timeout := 5 * time.Second
+			if strings.Contains(peerIDRaw, "/p2p-circuit") {
+				timeout = 15 * time.Second
+			}
+			dialCtx, cancel := context.WithTimeout(globalCtx, timeout)
 			defer cancel()
 			if err := globalHost.Connect(dialCtx, *pinfo); err != nil {
 				logger.Warn().Err(err).Str("target", pinfo.ID.String()).Msg("ConnectPeer: Dial with explicit multiaddr failed")
@@ -1871,7 +1922,7 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 				logger.Info().Str("target", pinfo.ID.String()).Msg("ConnectPeer: Connected via explicit multiaddr!")
 
 				// Open a stream to verify
-				streamCtx, cancelStream := context.WithTimeout(globalCtx, 4*time.Second)
+				streamCtx, cancelStream := context.WithTimeout(globalCtx, 5*time.Second)
 				defer cancelStream()
 				if s, errStream := globalHost.NewStream(streamCtx, pinfo.ID, "/p2p-core/msg/1.0.0"); errStream == nil {
 					s.Close()
@@ -1910,7 +1961,14 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 		logger.Info().Str("target", peerID.String()).Int("cached_count", len(cachedAddrs)).Msg("ConnectPeer: Checked cached addresses")
 		if len(cachedAddrs) > 0 {
 			logger.Info().Str("target", peerID.String()).Msg("ConnectPeer: Trying cached addresses first...")
-			dialCtx, cancel := context.WithTimeout(globalCtx, 3*time.Second)
+			timeout := 5 * time.Second
+			for _, addr := range cachedAddrs {
+				if strings.Contains(addr.String(), "/p2p-circuit") {
+					timeout = 15 * time.Second
+					break
+				}
+			}
+			dialCtx, cancel := context.WithTimeout(globalCtx, timeout)
 			pinfo := peer.AddrInfo{
 				ID:    peerID,
 				Addrs: cachedAddrs,
@@ -1935,7 +1993,14 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 				logger.Info().Str("target", peerID.String()).Int("addrs", len(pinfo.Addrs)).Msg("ConnectPeer: Found fresh addresses via DHT")
 				globalHost.Peerstore().AddAddrs(peerID, pinfo.Addrs, 5*time.Minute)
 
-				dialCtx2, cancel2 := context.WithTimeout(globalCtx, 5*time.Second)
+				timeout := 5 * time.Second
+				for _, addr := range pinfo.Addrs {
+					if strings.Contains(addr.String(), "/p2p-circuit") {
+						timeout = 15 * time.Second
+						break
+					}
+				}
+				dialCtx2, cancel2 := context.WithTimeout(globalCtx, timeout)
 				defer cancel2()
 				if errConnect := globalHost.Connect(dialCtx2, pinfo); errConnect != nil {
 					logger.Warn().Err(errConnect).Str("target", peerID.String()).Msg("ConnectPeer: Dial with fresh addresses failed")
@@ -1951,7 +2016,7 @@ func ConnectPeer(peerIDStr *C.char) *C.char {
 		if connected {
 			logger.Info().Str("target", peerID.String()).Msg("ConnectPeer: Proactively opening test stream as connection proof...")
 			startStream := time.Now()
-			streamCtx, cancelStream := context.WithTimeout(globalCtx, 4*time.Second)
+			streamCtx, cancelStream := context.WithTimeout(globalCtx, 5*time.Second)
 			s, errStream := globalHost.NewStream(streamCtx, peerID, "/p2p-core/msg/1.0.0")
 			cancelStream()
 

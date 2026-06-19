@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nicabreon/meshsage/pkg/logger"
+	corenet "github.com/nicabreon/meshsage/pkg/network"
 	corestore "github.com/nicabreon/meshsage/pkg/storage"
 )
 
@@ -85,12 +86,23 @@ func InitStats() {
 	logger.Info().Msg("Network stats tracking initialized (auto-save every 30s)")
 }
 
+// getSessionTraffic retrieves the bytes sent and received during this active session.
+// It queries the libp2p GlobalBWC bandwidth counter if available, or falls back to atomic session counters.
+func getSessionTraffic() (int64, int64) {
+	if corenet.GlobalBWC != nil {
+		stats := corenet.GlobalBWC.GetBandwidthTotals()
+		return stats.TotalOut, stats.TotalIn
+	}
+	return atomic.LoadInt64(&statsBytesSent), atomic.LoadInt64(&statsBytesRecv)
+}
+
 // SaveStatsNow writes current totals (base + session delta) to DB immediately.
 // Called by auto-save goroutine and by StopNode for a clean final flush.
 func SaveStatsNow() {
+	sent, recv := getSessionTraffic()
 	_ = corestore.SaveNetworkStats(
-		statsBaseSent+atomic.LoadInt64(&statsBytesSent),
-		statsBaseRecv+atomic.LoadInt64(&statsBytesRecv),
+		statsBaseSent+sent,
+		statsBaseRecv+recv,
 		statsBaseMsgSent+atomic.LoadInt64(&statsMsgSent),
 		statsBaseMsgRecv+atomic.LoadInt64(&statsMsgRecv),
 		statsBaseHandshakes+atomic.LoadInt64(&statsHandshakes),
@@ -124,8 +136,7 @@ func AddFileRecv(n int64) { atomic.AddInt64(&statsFileRecv, n) }
 
 // GetNetworkStatsJSON returns a JSON string of current cumulative stats for FFI.
 func GetNetworkStatsJSON() string {
-	sessionSent := atomic.LoadInt64(&statsBytesSent)
-	sessionRecv := atomic.LoadInt64(&statsBytesRecv)
+	sessionSent, sessionRecv := getSessionTraffic()
 
 	s := NetworkStatsJSON{
 		TotalSentBytes:   statsBaseSent + sessionSent,

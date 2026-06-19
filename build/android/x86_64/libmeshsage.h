@@ -120,6 +120,8 @@ extern void ResumeNetwork(void);
 extern int InitializeDartApi(void* data);
 extern void RegisterPort(int64_t portID);
 extern char* GetNetworkStats(void);
+extern int64_t GetVirtualTime(void);
+extern void TriggerTimeSync(void);
 extern char* GetChatHistory(char* targetIDVal, int isGroupVal, int limit, int offset);
 extern char* GetChatMetadata(void);
 extern char* MarkMessagesAsRead(char* targetIDVal, int isGroupVal);

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 
+	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
@@ -135,10 +136,10 @@ func DecryptMessage(key []byte, b64Ciphertext string) (string, error) {
 	return string(plaintext), nil
 }
 
-// DeriveKeyFromPassword generates a 32-byte AES key from a password string.
+// DeriveKeyFromPassword generates a 32-byte AES key from a password string using Argon2id.
 func DeriveKeyFromPassword(password string) []byte {
-	hash := sha256.Sum256([]byte(password))
-	return hash[:]
+	salt := []byte("meshsage-argon2id-stable-salt-32bytes")
+	return argon2.IDKey([]byte(password), salt, 1, 64*1024, 4, 32)
 }
 
 // HKDFExpand generates a key of desired length from a secret.

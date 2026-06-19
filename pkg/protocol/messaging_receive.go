@@ -492,6 +492,15 @@ func processDecryptedPayload(ctx context.Context, h host.Host, senderID peer.ID,
 	}
 	logger.Info().Str("msgID", env.ID).Str("type", env.Type).Msg("processDecryptedPayload: successfully unmarshaled decrypted JSON envelope")
 
+	// Verify Proof-of-Work if present
+	if env.PoWDiff > 0 {
+		if !env.VerifyPoW() {
+			logger.Warn().Str("peerID", senderID.String()).Str("msgID", env.ID).Msg("processDecryptedPayload: INVALID Proof of Work detected!")
+			return false
+		}
+		logger.Debug().Str("peerID", senderID.String()).Str("msgID", env.ID).Msg("Proof of Work verified successfully")
+	}
+
 	// 5. Verifikasi Signature
 	if env.Signature != "" {
 		pubKey, err := senderID.ExtractPublicKey()

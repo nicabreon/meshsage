@@ -211,6 +211,17 @@ func InitDatabase(dbPath string) error {
 		avatar_key TEXT DEFAULT "",
 		local_path TEXT DEFAULT "",
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+
+	-- 14. Persistent blockchain blocks
+	CREATE TABLE IF NOT EXISTS blockchain_blocks (
+		height INTEGER PRIMARY KEY,
+		block_hash TEXT UNIQUE NOT NULL,
+		prev_block_hash TEXT NOT NULL,
+		timestamp INTEGER NOT NULL,
+		validator_peer_id TEXT NOT NULL,
+		validator_signature TEXT NOT NULL,
+		transactions_json TEXT NOT NULL
 	);`
 
 	_, err = DB.Exec(query)
@@ -270,6 +281,29 @@ func InitDatabase(dbPath string) error {
 		}
 		currentVersion = 2
 		logger.Info().Msg("Database migration to version 2 completed successfully")
+	}
+
+	if currentVersion < 3 {
+		logger.Info().Msg("Running database migration to version 3...")
+		_, err = DB.Exec(`CREATE TABLE IF NOT EXISTS blockchain_blocks (
+			height INTEGER PRIMARY KEY,
+			block_hash TEXT UNIQUE NOT NULL,
+			prev_block_hash TEXT NOT NULL,
+			timestamp INTEGER NOT NULL,
+			validator_peer_id TEXT NOT NULL,
+			validator_signature TEXT NOT NULL,
+			transactions_json TEXT NOT NULL
+		);`)
+		if err != nil {
+			logger.Error().Err(err).Msg("Migration v3: failed to create blockchain_blocks table")
+		}
+
+		_, err = DB.Exec("PRAGMA user_version = 3;")
+		if err != nil {
+			return fmt.Errorf("failed to update user_version to 3: %w", err)
+		}
+		currentVersion = 3
+		logger.Info().Msg("Database migration to version 3 completed successfully")
 	}
 
 	// Performance & Concurrency Tuning (applied again after schema creation)

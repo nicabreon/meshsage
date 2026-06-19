@@ -26,6 +26,37 @@ import (
 type SignedMailboxEnvelope struct {
 	Payload   string `json:"payload"`   // The original E2EE message envelope
 	Signature string `json:"signature"` // Base64 signature of the payload
+	PoWNonce  uint64 `json:"w,omitempty"` // PoW Nonce
+	PoWDiff   int    `json:"d,omitempty"` // PoW Difficulty
+}
+
+// CalculateBaseHash calculates the baseline envelope hash used for PoW mining/verification
+func (env *SignedMailboxEnvelope) CalculateBaseHash() [32]byte {
+	h := sha256.New()
+	h.Write([]byte(env.Payload))
+	h.Write([]byte(env.Signature))
+	var base [32]byte
+	copy(base[:], h.Sum(nil))
+	return base
+}
+
+// MinePoW finds a nonce that satisfies the difficulty target
+func (env *SignedMailboxEnvelope) MinePoW(difficulty int) {
+	if difficulty <= 0 {
+		return
+	}
+	baseHash := env.CalculateBaseHash()
+	env.PoWNonce = MinePoW(baseHash, difficulty)
+	env.PoWDiff = difficulty
+}
+
+// VerifyPoW verifies if the envelope satisfies the required PoW difficulty
+func (env *SignedMailboxEnvelope) VerifyPoW() bool {
+	if env.PoWDiff <= 0 {
+		return true
+	}
+	baseHash := env.CalculateBaseHash()
+	return VerifyPoW(baseHash, env.PoWDiff, env.PoWNonce)
 }
 
 // WrapEnvelopeWithSignature signs the payload with the host's private key and marshals it into a SignedMailboxEnvelope JSON.
@@ -38,6 +69,9 @@ func WrapEnvelopeWithSignature(privKey crypto.PrivKey, payload string) (string, 
 		Payload:   payload,
 		Signature: base64.StdEncoding.EncodeToString(sig),
 	}
+	// Mine PoW
+	env.MinePoW(16) // DefaultMailboxPoWDifficulty
+
 	data, err := json.Marshal(env)
 	if err != nil {
 		return "", err
@@ -59,6 +93,15 @@ func VerifySignedEnvelope(envelopeStr string, senderPubKey crypto.PubKey) (strin
 	if err != nil || !valid {
 		return "", fmt.Errorf("invalid signature")
 	}
+
+	// Verify PoW
+	if env.PoWDiff < 16 {
+		return "", fmt.Errorf("insufficient Proof of Work difficulty (%d < 16)", env.PoWDiff)
+	}
+	if !env.VerifyPoW() {
+		return "", fmt.Errorf("invalid Proof of Work")
+	}
+
 	return env.Payload, nil
 }
 
@@ -284,7 +327,7 @@ func FetchMailboxMessages(ctx context.Context, h host.Host, relayID peer.ID, pri
 	coord := GetMailboxCoordinate(h.ID())
 	logger.Debug().Str("coord", coord).Str("peerID", relayID.String()).Msg("Starting mailbox fetch")
 
-	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	s, err := h.NewStream(dialCtx, relayID, protocol.ID(MailboxProtocolID))
 	cancel()
 	if err != nil {

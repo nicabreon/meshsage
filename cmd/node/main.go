@@ -165,6 +165,7 @@ func main() {
 	coreproto.SetupAliasService(host)
 	coreproto.SetupProfileService(host)
 	coreproto.SetupClusterSync(ctx, host)
+	coreproto.InitializeBlockchain(ctx, host)
 
 	// Start the global sequential mailbox sync manager
 	go coreproto.StartGlobalMailboxSyncManager(ctx, host, priv)
@@ -355,4 +356,5 @@ func main() {
 	}
 
 	logger.Info().Msg("Shutting down Meshsage node...")
+	coreproto.ShutdownBlockchain()
 }

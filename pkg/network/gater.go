@@ -1,6 +1,7 @@
 package network
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -124,11 +125,44 @@ func (g *RestrictedConnectionGater) isAllowed(p peer.ID) bool {
 		}
 	}
 
+	// 3.6. Izinkan jika peer memiliki alamat loopback/localhost (untuk development/testing lokal)
+	if g.h != nil {
+		addrs := g.h.Peerstore().Addrs(p)
+		if len(addrs) > 0 && HasLoopbackAddr(addrs) {
+			return true
+		}
+	}
+
+	// 3.7. Izinkan jika peer memiliki alamat relay (/p2p-circuit) di peerstore
+	if g.h != nil {
+		addrs := g.h.Peerstore().Addrs(p)
+		for _, addr := range addrs {
+			if strings.Contains(addr.String(), "/p2p-circuit") {
+				return true
+			}
+		}
+	}
+
 	// 4. Fallback: Jika tidak terhubung ke dedicated relay mana pun, izinkan koneksi terbuka untuk mencari relay
 	if g.h != nil && g.countConnectedDedicatedRelays() == 0 {
 		return true
 	}
 
+	return false
+}
+
+// HasLoopbackAddr mengecek apakah slice multiaddr mengandung alamat loopback/localhost
+func HasLoopbackAddr(addrs []multiaddr.Multiaddr) bool {
+	for _, addr := range addrs {
+		addrStr := addr.String()
+		if strings.Contains(addrStr, "127.0.0.1") || strings.Contains(addrStr, "localhost") || strings.Contains(addrStr, "::1") {
+			return true
+		}
+		ip := extractIP(addr)
+		if ip != nil && ip.IsLoopback() {
+			return true
+		}
+	}
 	return false
 }
 
@@ -152,6 +186,17 @@ func (g *RestrictedConnectionGater) InterceptPeerDial(p peer.ID) bool {
 }
 
 func (g *RestrictedConnectionGater) InterceptAddrDial(p peer.ID, addr multiaddr.Multiaddr) bool {
+	addrStr := addr.String()
+	if strings.Contains(addrStr, "/p2p-circuit") {
+		return true
+	}
+	if strings.Contains(addrStr, "127.0.0.1") || strings.Contains(addrStr, "localhost") || strings.Contains(addrStr, "::1") {
+		return true
+	}
+	ip := extractIP(addr)
+	if ip != nil && ip.IsLoopback() {
+		return true
+	}
 	return g.isAllowed(p)
 }
 

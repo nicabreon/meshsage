@@ -28,14 +28,14 @@ extern const char *_GoStringPtr(_GoString_ s);
 #include "dart_api_dl.h"
 
 // Helper function to post string messages via Dart_PostCObject_DL
-static bool post_string_to_dart(int64_t port_id, const char* str) {
+static int post_string_to_dart(int64_t port_id, const char* str) {
     if (Dart_PostCObject_DL == NULL) {
-        return false;
+        return 0;
     }
     Dart_CObject obj;
     obj.type = Dart_CObject_kString;
     obj.value.as_string = str;
-    return Dart_PostCObject_DL(port_id, &obj);
+    return Dart_PostCObject_DL(port_id, &obj) ? 1 : 0;
 }
 
 #line 1 "cgo-generated-wrapper"
@@ -116,9 +116,12 @@ extern char* GetLocalPeerID(void);
 extern char* PollEvent(void);
 extern void FreeString(char* ptr);
 extern void StopNode(void);
+extern void ResumeNetwork(void);
 extern int InitializeDartApi(void* data);
 extern void RegisterPort(int64_t portID);
 extern char* GetNetworkStats(void);
+extern int64_t GetVirtualTime(void);
+extern void TriggerTimeSync(void);
 extern char* GetChatHistory(char* targetIDVal, int isGroupVal, int limit, int offset);
 extern char* GetChatMetadata(void);
 extern char* MarkMessagesAsRead(char* targetIDVal, int isGroupVal);

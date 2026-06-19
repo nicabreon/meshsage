@@ -165,7 +165,8 @@ func init() {
 
 func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target peer.ID, msg string) (string, error) {
 	msg = strings.TrimSuffix(msg, "\n")
-	msgID := fmt.Sprintf("%x", sha256.Sum256([]byte(msg+time.Now().String())))[:8]
+	virtualTime := GetVirtualTime()
+	msgID := fmt.Sprintf("%x", sha256.Sum256([]byte(msg+virtualTime.String())))[:8]
 	dataToSign := []byte(msg + msgID)
 	sigBytes, _ := priv.Sign(dataToSign)
 	sigB64 := base64.StdEncoding.EncodeToString(sigBytes)
@@ -176,10 +177,13 @@ func SendMessage(ctx context.Context, h host.Host, priv crypto.PrivKey, target p
 		ID:        msgID,
 		Type:      MsgTypeText,
 		Content:   msg,
-		Timestamp: time.Now().UnixNano(),
+		Timestamp: virtualTime.UnixNano(),
 		Sender:    senderAlias,
 		Signature: sigB64,
 	}
+
+	// Mine PoW difficulty 16 for spam prevention
+	env.MinePoW(16)
 
 	// Simpan pesan ke sent-message buffer per-peer.
 	// Jika receiver mengalami masalah sesi dan mengirim REQUEST_X3DH,
@@ -434,8 +438,19 @@ func MeasureAndRecordDialTimeout(ctx context.Context, h host.Host, target peer.I
 			if timeout < 500*time.Millisecond {
 				timeout = 500 * time.Millisecond
 			}
-			if timeout > 3*time.Second {
-				timeout = 3 * time.Second
+			maxAllowedTimeout := 5 * time.Second
+			isTargetRelayed := false
+			for _, addr := range h.Peerstore().Addrs(target) {
+				if strings.Contains(addr.String(), "/p2p-circuit") {
+					isTargetRelayed = true
+					break
+				}
+			}
+			if isTargetRelayed {
+				maxAllowedTimeout = 15 * time.Second
+			}
+			if timeout > maxAllowedTimeout {
+				timeout = maxAllowedTimeout
 			}
 
 			customDialTimeouts.Store(target.String(), timeTrackedDuration{duration: timeout, updatedAt: now})
@@ -454,19 +469,37 @@ func MeasureAndRecordDialTimeout(ctx context.Context, h host.Host, target peer.I
 }
 
 func getPeerDialTimeout(ctx context.Context, h host.Host, target peer.ID) time.Duration {
-	// Establish maximum timeout limit. Hard cap is 3 seconds.
-	maxLimit := 3 * time.Second
+	// Establish maximum timeout limit. Hard cap is 5 seconds for direct, 15 seconds for relayed.
+	maxLimit := 5 * time.Second
 
-	// If we are connected to a dedicated relay, scale maxLimit dynamically based on the relay's RTT.
-	// Since relay routing takes at least 1 relay RTT (plus stream negotiation/handshakes),
-	// we scale the limit to 3 * relayRTT + 500ms.
-	if relayRTT := getRelayRTT(h); relayRTT > 0 {
-		adaptiveLimit := 3*relayRTT + 500*time.Millisecond
-		if adaptiveLimit < maxLimit {
-			maxLimit = adaptiveLimit
-			// Ensure a floor of 1.0 second so we don't time out too aggressively under normal jitter
-			if maxLimit < 1*time.Second {
-				maxLimit = 1 * time.Second
+	// Check if target is connected/configured via relay
+	isRelayed := false
+	conns := h.Network().ConnsToPeer(target)
+	for _, conn := range conns {
+		if strings.Contains(conn.RemoteMultiaddr().String(), "/p2p-circuit") {
+			isRelayed = true
+			break
+		}
+	}
+	if !isRelayed {
+		for _, addr := range h.Peerstore().Addrs(target) {
+			if strings.Contains(addr.String(), "/p2p-circuit") {
+				isRelayed = true
+				break
+			}
+		}
+	}
+
+	if isRelayed {
+		maxLimit = 15 * time.Second
+	} else {
+		// If we are connected to a dedicated relay, scale maxLimit dynamically based on the relay's RTT.
+		// Since relay routing takes at least 1 relay RTT (plus stream negotiation/handshakes),
+		// we scale the limit to 3 * relayRTT + 1 second.
+		if relayRTT := getRelayRTT(h); relayRTT > 0 {
+			adaptiveLimit := 3*relayRTT + 1*time.Second
+			if adaptiveLimit > maxLimit {
+				maxLimit = adaptiveLimit
 			}
 		}
 	}

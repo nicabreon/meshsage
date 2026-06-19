@@ -17,6 +17,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/metrics"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
@@ -48,6 +49,7 @@ var (
 	discoveredPublicIPMu sync.RWMutex
 	discoveredPublicIP   net.IP
 	GlobalHost           host.Host
+	GlobalBWC            *metrics.BandwidthCounter
 )
 
 // discoverPublicIPAsync queries a STUN server asynchronously to find our external/NAT-mapped IP.
@@ -351,6 +353,9 @@ func NewNode(ctx context.Context, cfg Config) (host.Host, error) {
 	}
 
 	// Create the libp2p host
+	GlobalBWC = metrics.NewBandwidthCounter()
+	opts = append(opts, libp2p.BandwidthReporter(GlobalBWC))
+
 	h, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)

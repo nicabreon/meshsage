@@ -115,7 +115,7 @@ func handleNotifyStream(s network.Stream) {
 }
 
 func SubscribeNotifications(ctx context.Context, h host.Host, relayID peer.ID, statusChan chan<- bool) {
-	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	s, err := h.NewStream(dialCtx, relayID, protocol.ID(NotifyProtocolID))
 	cancel()
 	if err != nil {
